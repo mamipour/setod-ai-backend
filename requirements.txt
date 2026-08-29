@@ -1,0 +1,50 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+# Twilio posts form-encoded webhooks; Starlette cannot parse them without this.
+python-multipart
+
+# ── Config & validation ───────────────────────────────────────────────────────
+pydantic
+pydantic-settings
+python-dotenv
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlmodel
+asyncpg
+alembic
+
+# ── Scheduling ────────────────────────────────────────────────────────────────
+# Schedules live in Postgres (agent_triggers.next_run_at) rather than a queue: agent runs are
+# long and infrequent, so throughput is irrelevant, while a cron job lost to a Redis restart
+# is an agent that silently stops working.
+croniter
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+openai
+anthropic
+
+# ── Integrations ──────────────────────────────────────────────────────────────
+twilio
+google-auth
+google-auth-oauthlib
+google-api-python-client
+telethon
+
+# ── Knowledge ─────────────────────────────────────────────────────────────────
+# Vector storage/search lives in Postgres (pgvector extension); embeddings come from the
+# workspace's own OpenAI key so document indexing is billed to the user like everything else.
+pgvector
+pypdf
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+httpx
+
+# ── Security ──────────────────────────────────────────────────────────────────
+python-jose[cryptography]
+passlib[bcrypt]
+
+# ── Dev & testing ─────────────────────────────────────────────────────────────
+pytest
+pytest-asyncio
+httpx
