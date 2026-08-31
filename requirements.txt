@@ -1,6 +1,8 @@
 # ── Web framework ─────────────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
+itsdangerous
+authlib
 # Twilio posts form-encoded webhooks; Starlette cannot parse them without this.
 python-multipart
 
@@ -39,6 +41,11 @@ pypdf
 
 # ── HTTP client ───────────────────────────────────────────────────────────────
 httpx
+
+# ── HTML extraction ───────────────────────────────────────────────────────────
+# fetch_page strips page chrome (nav/header/footer) via DOM parsing so agents pay
+# tokens for content rather than menus.
+lxml
 
 # ── Security ──────────────────────────────────────────────────────────────────
 python-jose[cryptography]

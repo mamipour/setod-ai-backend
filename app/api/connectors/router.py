@@ -353,16 +353,13 @@ class LLMValidateBody(BaseModel):
     api_key: str
 
 
-@router.post("/llm/validate", response_model=TestResult)
-async def validate_llm_key(
-    body: LLMValidateBody,
-    current_user: Annotated[User, Depends(get_current_user)],
-):
+async def _check_llm_key(provider: ConnectorType, api_key: str) -> TestResult:
+    """Validate an LLM API key against the provider's models endpoint."""
     async with httpx.AsyncClient() as client:
-        if body.provider == ConnectorType.openai:
+        if provider == ConnectorType.openai:
             resp = await client.get(
                 "https://api.openai.com/v1/models",
-                headers={"Authorization": f"Bearer {body.api_key}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 timeout=10,
             )
             if resp.status_code == 200:
@@ -371,11 +368,11 @@ async def validate_llm_key(
                 return TestResult(ok=False, detail="Invalid API key")
             return TestResult(ok=False, detail=f"OpenAI returned {resp.status_code}")
 
-        if body.provider == ConnectorType.anthropic:
+        if provider == ConnectorType.anthropic:
             resp = await client.get(
                 "https://api.anthropic.com/v1/models",
                 headers={
-                    "x-api-key": body.api_key,
+                    "x-api-key": api_key,
                     "anthropic-version": "2023-06-01",
                 },
                 timeout=15,
@@ -390,6 +387,14 @@ async def validate_llm_key(
     return TestResult(ok=False, detail="Unsupported provider")
 
 
+@router.post("/llm/validate", response_model=TestResult)
+async def validate_llm_key(
+    body: LLMValidateBody,
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    return await _check_llm_key(body.provider, body.api_key)
+
+
 @router.post("/llm", response_model=ConnectorOut, status_code=201)
 async def create_llm_connector(
     body: LLMConnectorCreate,
@@ -401,32 +406,9 @@ async def create_llm_connector(
 
     await _assert_org_member(session, current_user, body.org_id)
 
-    # Validate key before storing
-    async with httpx.AsyncClient() as client:
-        if body.provider == ConnectorType.openai:
-            resp = await client.get(
-                "https://api.openai.com/v1/models",
-                headers={"Authorization": f"Bearer {body.api_key}"},
-                timeout=10,
-            )
-            if resp.status_code == 401:
-                raise HTTPException(status_code=422, detail="Invalid OpenAI API key")
-            if resp.status_code != 200:
-                raise HTTPException(status_code=422, detail=f"OpenAI returned {resp.status_code}")
-
-        if body.provider == ConnectorType.anthropic:
-            resp = await client.get(
-                "https://api.anthropic.com/v1/models",
-                headers={
-                    "x-api-key": body.api_key,
-                    "anthropic-version": "2023-06-01",
-                },
-                timeout=15,
-            )
-            if resp.status_code == 401:
-                raise HTTPException(status_code=422, detail="Invalid Anthropic API key")
-            if resp.status_code != 200:
-                raise HTTPException(status_code=422, detail=f"Anthropic returned {resp.status_code}")
+    check = await _check_llm_key(body.provider, body.api_key)
+    if not check.ok:
+        raise HTTPException(status_code=422, detail=check.detail)
 
     config = encrypt_json({"api_key": body.api_key, "provider": body.provider})
 
@@ -438,6 +420,45 @@ async def create_llm_connector(
         status=ConnectorStatus.active,
         config=config,
     )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+class LLMKeyUpdate(BaseModel):
+    org_id: UUID
+    api_key: str
+
+
+@router.patch("/llm/{connector_id}", response_model=ConnectorOut)
+async def update_llm_key(
+    connector_id: UUID,
+    body: LLMKeyUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Replace an LLM connector's API key in place.
+
+    Deliberately not delete-and-recreate: agents reference the connector by id with
+    ON DELETE SET NULL, so deleting it would silently unbind every agent using this
+    provider as its model.
+    """
+    await _assert_org_member(session, current_user, body.org_id)
+
+    connector = await session.get(Connector, connector_id)
+    if not connector or connector.org_id != body.org_id:
+        raise HTTPException(status_code=404, detail="Connector not found")
+    if connector.type not in (ConnectorType.openai, ConnectorType.anthropic):
+        raise HTTPException(status_code=422, detail="Not an LLM connector")
+
+    check = await _check_llm_key(connector.type, body.api_key)
+    if not check.ok:
+        raise HTTPException(status_code=422, detail=check.detail)
+
+    connector.config = encrypt_json({"api_key": body.api_key, "provider": connector.type})
+    connector.status = ConnectorStatus.active
+    connector.updated_at = datetime.now(UTC)
     session.add(connector)
     await session.commit()
     await session.refresh(connector)
@@ -819,6 +840,7 @@ async def create_twilio(
     else:
         connector = Connector(
             org_id=body.org_id,
+            created_by=current_user.id,
             type=ConnectorType.twilio,
             name=body.name,
             status=ConnectorStatus.active,

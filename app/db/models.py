@@ -87,6 +87,11 @@ class Organization(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str
     slug: str = Field(unique=True, index=True)
+    # Encrypted workspace-level integration settings. Currently holds:
+    #   {"provider": "duckduckgo" | "tavily", "tavily_api_key": "<key>"}
+    # Encrypted via Fernet so the key is never stored in plain text. None when
+    # no workspace integrations have been configured.
+    web_settings: str | None = Field(default=None)
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 

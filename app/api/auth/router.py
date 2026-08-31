@@ -163,13 +163,14 @@ async def google_callback(
     access_token = create_access_token(user.id)
 
     response = Response(status_code=status.HTTP_302_FOUND)
-    response.headers["location"] = "http://localhost:3000/dashboard"
+    response.headers["location"] = f"{settings.frontend_origin}/dashboard"
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
         samesite="lax",
         secure=settings.is_production,
+        domain=settings.cookie_domain,
         max_age=60 * settings.jwt_access_token_expire_minutes,
     )
     return response

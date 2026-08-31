@@ -27,6 +27,8 @@ The static routes above are declared before `/{agent_id}`, since FastAPI matches
 declaration order and would otherwise read "templates" as an agent id.
 """
 
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Annotated
@@ -58,11 +60,20 @@ from app.api.agents.schemas import (
 )
 from app.api.auth.dependencies import get_current_user
 from app.core.agents import templates
-from app.core.agents.base import AgentRunError, run_agent, snapshot_config
+from app.core.agents.base import AgentRunError, RegisteredTool, run_agent, snapshot_config
 from app.core.agents.templates import TEMPLATES
 from app.core import knowledge
 from app.core.crypto import decrypt_json
-from app.core.llm.client import DEFAULT_MODELS, build_client, system_message, user_message
+from app.core.llm.client import (
+    DEFAULT_MODELS,
+    ToolSpec,
+    build_client,
+    assistant_message,
+    system_message,
+    tool_message,
+    user_message,
+)
+from app.integrations import websearch as _websearch
 from app.core.triggers import schedule
 from app.integrations.base import ToolContext
 from app.integrations import mcp
@@ -84,6 +95,8 @@ from app.db.models import (
     ConnectorStatus,
     ConnectorType,
     DEFAULT_AGENT_SETTINGS,
+    MessageRole,
+    Organization,
     OrganizationMember,
     SessionStatus,
     Skill,
@@ -93,6 +106,7 @@ from app.db.models import (
 from app.db.session import get_session
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+log = logging.getLogger("setod.assist")
 
 # Channel triggers are switched off by product decision (2026-08-26): they require a public
 # webhook URL, which in development means babysitting a tunnel, and cron scheduling covers
@@ -860,9 +874,42 @@ Skills:
 - Users can edit any skill or create their own from the Skills page (sidebar → Skills)
 - When writing a prompt, you should NOT duplicate behaviour that a skill already handles — instead tell the user to attach the relevant skill
 
+## Research tools (you can use these yourself)
+
+You have two tools available in this conversation:
+
+- `search_web` — search the web and get titles, URLs, and short snippets. Use it whenever you need to look something up to give a grounded answer.
+- `fetch_page` — fetch the full text of any public URL. Use it to read a page and understand its structure before writing a prompt that references it.
+
+- `read_run_trace` — read one of this agent's past runs step by step: every tool it called, the arguments it passed, what each tool returned, and its closing message. Runs are numbered in the context below, 1 being the most recent.
+
+Use these tools proactively when the user gives you a URL or asks about a third-party service you are not certain about. Do not invent API formats, RSS URLs, or field names — verify them.
+
+Call at most 4–6 tools per reply. Stop as soon as you have enough information to write the prompt.
+
+## Diagnosing a run
+
+When the user asks why the agent did or did not do something on a run — a missing link, a message that never arrived, the wrong items picked — call `read_run_trace` first. The run list in your context shows only status and token count; the trace shows what actually happened.
+
+Read the trace before forming a theory. It tells you which tool the agent called, the exact arguments it passed (an outbound message body appears here, so you can see precisely what was sent), and what each tool returned — so you can tell a prompt problem apart from a tool returning data that did not contain what the prompt asked for.
+
+Never tell the user you cannot see the run's internal trace or the content of a message it sent. You can: read it.
+
+## URL monitoring protocol
+
+When the user wants the agent to periodically check a website for new or changed content:
+
+1. **Fetch the URL** the user gave you. Read the page text.
+2. **Look for a better data source.** Check the page for links labelled "download", "API", "CSV", "RSS", "open data", or "dataset". Also run a search for `"[site domain]" API OR RSS OR "open data"` to find official feeds. Prefer sources in this order: API > CSV/dataset > RSS > filtered HTML listing > unfiltered pages. Each step down costs the user more tokens per run and breaks more easily, so the difference is real money: a structured source is often 10–20x cheaper per run than page-by-page browsing.
+3. **Verify the best endpoint** by fetching it. Confirm you get readable, structured content.
+4. **Write instructions that embed the verified endpoint** — the exact URL the agent should fetch — plus extraction hints (column names, keywords to filter on, what a match looks like). Do not leave the URL discovery to the agent at runtime.
+   - **If only HTML listings exist**, write instructions that use the site's own filters and sorting (query parameters for category, status, newest-first) so one page carries the most relevant rows, and give the agent a stop rule: read newest-first and stop fetching further pages or detail links as soon as items fall outside the monitoring window (older than N days, already seen, wrong status). Fetched pages may end with a "[truncated — showing X of Y lines]" note; that means the page continued, so narrow the filters or follow the pagination link rather than assuming everything was seen.
+5. **Check the agent's web settings** (shown in `<agent_context>`). If web search or live page access is off, tell the user: "Go to this agent's Settings tab and enable Web search and Live page access — the agent needs those to fetch the URL during its runs."
+6. **If the page returns almost no text** (likely a JavaScript-rendered SPA), say so honestly: "This page appears to need a browser to load — the agent's built-in fetch tool will not see content here. Look for an RSS feed, API, or data download on the site instead."
+
 ## When the user asks for something not yet possible
 
-If the user describes a need that setod does not currently support (reading Slack, WhatsApp, Notion; browsing the internet; running code; persistent memory; event-based triggers), respond:
+If the user describes a need that setod does not currently support (reading Slack, WhatsApp, Notion; running code; persistent memory; event-based triggers), respond:
 "That's not something setod supports yet. If it's important for your workflow, send a feature request to support — the team reviews them and prioritises based on demand. In the meantime, here's the closest thing you can do with what's available: [suggest an alternative if one exists]"
 
 Never say "you could connect X" if X is not in the list of available connectors.
@@ -925,6 +972,80 @@ _ALL_CONNECTOR_TOOLS: dict[str, list[str]] = {
 }
 
 
+# Caps for a run trace handed to the copilot. Per-step so one giant tool result (a fetched
+# CSV, a full inbox) cannot swallow the trace, and overall so a long run still fits in a
+# reply. The middle is elided rather than the tail — the closing message and the last tool
+# calls are usually what the question is about.
+TRACE_STEP_CHARS = 1_200
+TRACE_TOTAL_CHARS = 10_000
+
+
+async def _run_trace(session: AsyncSession, agent: Agent, run_number: int) -> str:
+    """Render one past run's message trace for the copilot to read.
+
+    Includes tool arguments, not just results: the body of an outbound message lives in
+    `tool_args`, so without it the copilot cannot see what the agent actually sent.
+    """
+    runs_result = await session.exec(
+        select(AgentSession)
+        .where(AgentSession.agent_id == agent.id)
+        .order_by(AgentSession.started_at.desc())
+        .limit(20)
+    )
+    runs = runs_result.all()
+    if not runs:
+        return "This agent has no runs yet."
+    if run_number < 1 or run_number > len(runs):
+        return f"No run numbered {run_number}. This agent has {len(runs)} recent run(s), numbered 1 (most recent) to {len(runs)}."
+
+    run = runs[run_number - 1]
+    msgs_result = await session.exec(
+        select(AgentSessionMessage)
+        .where(AgentSessionMessage.session_id == run.id)
+        .order_by(AgentSessionMessage.sequence)
+    )
+    messages = msgs_result.all()
+
+    steps: list[str] = []
+    for m in messages:
+        body = (m.content or "").strip()
+        if len(body) > TRACE_STEP_CHARS:
+            body = body[:TRACE_STEP_CHARS] + " …[truncated]"
+        if m.role == MessageRole.tool:
+            args = json.dumps(m.tool_args or {}, ensure_ascii=False)
+            if len(args) > TRACE_STEP_CHARS:
+                args = args[:TRACE_STEP_CHARS] + " …[truncated]"
+            steps.append(f"CALLED {m.tool_name}({args})\n  RETURNED: {body}")
+        else:
+            steps.append(f"{m.role.value.upper()}: {body}")
+
+    # Keep the head and the tail, drop the middle if the whole thing will not fit.
+    total = sum(len(s) for s in steps)
+    if total > TRACE_TOTAL_CHARS:
+        head, tail, budget = [], [], TRACE_TOTAL_CHARS // 2
+        spent = 0
+        for s in steps:
+            if spent + len(s) > budget:
+                break
+            head.append(s); spent += len(s)
+        spent = 0
+        for s in reversed(steps[len(head):]):
+            if spent + len(s) > budget:
+                break
+            tail.insert(0, s); spent += len(s)
+        omitted = len(steps) - len(head) - len(tail)
+        steps = head + ([f"…[{omitted} step(s) omitted]…"] if omitted > 0 else []) + tail
+
+    started = run.started_at.strftime("%Y-%m-%d %H:%M UTC") if run.started_at else "?"
+    header = (
+        f"Run [{run_number}] — {run.status.value.upper()}, started {started}, "
+        f"trigger {run.trigger_type.value if run.trigger_type else 'manual'}, "
+        f"{run.total_tokens or 0} tokens"
+        + (f", error: {run.error}" if run.error else "")
+    )
+    return header + "\n\n" + "\n\n".join(steps)
+
+
 async def _build_agent_context_block(session: AsyncSession, agent: Agent) -> str:
     """Build a live <agent_context> block for the system prompt on every request."""
     tool_rows = await session.exec(select(AgentTool).where(AgentTool.agent_id == agent.id))
@@ -967,17 +1088,30 @@ async def _build_agent_context_block(session: AsyncSession, agent: Agent) -> str
         .limit(20)
     )
     run_lines = []
-    for r in runs_result.all():
+    # Numbered so the copilot can name one when calling read_run_trace. 1 = most recent.
+    for n, r in enumerate(runs_result.all(), 1):
         date = r.started_at.strftime("%Y-%m-%d %H:%M") if r.started_at else "?"
         tokens = f" | {r.total_tokens} tok" if r.total_tokens else ""
         error = f" | error: {r.error[:80]}" if r.error else ""
         trigger = r.trigger_type.value if r.trigger_type else "manual"
-        run_lines.append(f"  - [{r.status.value.upper()}] {date} ({trigger}){tokens}{error}")
+        run_lines.append(f"  [{n}] [{r.status.value.upper()}] {date} ({trigger}){tokens}{error}")
+
+    settings = {**DEFAULT_AGENT_SETTINGS, **(agent.settings or {})}
+    web_on = settings.get("web_search", False)
+    page_on = settings.get("live_page_access", False)
+    web_status = (
+        "Web search ON, live page access ON"
+        if web_on and page_on
+        else "Web search ON, live page access OFF"
+        if web_on
+        else "Web search OFF (both toggles off)"
+    )
 
     return (
         f"<agent_context>\n"
         f"Agent: {agent.name}\n"
-        f"Model: {agent.model or 'not set'}\n\n"
+        f"Model: {agent.model or 'not set'}\n"
+        f"Web settings: {web_status}\n\n"
         f"Current instructions:\n```\n{agent.instructions or '(empty)'}\n```\n\n"
         f"Attached tools:\n{chr(10).join(tool_lines) or '  (none)'}\n\n"
         f"Attached skills:\n{chr(10).join(skill_lines) or '  (none)'}\n\n"
@@ -1050,23 +1184,141 @@ async def assist_chat(
     for m in history:
         msgs.append({"role": m.role, "content": m.content})
 
-    async def event_stream():
-        accumulated = ""
+    # Research tools — always available to the copilot, no connector required.
+    from app.core.workspace import get_tavily_key
+    _copilot_org = await session.get(Organization, agent.org_id)
+    _research_tools = _websearch.build_tools(
+        live_page_access=True,
+        context_size="medium",
+        tavily_api_key=get_tavily_key(_copilot_org),
+    )
+
+    # Lets the copilot read what an agent actually did on a past run: the tools it called,
+    # the arguments it passed (which is where an outbound message body lives), and what
+    # came back. Without it the copilot only sees run status and has to guess at causes.
+    async def _trace_handler(args: dict, dry_run: bool) -> str:
         try:
-            async for chunk in llm.stream_chat(msgs):
-                accumulated += chunk
-                encoded = chunk.replace("\n", "\\n")
-                yield f"data: {encoded}\n\n"
+            run_number = int(args.get("run", 1))
+        except (TypeError, ValueError):
+            return "Error: 'run' must be a whole number, 1 for the most recent run."
+        return await _run_trace(session, agent, run_number)
+
+    _research_tools = _research_tools + [
+        RegisteredTool(
+            spec=ToolSpec(
+                name="read_run_trace",
+                description=(
+                    "Read the full step-by-step trace of one of this agent's past runs: "
+                    "every tool it called, the arguments it passed, what each tool "
+                    "returned, and its closing message. Use this before diagnosing why a "
+                    "run behaved a certain way — do not guess from the run status alone. "
+                    "Runs are numbered in the agent context, 1 being the most recent."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "run": {
+                            "type": "integer",
+                            "description": "Which run to read. 1 is the most recent.",
+                        }
+                    },
+                    "required": ["run"],
+                },
+            ),
+            handler=_trace_handler,
+        )
+    ]
+
+    _research_specs = [t.spec for t in _research_tools]
+    _research_handlers = {t.spec.name: t.handler for t in _research_tools}
+
+    # Status label shown to the user while the model calls tools.
+    def _status_line(tool_name: str, args: dict) -> str:
+        if tool_name == "search_web":
+            return f"Searching the web for \"{args.get('query', '')}\"…"
+        if tool_name == "fetch_page":
+            url = args.get("url", "")
+            host = url.split("/")[2] if url.count("/") >= 2 else url
+            return f"Reading {host}…"
+        if tool_name == "read_run_trace":
+            return f"Reading the trace of run {args.get('run', 1)}…"
+        return f"Running {tool_name}…"
+
+    async def event_stream():
+        answer = ""
+        agent_tag = f"agent={agent_id} model={model!r}"
+        try:
+            # Bounded tool loop: up to RESEARCH_MAX_ROUNDS rounds.  If the model
+            # still wants tools after the cap, one final call without tools forces
+            # a text answer.
+            RESEARCH_MAX_ROUNDS = 6
+            loop_msgs = list(msgs)  # shallow copy so original is unchanged
+
+            log.info("[assist] START %s user=%r", agent_tag, body.content[:120])
+
+            for round_num in range(RESEARCH_MAX_ROUNDS + 1):
+                force_text = round_num == RESEARCH_MAX_ROUNDS
+                log.info("[assist] round=%d force_text=%s %s", round_num, force_text, agent_tag)
+
+                resp = await llm.chat(
+                    loop_msgs,
+                    tools=None if force_text else _research_specs,
+                )
+
+                log.info(
+                    "[assist] round=%d tool_calls=%d content_len=%d %s",
+                    round_num,
+                    len(resp.tool_calls or []),
+                    len(resp.content or ""),
+                    agent_tag,
+                )
+
+                if not resp.tool_calls or force_text:
+                    # Final text answer — emit as a single streamed payload.
+                    answer = resp.content
+                    log.info("[assist] FINAL answer_len=%d %s", len(answer), agent_tag)
+                    encoded = answer.replace("\n", "\\n")
+                    yield f"data: {encoded}\n\n"
+                    break
+
+                # Execute each tool call and stream a status line for each.
+                loop_msgs.append(assistant_message(resp.content, resp.tool_calls))
+                for tc in resp.tool_calls:
+                    log.info(
+                        "[assist] tool_call name=%r args=%r %s",
+                        tc.name,
+                        tc.arguments,
+                        agent_tag,
+                    )
+                    status = _status_line(tc.name, tc.arguments)
+                    yield f"data: [STATUS] {status}\n\n"
+                    handler = _research_handlers.get(tc.name)
+                    if handler is None:
+                        result = f"Unknown tool: {tc.name}"
+                        log.warning("[assist] unknown tool %r %s", tc.name, agent_tag)
+                    else:
+                        result = await handler(tc.arguments, False)
+                    log.info(
+                        "[assist] tool_result name=%r result_len=%d snippet=%r %s",
+                        tc.name,
+                        len(result),
+                        result[:200],
+                        agent_tag,
+                    )
+                    loop_msgs.append(tool_message(tc.id, tc.name, result))
+
         except Exception as exc:
+            log.exception("[assist] ERROR %s", agent_tag)
             yield f"data: [ERROR] {exc}\n\n"
         finally:
-            # Save the completed assistant reply
-            if accumulated:
+            # Persist only the final answer text; the research trace is ephemeral.
+            if answer:
                 assistant_msg = AgentAssistMessage(
-                    agent_id=agent.id, role="assistant", content=accumulated
+                    agent_id=agent.id, role="assistant", content=answer
                 )
                 session.add(assistant_msg)
                 await session.commit()
+            log.info("[assist] DONE persisted=%s %s", bool(answer), agent_tag)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

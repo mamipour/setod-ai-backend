@@ -105,6 +105,26 @@ class Settings(BaseSettings):
             return self.allowed_origins[0]
         return "http://localhost:3000"
 
+    @property
+    def cookie_domain(self) -> str | None:
+        """Shared parent domain for the auth cookie in production.
+
+        Setting domain=".setod.com" makes the cookie visible to both setod.com
+        (Next.js middleware) and api.setod.com (the API), which is required for
+        the session middleware to see the token after the OAuth redirect.
+        In development, None lets the browser default to the exact hostname.
+        """
+        if not self.is_production:
+            return None
+        from urllib.parse import urlparse
+        parsed = urlparse(self.frontend_origin)
+        host = parsed.hostname or ""
+        # Strip leading www/subdomain to get the registrable domain
+        parts = host.split(".")
+        if len(parts) >= 2:
+            return "." + ".".join(parts[-2:])
+        return None
+
     def mcp_oauth_app(self, catalog_key: str) -> tuple[str, str]:
         """Pre-registered confidential client for a catalog MCP server, if we have one."""
         apps = {
