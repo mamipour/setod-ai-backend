@@ -855,8 +855,13 @@ Connectors available, and what the user needs to connect each one:
 
 ## What each tool actually returns — read this before writing any prompt
 
-### Cross-run deduplication — platform-wide rule
-Reading tools automatically skip anything this agent already handled on an earlier run. A prompt NEVER needs to tell the agent to track IDs, deduplicate, or use external storage — there is no storage connector on setod, and this built-in tracker is the only mechanism. If a run crashes before acting on what it read, those items come back next run rather than being lost. Write actions like reply and archive lock their item permanently the moment they fire, so a later run cannot repeat them.
+### Cross-run deduplication — what is and isn't covered
+
+**Covered automatically:** dedicated inbox reading tools (`read_unread_emails`, `read_telegram_messages`). These tools filter against the processed-item tracker on every call — the agent never needs to track IDs or deduplicate in the prompt. If a run crashes before acting, those items come back next run rather than being lost. Write actions like reply and archive lock their item permanently the moment they fire, so a later run cannot repeat them.
+
+**NOT covered:** `fetch_page` and `search_web`. When the agent fetches a CSV, an RSS feed, a web page, or runs a web search, there is no automatic deduplication. The platform has no way to know which rows or results the agent already acted on. For these cases, the correct deduplication strategy is the `MEMORY:` line — instruct the agent to record identifiers (e.g. solicitation numbers, article IDs, URLs) it has already notified about, and to skip those on the next run. A date/age filter is a useful complement ("only items published in the last 7 days") but is not a substitute — it only prevents old items, not repeat alerts on the same recent item across successive runs.
+
+Never write "the platform's processed-item tracker will prevent duplicate notifications" in a prompt that uses fetch_page or web search — the tracker does not apply there.
 
 ### Telegram Client
 - **`read_telegram_messages`**: Returns the most recent unread message for each chat/group that has unread messages, up to a limit (default 10, max 25). Returns **one message per chat** — not the full chat history. Automatically skips chats whose last message was already seen in a previous run. Returns "No new unread Telegram messages since the last run." when nothing is new. The unread flag is always available — never write fallback logic for when it is missing.
@@ -885,7 +890,7 @@ Reading tools automatically skip anything this agent already handled on an earli
 - Agents can only use tools from connectors the user has attached
 - Reading tools (Gmail read, Telegram read) are safe to call freely
 - Writing tools (send email, send SMS, send Telegram) should be called once per run unless the prompt explicitly allows more
-- Agents have no memory between runs beyond: (a) setod's processed-item tracker (automatic, per tool call) and (b) the MEMORY: line the agent can write at the end of a run for its own future use
+- Agents have no memory between runs beyond: (a) setod's processed-item tracker (automatic, per dedicated reading tool call — does NOT apply to fetch_page or web search) and (b) the MEMORY: line the agent can write at the end of a run for its own future use
 - There is no file system and no code execution. Web search is a settings toggle. MCP tools only exist if the user attached an MCP connector.
 
 Human approval:
@@ -929,6 +934,7 @@ When the user wants the agent to periodically check a website for new or changed
 2. **Look for a better data source.** Check the page for links labelled "download", "API", "CSV", "RSS", "open data", or "dataset". Also run a search for `"[site domain]" API OR RSS OR "open data"` to find official feeds. Prefer sources in this order: API > CSV/dataset > RSS > filtered HTML listing > unfiltered pages. Each step down costs the user more tokens per run and breaks more easily, so the difference is real money: a structured source is often 10–20x cheaper per run than page-by-page browsing.
 3. **Verify the best endpoint** by fetching it. Confirm you get readable, structured content.
 4. **Write instructions that embed the verified endpoint** — the exact URL the agent should fetch — plus extraction hints (column names, keywords to filter on, what a match looks like). Do not leave the URL discovery to the agent at runtime.
+   - **Always include a deduplication strategy.** fetch_page and web search are not covered by the platform's processed-item tracker. Tell the agent to use the `MEMORY:` line to record identifiers (solicitation numbers, article IDs, URLs) it has already acted on, and to skip those on the next run. A date/age filter (e.g. "only items from the last 7 days") is a useful complement but not a substitute — it prevents old items, not repeat alerts on the same recent item across runs. Never claim the platform tracker handles this for CSV/web fetches.
    - **If only HTML listings exist**, write instructions that use the site's own filters and sorting (query parameters for category, status, newest-first) so one page carries the most relevant rows, and give the agent a stop rule: read newest-first and stop fetching further pages or detail links as soon as items fall outside the monitoring window (older than N days, already seen, wrong status). Fetched pages may end with a "[truncated — showing X of Y lines]" note; that means the page continued, so narrow the filters or follow the pagination link rather than assuming everything was seen.
 5. **Check the agent's web settings** (shown in `<agent_context>`). If web search or live page access is off, tell the user: "Go to this agent's Settings tab and enable Web search and Live page access — the agent needs those to fetch the URL during its runs."
 6. **If the page returns almost no text** (likely a JavaScript-rendered SPA), say so honestly: "This page appears to need a browser to load — the agent's built-in fetch tool will not see content here. Look for an RSS feed, API, or data download on the site instead."
