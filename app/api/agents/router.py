@@ -851,14 +851,30 @@ Connectors available (tools the agent can call):
 - Telegram Client — read messages from any chat/group the user's account has access to, send messages
 - Twilio — send SMS
 - MCP — remote HTTPS tool servers (GitHub, Linear, Notion, Slack, Atlassian, Zapier, or a custom URL). Tools are whatever the user attached from that server; do not invent MCP tool names.
-
 - Other agents — call a published agent as a tool (call_X) and get its final answer back. The target runs with its own accounts and approval rules. Depth is capped at 1 — a called agent cannot itself call agents.
 
-Tool behaviour rules every prompt must respect:
+## What each tool actually returns — read this before writing any prompt
+
+**Telegram Client — `read_telegram_messages`**
+- Returns the most recent unread message for each chat/group that has unread messages, up to a configurable limit (default 10, max 25). It returns ONE message per chat, not the full message history.
+- setod automatically tracks which messages were processed on previous runs. The tool silently excludes already-seen messages and returns "No new unread Telegram messages since the last run." when nothing is new. Prompts do NOT need to instruct the agent to deduplicate, track message IDs, or use any external storage — this is handled by the platform.
+- The "unread" flag is always available — do not write fallback instructions for when it is missing.
+- There is NO "mark as read" tool. Marking messages as read is not a capability of the Telegram connector.
+- To avoid re-processing: the platform handles this. A prompt that says "skip messages you've already seen" or "track processed IDs" is redundant and may confuse the agent.
+
+**Google Gmail — `read_unread_emails`**
+- Returns unread emails, newest first, up to a limit.
+- setod automatically tracks processed email IDs across runs — same behaviour as Telegram. Prompts do not need to handle deduplication.
+
+**All reading tools — cross-run deduplication is built in**
+- setod's processed-item tracker is always active for reading tools. The tool itself handles "have I seen this before?" — the agent's prompt never needs to.
+- Do NOT suggest that a user attach "Google", "MCP", or any other connector purely for persistence/storage. There is no storage connector on setod. The platform's built-in tracker is the only cross-run deduplication mechanism.
+
+## Tool behaviour rules every prompt must respect
 - Agents can only use tools from connectors the user has attached
 - Reading tools (Gmail read, Telegram read) are safe to call freely
 - Writing tools (send email, send SMS, send Telegram) should be called once per run unless the prompt explicitly allows more
-- Agents have no memory between runs unless the prompt explicitly builds one from tool output
+- Agents have no memory between runs beyond: (a) setod's processed-item tracker (automatic, per tool call) and (b) the MEMORY: line the agent can write at the end of a run for its own future use
 - There is no file system and no code execution. Web search is a settings toggle. MCP tools only exist if the user attached an MCP connector.
 
 Human approval:
