@@ -903,6 +903,7 @@ Skills:
 - Skills are attached per-agent from the Agent tab → Skills section
 - When attached, a skill's content is injected into the agent's system prompt automatically — the user does not need to copy its text into the instructions
 - Default skills available in every org: Silence when idle, No duplicate actions, One action per run, Urgency first, After-hours notifications only, Escalate when unsure, Professional tone, Concise run summary, No PII in summaries, Stop gracefully at budget, Lead qualification
+- "No duplicate actions" covers in-run safety (prevents the agent calling the same write tool twice within a single run). It does NOT handle cross-run deduplication of fetched content — for that, MEMORY: is the correct mechanism.
 - Users can edit any skill or create their own from the Skills page (sidebar → Skills)
 - When writing a prompt, you should NOT duplicate behaviour that a skill already handles — instead tell the user to attach the relevant skill
 
@@ -1156,10 +1157,20 @@ async def _build_agent_context_block(session: AsyncSession, agent: Agent) -> str
         else "Web search OFF (both toggles off)"
     )
 
+    # Resolve the effective model label from the connector, since agent.model is often null
+    # while model_connector_id points to the real provider. Show the connector name so the
+    # copilot knows the agent is properly configured.
+    model_label = agent.model or ""
+    if not model_label and agent.model_connector_id:
+        mc = await session.get(Connector, agent.model_connector_id)
+        if mc:
+            model_label = f"{mc.name} ({mc.type.value})"
+    model_label = model_label or "not set — agent cannot run until a model connector is chosen"
+
     return (
         f"<agent_context>\n"
         f"Agent: {agent.name}\n"
-        f"Model: {agent.model or 'not set'}\n"
+        f"Model: {model_label}\n"
         f"Web settings: {web_status}\n\n"
         f"Current instructions:\n```\n{agent.instructions or '(empty)'}\n```\n\n"
         f"Attached tools:\n{chr(10).join(tool_lines) or '  (none)'}\n\n"
