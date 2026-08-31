@@ -178,7 +178,12 @@ async def google_callback(
 
 @router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie("access_token")
+    response.delete_cookie(
+        "access_token",
+        domain=settings.cookie_domain,
+        samesite="lax",
+        secure=settings.is_production,
+    )
     return {"ok": True}
 
 
