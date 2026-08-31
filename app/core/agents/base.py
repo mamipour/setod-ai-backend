@@ -125,15 +125,14 @@ _MEMORY_MARKER = re.compile(r"^\s*MEMORY:\s*(?P<note>.+?)\s*$", re.MULTILINE)
 # recalled text is whatever prose the run happened to end on. Emitted from the same setting
 # as the recall so the two halves can never be configured apart.
 MEMORY_PREAMBLE = (
-    "End your final message with a single line starting `MEMORY:`. It is the only thing "
-    "your next run will remember, so put only what that run needs to avoid repeating work: "
-    "items you acted on, state you established, what you deliberately skipped. Record each "
-    "item by its exact identifier — reference number, ID, URL slug — never by name, title, "
-    "or description. Your next run deduplicates by matching these identifiers exactly; a "
-    "description forces it to guess whether two items are the same, and it will guess "
-    "wrong. Carry forward identifiers from earlier MEMORY lines that still matter and drop "
-    f"what has gone stale. Keep it under {MEMORY_LINE_CHARS} characters. If there is "
-    "nothing worth carrying forward, write `MEMORY: none`."
+    "End your final message with a single line starting `MEMORY:`. Your recalled notes "
+    "from earlier runs are injected above — treat them as the running state you must "
+    "maintain. Always carry every identifier forward from those notes unless it has clearly "
+    "gone stale (e.g. a tender that closed, a task that is done). Add any new identifiers "
+    "you acted on this run. Record each item by its exact identifier — reference number, "
+    "ID, URL slug — never by name or description. Deduplication works by exact match; a "
+    f"description forces a guess. Keep it under {MEMORY_LINE_CHARS} characters. If this "
+    "run and all recalled notes have nothing worth preserving, write `MEMORY: none`."
 )
 
 
