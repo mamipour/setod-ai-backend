@@ -1180,12 +1180,12 @@ async def assist_chat(
     history = history_result.all()
 
     # Build the fresh context block and inject it into the system prompt.
-    # REASONING_PREAMBLE is always enabled for the copilot — it benefits from
-    # thinking through prompt issues before advising, and the models we select
-    # are reasoning-capable so this costs nothing extra.
-    from app.core.agents.base import REASONING_PREAMBLE
+    # NOTE: REASONING_PREAMBLE is intentionally NOT used here. The models we
+    # select (gpt-5-mini, claude-sonnet-5, etc.) reason natively and silently.
+    # Adding the preamble caused the model to output its internal monologue as
+    # visible reply text ("Reasoning: I reviewed..."), which clutters the chat.
     context_block = await _build_agent_context_block(session, agent)
-    full_system = _ASSIST_SYSTEM + "\n\n" + REASONING_PREAMBLE + "\n\n" + context_block
+    full_system = _ASSIST_SYSTEM + "\n\n" + context_block
 
     msgs: list[dict] = [system_message(full_system)]
     for m in history:
