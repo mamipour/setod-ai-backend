@@ -1157,11 +1157,14 @@ async def assist_chat(
         raise HTTPException(status_code=404, detail="Model connector not found")
 
     config = decrypt_json(connector.config)
-    # If this connector has no model stored (e.g. the user never configured a specific model
-    # for it), fall back to the agent's own model rather than a hardcoded default — that way
-    # the model ID is always something the user has explicitly chosen and validated.
-    model = config.get("model") or agent.model or ""
-    llm = build_client(connector.type.value, config.get("api_key", ""), model)
+    api_key = config.get("api_key", "")
+    # Pick the best reasoning-capable model from our copilot preference list.
+    # Falls back to the agent's configured model when nothing from the list is available,
+    # so the copilot always gets a valid model even on restricted API keys.
+    configured_model = config.get("model") or agent.model or ""
+    from app.core.llm.client import pick_copilot_model
+    model = await pick_copilot_model(connector.type.value, api_key, fallback=configured_model)
+    llm = build_client(connector.type.value, api_key, model)
 
     # Persist the user message immediately
     user_msg = AgentAssistMessage(agent_id=agent.id, role="user", content=body.content)
@@ -1176,9 +1179,13 @@ async def assist_chat(
     )
     history = history_result.all()
 
-    # Build the fresh context block and inject it into the system prompt
+    # Build the fresh context block and inject it into the system prompt.
+    # REASONING_PREAMBLE is always enabled for the copilot — it benefits from
+    # thinking through prompt issues before advising, and the models we select
+    # are reasoning-capable so this costs nothing extra.
+    from app.core.agents.base import REASONING_PREAMBLE
     context_block = await _build_agent_context_block(session, agent)
-    full_system = _ASSIST_SYSTEM + "\n\n" + context_block
+    full_system = _ASSIST_SYSTEM + "\n\n" + REASONING_PREAMBLE + "\n\n" + context_block
 
     msgs: list[dict] = [system_message(full_system)]
     for m in history:

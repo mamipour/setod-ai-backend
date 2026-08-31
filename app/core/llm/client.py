@@ -18,12 +18,15 @@ two, and Anthropic is adapted to it here:
 Keeping all of that here means the loop deals in one vocabulary.
 """
 
+import hashlib
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import anthropic
+import httpx
 import openai
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -318,6 +321,84 @@ DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
 }
+
+
+# ── Copilot model selection ────────────────────────────────────────────────────
+# Ordered best-to-worst for the copilot use-case (prompt engineering + run analysis).
+# Frontier/overkill models (gpt-5.6-sol, gpt-5.5-pro, gpt-5.4-pro, claude-fable-5,
+# claude-opus-5) are intentionally excluded — they add cost without improving
+# conversational prompt advice, and the copilot isn't doing frontier research.
+_COPILOT_PREFS: dict[str, list[str]] = {
+    "openai": [
+        "gpt-5",         # strong reasoning, appropriate for iterative chat
+        "gpt-5-mini",    # fast reasoning, cost-efficient sweet spot
+        "o3",            # reasoning-first, great for analysis
+        "o4-mini",       # fast o-series, good conversational reasoning
+        "gpt-5.5",       # borderline but capable
+        "gpt-4.1",       # solid non-reasoning fallback
+        "gpt-4o",
+        "gpt-4o-mini",
+    ],
+    "anthropic": [
+        "claude-sonnet-5",        # adaptive thinking high by default — sweet spot
+        "claude-opus-4-8",        # capable, reasoning available
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-5",          # deep reasoning, slightly pricier
+        "claude-sonnet-4-6",      # solid fallback
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5",
+    ],
+}
+
+# (provider + key-hash) -> (chosen model, monotonic expiry)
+_copilot_model_cache: dict[str, tuple[str, float]] = {}
+_COPILOT_CACHE_TTL = 3600.0  # re-fetch live list at most once per hour
+
+
+async def pick_copilot_model(provider: str, api_key: str, fallback: str = "") -> str:
+    """Return the best copilot model the API key actually has access to.
+
+    Fetches the provider's live model list (cached for 1 h) and returns the first
+    entry from *_COPILOT_PREFS* that appears in the list. Falls back to *fallback*
+    (usually the agent's own configured model) when nothing matches or the fetch
+    fails — so the copilot always gets *some* model rather than crashing.
+    """
+    cache_key = f"{provider}:{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
+    now = time.monotonic()
+    cached = _copilot_model_cache.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    prefs = _COPILOT_PREFS.get(provider, [])
+    available: set[str] = set()
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            if provider == "openai":
+                resp = await http.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                if resp.status_code == 200:
+                    available = {m["id"] for m in resp.json().get("data", [])}
+            elif provider == "anthropic":
+                resp = await http.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+                if resp.status_code == 200:
+                    available = {m["id"] for m in resp.json().get("data", [])}
+    except Exception:
+        pass  # network error — fall through to fallback
+
+    selected = next((m for m in prefs if m in available), fallback)
+    if selected:
+        _copilot_model_cache[cache_key] = (selected, now + _COPILOT_CACHE_TTL)
+    return selected
 
 
 def build_client(provider: str, api_key: str, model: str = "") -> LLMClient:
