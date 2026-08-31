@@ -330,10 +330,10 @@ DEFAULT_MODELS = {
 # conversational prompt advice, and the copilot isn't doing frontier research.
 _COPILOT_PREFS: dict[str, list[str]] = {
     "openai": [
-        "gpt-5",         # strong reasoning, appropriate for iterative chat
-        "gpt-5-mini",    # fast reasoning, cost-efficient sweet spot
-        "o3",            # reasoning-first, great for analysis
-        "o4-mini",       # fast o-series, good conversational reasoning
+        "gpt-5-mini",    # fast + capable — OpenAI's quick/cost-efficient GPT-5 variant
+        "o4-mini",       # fast reasoning, great for conversational Q&A
+        "o3",            # reasoning-first, still reasonably fast
+        "gpt-5",         # demoted: heavy reasoning → 56-66 s TTFT, too slow for chat
         "gpt-5.5",       # borderline but capable
         "gpt-4.1",       # solid non-reasoning fallback
         "gpt-4o",
