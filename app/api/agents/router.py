@@ -855,22 +855,39 @@ Connectors available (tools the agent can call):
 
 ## What each tool actually returns — read this before writing any prompt
 
-**Telegram Client — `read_telegram_messages`**
-- Returns the most recent unread message for each chat/group that has unread messages, up to a configurable limit (default 10, max 25). It returns ONE message per chat, not the full message history.
-- setod automatically tracks which messages were processed on previous runs. The tool silently excludes already-seen messages and returns "No new unread Telegram messages since the last run." when nothing is new. Prompts do NOT need to instruct the agent to deduplicate, track message IDs, or use any external storage — this is handled by the platform.
-- The "unread" flag is always available — do not write fallback instructions for when it is missing.
-- There is NO "mark as read" tool. Marking messages as read is not a capability of the Telegram connector.
-- To avoid re-processing: the platform handles this. A prompt that says "skip messages you've already seen" or "track processed IDs" is redundant and may confuse the agent.
+### Cross-run deduplication — platform-wide rule
+setod's processed-item tracker runs automatically for every reading tool. A prompt NEVER needs to instruct the agent to track IDs, deduplicate, or use external storage. There is no storage connector on setod. The built-in tracker is the only cross-run deduplication mechanism available.
 
-**Google Gmail — `read_unread_emails`**
-- Returns unread emails, newest first, up to a limit.
-- setod automatically tracks processed email IDs across runs — same behaviour as Telegram. Prompts do not need to handle deduplication.
+Two deduplication levels exist in the platform:
+- **note_seen** (deferred): records an item as "surfaced" only when the run finishes successfully. If the run crashes after reading but before acting, the item resurfaces next run — intentionally, so no work is silently dropped.
+- **mark_processed** (immediate/permanent): used by write actions (reply, archive) right after an irreversible action. Survives crashes. Prevents a second run from sending the same reply twice.
 
-**All reading tools — cross-run deduplication is built in**
-- setod's processed-item tracker is always active for reading tools. The tool itself handles "have I seen this before?" — the agent's prompt never needs to.
-- Do NOT suggest that a user attach "Google", "MCP", or any other connector purely for persistence/storage. There is no storage connector on setod. The platform's built-in tracker is the only cross-run deduplication mechanism.
+Prompts do not need to know about these levels — just know that reading tools handle deduplication automatically, and write tools lock an item permanently after acting on it.
 
-## Tool behaviour rules every prompt must respect
+### Telegram Client
+- **`read_telegram_messages`**: Returns the most recent unread message for each chat/group that has unread messages, up to a limit (default 10, max 25). Returns **one message per chat** — not the full chat history. Automatically skips chats whose last message was already seen in a previous run (note_seen deduplication). Returns "No new unread Telegram messages since the last run." when nothing is new. The unread flag is always available — never write fallback logic for when it is missing.
+- **`send_telegram_message`**: Sends a message from the user's account to any @username, phone number, or chat ID.
+- **No mark-as-read tool exists.** There is no way to mark Telegram messages as read. Do not suggest it.
+- **No search tool exists.** You cannot search Telegram history or filter by keyword at fetch time.
+
+### Telegram Bot
+- **`send_telegram_message`**: Sends a message to the single admin chat configured in the connector. One direction only — it cannot read anything.
+
+### Google Gmail
+- **`read_unread_emails`**: Returns unread inbox emails (newest first), each with id, sender, subject, and first 300 characters of body. Default 10, max 25. Skips emails already handled in a previous run (note_seen deduplication). Returns "No new unread email." when nothing is new.
+- **`search_emails`**: Searches with Gmail-style syntax: `from:`, `subject:`, `after:`, `before:`, `is:unread`, `is:read`, etc. Returns up to 25 results. **Does NOT use the deduplication tracker** — always returns whatever matches the query regardless of prior runs.
+- **`send_email`**: Sends a plain-text email. `to` and `body` are required, `subject` is optional.
+- **`reply_to_email`**: Replies to an existing email (takes `message_id` from `read_unread_emails`). Immediately marks the email permanently processed — a second run cannot reply to the same email again.
+- **`archive_email`**: Moves an email out of the inbox (not deleted). Immediately marks permanently processed.
+
+### Google Calendar
+- **`list_calendar_events`**: Lists events on the user's primary calendar between two dates (YYYY-MM-DD). Defaults to today. Returns title, id, start, end, location, and attendees. No deduplication — it's a query, not an inbox.
+- **`create_calendar_event`**: Creates an event with title, start, end (YYYY-MM-DD or YYYY-MM-DDTHH:MM). Optional: description, location, attendees (comma-separated emails — each receives a Google invite), timezone (e.g. America/Toronto).
+
+### Twilio
+- **`send_sms`**: Sends SMS from the connector's fixed phone number. `to` must be E.164 format (e.g. +15551234567). Messages over 160 characters are split into multiple SMS segments and charged per segment — keep bodies under 320 characters when possible. No deduplication — each call sends a new SMS.
+
+### Tool behaviour rules every prompt must respect
 - Agents can only use tools from connectors the user has attached
 - Reading tools (Gmail read, Telegram read) are safe to call freely
 - Writing tools (send email, send SMS, send Telegram) should be called once per run unless the prompt explicitly allows more
