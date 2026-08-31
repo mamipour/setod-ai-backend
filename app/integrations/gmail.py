@@ -1,232 +1,300 @@
 """
-Google connector (Gmail + Calendar)
-===================================
-One OAuth token. Mail lives here; Calendar tools are appended from
-`app.integrations.calendar` so token refresh stays in one place.
+Gmail connector — IMAP read + SMTP send via App Password
+=========================================================
+No OAuth, no Google Cloud Console review required.
+Users generate a 16-char App Password from their Google Account
+(myaccount.google.com → Security → 2-Step Verification → App passwords).
 
-Gmail has no delete: removing the INBOX label is what archiving means, which is why
-`archive_email` modifies labels rather than calling a delete endpoint.
+Config stored encrypted: {"email": "user@gmail.com", "app_password": "xxxx xxxx xxxx xxxx"}
 """
 
-import base64
-from datetime import UTC, datetime
+from __future__ import annotations
+
+import asyncio
+import email as _email_lib
+import email.header
+import imaplib
+import re
+import smtplib
+import ssl
 from email.message import EmailMessage
 from typing import Any
 
-import httpx
-
-from app.config import settings
-from app.core.crypto import decrypt_json, encrypt_json
+from app.core.crypto import decrypt_json
 from app.core.llm.client import ToolSpec
-from app.db.models import Connector, ConnectorStatus
+from app.db.models import Connector
 from app.integrations.base import IntegrationError, RegisteredTool, ToolContext
-from sqlmodel.ext.asyncio.session import AsyncSession
 
-API = "https://gmail.googleapis.com/gmail/v1/users/me"
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
 
-REQUIRED_SCOPES = {
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.labels",
-    "https://www.googleapis.com/auth/calendar.events",
-}
-
-
-# ── Token management ───────────────────────────────────────────────────────────
-
-async def refresh_token(connector: Connector, db: AsyncSession) -> dict[str, Any]:
-    """Exchange the stored refresh token for a fresh access token.
-
-    Marks the connector revoked if Google refuses, which is the signal the UI uses to tell
-    the user to reconnect rather than silently failing every run from then on.
-    """
-    config = decrypt_json(connector.config)
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "refresh_token": config["refresh_token"],
-                "grant_type": "refresh_token",
-            },
-            timeout=15,
-        )
-
-    if resp.status_code != 200:
-        connector.status = ConnectorStatus.revoked
-        connector.updated_at = datetime.now(UTC)
-        db.add(connector)
-        await db.commit()
-        raise IntegrationError("Gmail access was revoked — reconnect the account.")
-
-    data = resp.json()
-    config["access_token"] = data["access_token"]
-    config["token_expires_at"] = datetime.now(UTC).timestamp() + data.get("expires_in", 3600)
-    connector.config = encrypt_json(config)
-    connector.status = ConnectorStatus.active
-    connector.updated_at = datetime.now(UTC)
-    db.add(connector)
-    await db.commit()
-    return config
+# Fetch at most this many bytes per message body when listing.
+# Keeps listing fast; full body is available when the agent needs it.
+_BODY_PREVIEW_BYTES = 30_000
 
 
-async def valid_token(connector: Connector, db: AsyncSession) -> str:
-    """A usable access token, refreshed if it is within 60s of expiring."""
-    config = decrypt_json(connector.config)
-    if datetime.now(UTC).timestamp() >= config.get("token_expires_at", 0) - 60:
-        config = await refresh_token(connector, db)
-    return config["access_token"]
+# ── Config helpers ─────────────────────────────────────────────────────────────
+
+def _cfg(connector: Connector) -> tuple[str, str]:
+    """Return (email, app_password) from the encrypted connector config."""
+    data = decrypt_json(connector.config)
+    return data["email"], data["app_password"]
 
 
-async def _call(
-    connector: Connector,
-    db: AsyncSession,
-    method: str,
-    path: str,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    token = await valid_token(connector, db)
-    async with httpx.AsyncClient() as client:
-        resp = await client.request(
-            method,
-            f"{API}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-            **kwargs,
-        )
-    if resp.status_code == 401:
-        raise IntegrationError("Gmail rejected the access token — reconnect the account.")
-    if resp.status_code >= 400:
-        detail = resp.json().get("error", {}).get("message", resp.text[:200])
-        raise IntegrationError(f"Gmail API error ({resp.status_code}): {detail}")
-    return resp.json() if resp.content else {}
+# ── IMAP primitives (sync — run in thread) ────────────────────────────────────
+
+def _imap_connect(email_addr: str, app_password: str) -> imaplib.IMAP4_SSL:
+    ctx = ssl.create_default_context()
+    imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
+    try:
+        imap.login(email_addr, app_password)
+    except imaplib.IMAP4.error as exc:
+        raise IntegrationError(
+            f"Gmail login failed — check the App Password is correct. ({exc})"
+        ) from exc
+    return imap
 
 
-# ── Operations ─────────────────────────────────────────────────────────────────
-
-async def get_profile(connector: Connector, db: AsyncSession) -> dict[str, Any]:
-    return await _call(connector, db, "GET", "/profile")
-
-
-async def check_scopes(connector: Connector, db: AsyncSession) -> set[str]:
-    """Scopes actually granted, so the UI can warn before an agent fails mid-run."""
-    token = await valid_token(connector, db)
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://www.googleapis.com/oauth2/v3/tokeninfo",
-            params={"access_token": token},
-            timeout=15,
-        )
-    if resp.status_code != 200:
-        return set()
-    return set(resp.json().get("scope", "").split())
+def _decode_header_str(value: str | None) -> str:
+    if not value:
+        return ""
+    parts = email.header.decode_header(value)
+    out = []
+    for raw, charset in parts:
+        if isinstance(raw, bytes):
+            out.append(raw.decode(charset or "utf-8", errors="replace"))
+        else:
+            out.append(raw)
+    return "".join(out)
 
 
-async def list_messages(
-    connector: Connector, db: AsyncSession, query: str, limit: int
-) -> list[dict[str, Any]]:
-    """Message ids matching a Gmail search query. Metadata comes from `get_message`."""
-    data = await _call(
-        connector, db, "GET", "/messages",
-        params={"q": query, "maxResults": min(limit, 50)},
-    )
-    return data.get("messages", [])
+def _extract_body(msg: _email_lib.message.Message) -> str:
+    """Pull plain text from a parsed email, stripping HTML tags as fallback."""
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if "attachment" in str(part.get("Content-Disposition", "")):
+                continue
+            if ct == "text/plain":
+                raw = part.get_payload(decode=True)
+                body = raw.decode(part.get_content_charset() or "utf-8", errors="replace")
+                break
+            if ct == "text/html" and not body:
+                raw = part.get_payload(decode=True)
+                html = raw.decode(part.get_content_charset() or "utf-8", errors="replace")
+                body = _strip_html(html)
+    else:
+        raw = msg.get_payload(decode=True)
+        text = raw.decode(msg.get_content_charset() or "utf-8", errors="replace") if raw else ""
+        body = _strip_html(text) if msg.get_content_type() == "text/html" else text
+    return body.strip()
 
 
-async def get_message(connector: Connector, db: AsyncSession, message_id: str) -> dict[str, Any]:
-    """Headers plus a text snippet — enough to triage without pulling whole attachments."""
-    data = await _call(
-        connector, db, "GET", f"/messages/{message_id}",
-        params={
-            "format": "metadata",
-            "metadataHeaders": ["From", "To", "Subject", "Date"],
-        },
-    )
-    headers = {h["name"].lower(): h["value"] for h in data.get("payload", {}).get("headers", [])}
+def _strip_html(html: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _parse_message(uid: str, raw_bytes: bytes) -> dict[str, Any]:
+    msg = _email_lib.message_from_bytes(raw_bytes)
     return {
-        "id": data.get("id"),
-        "thread_id": data.get("threadId"),
-        "from": headers.get("from", ""),
-        "to": headers.get("to", ""),
-        "subject": headers.get("subject", "(no subject)"),
-        "date": headers.get("date", ""),
-        "snippet": data.get("snippet", ""),
-        "labels": data.get("labelIds", []),
+        "id": uid,
+        "from": _decode_header_str(msg.get("From")),
+        "to": _decode_header_str(msg.get("To")),
+        "subject": _decode_header_str(msg.get("Subject")) or "(no subject)",
+        "date": msg.get("Date", ""),
+        "message_id_header": msg.get("Message-ID", ""),
+        "body": _extract_body(msg),
     }
+
+
+def _search_sync(
+    email_addr: str, app_password: str, criteria: str, limit: int
+) -> list[dict[str, Any]]:
+    """IMAP search → fetch message data. Returns newest-first up to limit."""
+    imap = _imap_connect(email_addr, app_password)
+    try:
+        imap.select("INBOX")
+        status, data = imap.uid("search", None, criteria)
+        if status != "OK":
+            return []
+        uids = data[0].split() if data[0] else []
+        uids = uids[-limit:]  # newest UIDs are highest numbers
+
+        results = []
+        for uid_bytes in reversed(uids):
+            uid = uid_bytes.decode()
+            status, msg_data = imap.uid(
+                "fetch", uid, f"(BODY.PEEK[]<0.{_BODY_PREVIEW_BYTES}>)"
+            )
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1]
+            results.append(_parse_message(uid, raw))
+        return results
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _get_message_sync(email_addr: str, app_password: str, uid: str) -> dict[str, Any]:
+    """Fetch a single message by IMAP UID (full body)."""
+    imap = _imap_connect(email_addr, app_password)
+    try:
+        imap.select("INBOX")
+        status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            raise IntegrationError(f"Message {uid} not found in INBOX.")
+        return _parse_message(uid, msg_data[0][1])
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _send_sync(
+    email_addr: str,
+    app_password: str,
+    to: str,
+    subject: str,
+    body: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+) -> None:
+    msg = EmailMessage()
+    msg["From"] = email_addr
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as smtp:
+        try:
+            smtp.login(email_addr, app_password)
+        except smtplib.SMTPAuthenticationError as exc:
+            raise IntegrationError(
+                f"Gmail SMTP login failed — check the App Password. ({exc})"
+            ) from exc
+        smtp.send_message(msg)
+
+
+def _archive_sync(email_addr: str, app_password: str, uid: str) -> None:
+    """Move message from INBOX to [Gmail]/All Mail (archive, not delete)."""
+    imap = _imap_connect(email_addr, app_password)
+    try:
+        imap.select("INBOX")
+        # Gmail supports the MOVE extension; fall back to copy+delete if not.
+        try:
+            imap.uid("move", uid, "[Gmail]/All Mail")
+        except Exception:
+            imap.uid("copy", uid, "[Gmail]/All Mail")
+            imap.uid("store", uid, "+FLAGS", "\\Deleted")
+            imap.expunge()
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _test_connection_sync(email_addr: str, app_password: str) -> None:
+    """Attempt IMAP login and return; raises IntegrationError on failure."""
+    imap = _imap_connect(email_addr, app_password)
+    imap.logout()
+
+
+# ── Async wrappers ─────────────────────────────────────────────────────────────
+
+async def search_messages(
+    connector: Connector, criteria: str, limit: int
+) -> list[dict[str, Any]]:
+    email_addr, pwd = _cfg(connector)
+    return await asyncio.to_thread(_search_sync, email_addr, pwd, criteria, limit)
+
+
+async def get_message(connector: Connector, uid: str) -> dict[str, Any]:
+    email_addr, pwd = _cfg(connector)
+    return await asyncio.to_thread(_get_message_sync, email_addr, pwd, uid)
 
 
 async def send_message(
     connector: Connector,
-    db: AsyncSession,
     to: str,
     subject: str,
     body: str,
-    thread_id: str | None = None,
-) -> dict[str, Any]:
-    msg = EmailMessage()
-    msg["To"] = to
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    payload: dict[str, Any] = {
-        "raw": base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    }
-    if thread_id:
-        payload["threadId"] = thread_id
-
-    return await _call(connector, db, "POST", "/messages/send", json=payload)
+    in_reply_to: str | None = None,
+    references: str | None = None,
+) -> None:
+    email_addr, pwd = _cfg(connector)
+    await asyncio.to_thread(_send_sync, email_addr, pwd, to, subject, body, in_reply_to, references)
 
 
-async def archive_message(connector: Connector, db: AsyncSession, message_id: str) -> None:
-    """Gmail has no archive endpoint — removing INBOX is what archiving is."""
-    await _call(
-        connector, db, "POST", f"/messages/{message_id}/modify",
-        json={"removeLabelIds": ["INBOX"]},
-    )
+async def archive_message(connector: Connector, uid: str) -> None:
+    email_addr, pwd = _cfg(connector)
+    await asyncio.to_thread(_archive_sync, email_addr, pwd, uid)
+
+
+async def test_connection(connector: Connector) -> str:
+    """Returns a success detail string, raises IntegrationError on failure."""
+    email_addr, pwd = _cfg(connector)
+    await asyncio.to_thread(_test_connection_sync, email_addr, pwd)
+    return email_addr
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
 def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
-    connector, db = ctx.connector, ctx.db
+    connector = ctx.connector
 
     async def read_unread(args: dict[str, Any], dry_run: bool) -> str:
         limit = min(int(args.get("limit", 10)), 25)
-        stubs = await list_messages(connector, db, "is:unread in:inbox", limit)
-        ids = [s["id"] for s in stubs]
+        msgs = await search_messages(connector, "UNSEEN", limit)
+        ids = [m["id"] for m in msgs]
 
-        fresh = await ctx.unprocessed(ids)
-        skipped = len(ids) - len(fresh)
+        fresh_set = await ctx.unprocessed(ids)
+        fresh = [m for m in msgs if m["id"] in fresh_set]
+        skipped = len(msgs) - len(fresh)
+
         if not fresh:
             return f"No new unread email. ({skipped} already handled in an earlier run.)"
 
-        out = []
-        for mid in [i for i in ids if i in fresh]:
-            msg = await get_message(connector, db, mid)
-            ctx.note_seen(mid)
-            out.append(msg)
+        for m in fresh:
+            ctx.note_seen(m["id"])
 
         lines = [
-            f"{i + 1}. id={m['id']} from={m['from']} subject={m['subject']!r} — {m['snippet'][:160]}"
-            for i, m in enumerate(out)
+            f"{i + 1}. id={m['id']} from={m['from']} subject={m['subject']!r}\n"
+            f"   {m['body'][:300]}"
+            for i, m in enumerate(fresh)
         ]
-        suffix = f"\n({skipped} already handled in an earlier run, omitted.)" if skipped else ""
-        return f"{len(out)} unread email(s):\n" + "\n".join(lines) + suffix
+        suffix = f"\n({skipped} already handled, omitted.)" if skipped else ""
+        return f"{len(fresh)} unread email(s):\n" + "\n".join(lines) + suffix
 
     async def search(args: dict[str, Any], dry_run: bool) -> str:
         query = str(args.get("query", "")).strip()
         if not query:
             return "Error: query is required."
-        stubs = await list_messages(connector, db, query, min(int(args.get("limit", 10)), 25))
-        if not stubs:
+        # Convert Gmail-style search to IMAP where possible; pass through otherwise.
+        imap_criteria = _gmail_query_to_imap(query)
+        limit = min(int(args.get("limit", 10)), 25)
+        msgs = await search_messages(connector, imap_criteria, limit)
+        if not msgs:
             return f"No email matched {query!r}."
-        msgs = [await get_message(connector, db, s["id"]) for s in stubs]
-        return f"{len(msgs)} result(s):\n" + "\n".join(
-            f"{i + 1}. id={m['id']} from={m['from']} subject={m['subject']!r} — {m['snippet'][:160]}"
+        lines = [
+            f"{i + 1}. id={m['id']} from={m['from']} subject={m['subject']!r}\n"
+            f"   {m['body'][:300]}"
             for i, m in enumerate(msgs)
-        )
+        ]
+        return f"{len(msgs)} result(s):\n" + "\n".join(lines)
 
     async def send(args: dict[str, Any], dry_run: bool) -> str:
         to = str(args.get("to", "")).strip()
@@ -236,16 +304,17 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             return "Error: 'to' and 'body' are required."
         if dry_run:
             return f"Would have emailed {to} — subject {subject!r}, body: {body[:300]}"
-        result = await send_message(connector, db, to, subject, body)
-        return f"Email sent to {to} (id {result.get('id')})."
+        email_addr, _ = _cfg(connector)
+        await send_message(connector, to, subject, body)
+        return f"Email sent to {to}."
 
     async def reply(args: dict[str, Any], dry_run: bool) -> str:
-        message_id = str(args.get("message_id", "")).strip()
+        uid = str(args.get("message_id", "")).strip()
         body = str(args.get("body", "")).strip()
-        if not (message_id and body):
+        if not (uid and body):
             return "Error: 'message_id' and 'body' are required."
 
-        original = await get_message(connector, db, message_id)
+        original = await get_message(connector, uid)
         subject = original["subject"]
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
@@ -256,21 +325,26 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
                 f"with: {body[:300]}"
             )
         await send_message(
-            connector, db, original["from"], subject, body, thread_id=original["thread_id"]
+            connector,
+            original["from"],
+            subject,
+            body,
+            in_reply_to=original["message_id_header"],
+            references=original["message_id_header"],
         )
-        await ctx.mark_processed(message_id)
+        await ctx.mark_processed(uid)
         return f"Replied to {original['from']} about {original['subject']!r}."
 
     async def archive(args: dict[str, Any], dry_run: bool) -> str:
-        message_id = str(args.get("message_id", "")).strip()
-        if not message_id:
+        uid = str(args.get("message_id", "")).strip()
+        if not uid:
             return "Error: 'message_id' is required."
         if dry_run:
-            msg = await get_message(connector, db, message_id)
-            return f"Would have archived {msg['subject']!r} from {msg['from']}."
-        await archive_message(connector, db, message_id)
-        await ctx.mark_processed(message_id)
-        return f"Archived message {message_id}."
+            original = await get_message(connector, uid)
+            return f"Would have archived {original['subject']!r} from {original['from']}."
+        await archive_message(connector, uid)
+        await ctx.mark_processed(uid)
+        return f"Archived message {uid}."
 
     limit_prop = {"limit": {"type": "integer", "description": "Max messages, default 10, cap 25."}}
 
@@ -279,8 +353,8 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             ToolSpec(
                 ctx.tool_name("read_unread_emails"),
                 ctx.describe(
-                    "List unread inbox email. Automatically excludes messages this agent "
-                    "already handled on a previous run."
+                    "List unread inbox emails with body preview. Excludes messages this "
+                    "agent already handled on a previous run."
                 ),
                 {"type": "object", "properties": limit_prop},
             ),
@@ -289,7 +363,10 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         RegisteredTool(
             ToolSpec(
                 ctx.tool_name("search_emails"),
-                ctx.describe("Search email using Gmail search syntax, e.g. 'from:bob after:2026/01/01'."),
+                ctx.describe(
+                    "Search email. Supports Gmail-style syntax: from:, subject:, after:, before:, "
+                    "is:unread, is:read, etc."
+                ),
                 {
                     "type": "object",
                     "properties": {"query": {"type": "string"}, **limit_prop},
@@ -332,9 +409,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         RegisteredTool(
             ToolSpec(
                 ctx.tool_name("archive_email"),
-                ctx.describe(
-                    "Archive an email by removing it from the inbox. Nothing is deleted."
-                ),
+                ctx.describe("Archive an email (moves out of inbox, nothing is deleted)."),
                 {
                     "type": "object",
                     "properties": {"message_id": {"type": "string"}},
@@ -344,6 +419,60 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             archive,
         ),
     ]
+
     from app.integrations import calendar as google_calendar
 
     return tools + google_calendar.build_tools(ctx)
+
+
+# ── Query translation helpers ──────────────────────────────────────────────────
+
+def _gmail_query_to_imap(query: str) -> str:
+    """Best-effort conversion of Gmail search syntax to IMAP search criteria."""
+    parts = []
+    remaining = query
+
+    # from:address → FROM "address"
+    for m in re.finditer(r'from:(\S+)', remaining):
+        parts.append(f'FROM "{m.group(1)}"')
+        remaining = remaining.replace(m.group(0), "")
+
+    # subject:text → SUBJECT "text"
+    for m in re.finditer(r'subject:(\S+)', remaining):
+        parts.append(f'SUBJECT "{m.group(1)}"')
+        remaining = remaining.replace(m.group(0), "")
+
+    # is:unread → UNSEEN, is:read → SEEN
+    if "is:unread" in remaining:
+        parts.append("UNSEEN")
+        remaining = remaining.replace("is:unread", "")
+    if "is:read" in remaining:
+        parts.append("SEEN")
+        remaining = remaining.replace("is:read", "")
+
+    # after:YYYY/MM/DD → SINCE DD-Mon-YYYY
+    for m in re.finditer(r'after:(\d{4}/\d{1,2}/\d{1,2})', remaining):
+        parts.append(f'SINCE "{_ymd_to_imap(m.group(1))}"')
+        remaining = remaining.replace(m.group(0), "")
+
+    # before:YYYY/MM/DD → BEFORE DD-Mon-YYYY
+    for m in re.finditer(r'before:(\d{4}/\d{1,2}/\d{1,2})', remaining):
+        parts.append(f'BEFORE "{_ymd_to_imap(m.group(1))}"')
+        remaining = remaining.replace(m.group(0), "")
+
+    # Remaining free text → TEXT search
+    remaining = remaining.strip()
+    if remaining:
+        parts.append(f'TEXT "{remaining}"')
+
+    return " ".join(parts) if parts else "ALL"
+
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _ymd_to_imap(ymd: str) -> str:
+    """2026/08/01 → 01-Aug-2026"""
+    y, m, d = ymd.split("/")
+    return f"{int(d):02d}-{_MONTHS[int(m) - 1]}-{y}"

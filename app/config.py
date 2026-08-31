@@ -92,10 +92,6 @@ class Settings(BaseSettings):
         return f"{self.api_public_origin}/auth/google/callback"
 
     @property
-    def connector_google_redirect_uri(self) -> str:
-        return f"{self.api_public_origin}/connectors/oauth/google/callback"
-
-    @property
     def connector_mcp_redirect_uri(self) -> str:
         return f"{self.api_public_origin}/connectors/oauth/mcp/callback"
 

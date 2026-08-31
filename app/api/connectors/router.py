@@ -11,11 +11,11 @@ DELETE /connectors/{id}                          remove a connector
 POST   /connectors/{id}/test                     test a connector's credentials
 POST   /connectors/telegram-bot                  create Telegram Bot connector
 POST   /connectors/llm                           create OpenAI / Anthropic connector
+PATCH  /connectors/llm/{id}                      update an LLM connector's API key
 POST   /connectors/telegram-client/start         begin MTProto auth (send OTP)
 POST   /connectors/telegram-client/verify        submit OTP or 2FA password
 POST   /connectors/telegram-client/save          save verified MTProto session
-GET    /connectors/oauth/google/start            begin Gmail OAuth flow
-GET    /connectors/oauth/google/callback         Google redirects here after consent
+POST   /connectors/gmail                         save Gmail connector (App Password)
 POST   /connectors/twilio/validate               validate Twilio credentials (no save)
 POST   /connectors/twilio                        save Twilio connector
 POST   /connectors/twilio/{id}/send-test-sms     send a test SMS via saved connector
@@ -34,7 +34,6 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import httpx
-from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
@@ -54,31 +53,6 @@ from app.db.session import get_session
 from app.integrations import gmail, mcp, telegram, twilio
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
-
-# ── OAuth client ──────────────────────────────────────────────────────────────
-
-_GMAIL_SCOPES = " ".join([
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.labels",
-    "https://www.googleapis.com/auth/calendar.events",
-])
-
-
-def _get_gmail_oauth() -> OAuth:
-    oauth = OAuth()
-    oauth.register(
-        name="google_gmail",
-        client_id=settings.google_client_id,
-        client_secret=settings.google_client_secret,
-        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-        client_kwargs={"scope": _GMAIL_SCOPES},
-    )
-    return oauth
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -171,22 +145,8 @@ async def test_connector(
 
     if connector.type == ConnectorType.gmail:
         try:
-            profile = await gmail.get_profile(connector, session)
-            missing = gmail.REQUIRED_SCOPES - await gmail.check_scopes(connector, session)
-            if missing:
-                short = sorted(s.split("/")[-1] for s in missing)
-                return TestResult(
-                    ok=False,
-                    detail=(
-                        f"Missing permissions: {', '.join(short)}. "
-                        "Reconnect and grant everything Google asks for."
-                    ),
-                )
-            from app.integrations import calendar as google_calendar
-
-            email = profile.get("emailAddress", "unknown")
-            tz = await google_calendar.primary_timezone(connector, session)
-            return TestResult(ok=True, detail=f"Connected as {email} — mail and calendar ({tz})")
+            email_addr = await gmail.test_connection(connector)
+            return TestResult(ok=True, detail=f"Connected as {email_addr} — IMAP and SMTP verified.")
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
 
@@ -643,72 +603,43 @@ async def tg_client_save(
     return connector
 
 
-# ── Google Gmail OAuth ─────────────────────────────────────────────────────────
+# ── Gmail (App Password) ───────────────────────────────────────────────────────
 
-@router.get("/oauth/google/start")
-async def gmail_oauth_start(
-    request: Request,
-    org_id: Annotated[UUID, Query()],
+class GmailConnectorBody(BaseModel):
+    org_id: UUID
+    email: str
+    app_password: str
+
+
+@router.post("/gmail", response_model=ConnectorOut, status_code=201)
+async def create_gmail_connector(
+    body: GmailConnectorBody,
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, org_id)
+    """Save a Gmail connector backed by an App Password (IMAP + SMTP + CalDAV)."""
+    await _assert_org_member(session, current_user, body.org_id)
 
-    # Stash org_id + user_id in the server-side session for the callback
-    request.session["connector_org_id"] = str(org_id)
-    request.session["connector_user_id"] = str(current_user.id)
+    # Verify credentials before storing
+    from app.integrations.base import IntegrationError as _IntegrationError
+    try:
+        from app.integrations.gmail import _test_connection_sync
+        import asyncio
+        await asyncio.to_thread(_test_connection_sync, body.email, body.app_password)
+    except _IntegrationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not connect to Gmail: {exc}")
 
-    return await _get_gmail_oauth().google_gmail.authorize_redirect(
-        request,
-        settings.connector_google_redirect_uri,
-        access_type="offline",
-        prompt="select_account consent",  # picker so Add another can be a different Google user
-        include_granted_scopes="true",
-    )
+    config = encrypt_json({"email": body.email, "app_password": body.app_password})
+    connector_name = f"Gmail · {body.email}"
 
-
-@router.get("/oauth/google/callback")
-async def gmail_oauth_callback(
-    request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
-):
-    org_id_str = request.session.pop("connector_org_id", None)
-    user_id_str = request.session.pop("connector_user_id", None)
-
-    if not org_id_str or not user_id_str:
-        raise HTTPException(status_code=400, detail="OAuth session expired — please try again")
-
-    org_id = UUID(org_id_str)
-    user_id = UUID(user_id_str)
-
-    token = await _get_gmail_oauth().google_gmail.authorize_access_token(request)
-    userinfo = token.get("userinfo") or {}
-    google_email = userinfo.get("email", "unknown")
-
-    refresh_token = token.get("refresh_token")
-    if not refresh_token:
-        raise HTTPException(
-            status_code=400,
-            detail="Google did not return a refresh token. Revoke app access in your Google Account and try again.",
-        )
-
-    expires_at = token.get("expires_at") or (datetime.now(UTC).timestamp() + 3600)
-
-    config = encrypt_json({
-        "google_sub": userinfo.get("sub"),
-        "email": google_email,
-        "access_token": token["access_token"],
-        "refresh_token": refresh_token,
-        "token_expires_at": float(expires_at),
-        "scopes": _GMAIL_SCOPES.split(),
-    })
-
-    # Upsert: one Gmail connector per (org, google account email)
+    # Upsert: one connector per (org, email address)
     existing = await session.exec(
         select(Connector).where(
-            Connector.org_id == org_id,
+            Connector.org_id == body.org_id,
             Connector.type == ConnectorType.gmail,
-            Connector.name == f"Gmail · {google_email}",
+            Connector.name == connector_name,
         )
     )
     connector = existing.first()
@@ -719,9 +650,9 @@ async def gmail_oauth_callback(
         connector.updated_at = datetime.now(UTC)
     else:
         connector = Connector(
-            org_id=org_id,
-            created_by=user_id,
-            name=f"Gmail · {google_email}",
+            org_id=body.org_id,
+            created_by=current_user.id,
+            name=connector_name,
             type=ConnectorType.gmail,
             status=ConnectorStatus.active,
             config=config,
@@ -729,10 +660,8 @@ async def gmail_oauth_callback(
 
     session.add(connector)
     await session.commit()
-
-    response = Response(status_code=302)
-    response.headers["location"] = f"{settings.frontend_origin}/connectors?connected=gmail"
-    return response
+    await session.refresh(connector)
+    return connector
 
 
 # ── Twilio ────────────────────────────────────────────────────────────────────

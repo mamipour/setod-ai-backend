@@ -1,131 +1,222 @@
 """
-Google Calendar — same OAuth token as Gmail.
-==========================================
-Reads and writes the primary calendar. Tokens come from the Google connector;
-this module never does its own OAuth.
+Google Calendar connector — CalDAV via App Password
+====================================================
+Uses the same connector as Gmail (same email + App Password).
+Connects to Google's CalDAV endpoint which accepts App Passwords,
+so no OAuth or Google Cloud Console review is required.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import asyncio
+import uuid
+from datetime import UTC, datetime, timedelta, date
 from typing import Any
 from zoneinfo import ZoneInfo
-
-import httpx
 
 from app.core.llm.client import ToolSpec
 from app.db.models import Connector
 from app.integrations.base import IntegrationError, RegisteredTool, ToolContext
-from app.integrations.gmail import valid_token
-from sqlmodel.ext.asyncio.session import AsyncSession
+from app.integrations.gmail import _cfg
 
-CAL_API = "https://www.googleapis.com/calendar/v3"
-SCOPE = "https://www.googleapis.com/auth/calendar.events"
 DEFAULT_TZ = "America/Toronto"
 
-
-async def _call(
-    connector: Connector,
-    db: AsyncSession,
-    method: str,
-    path: str,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    token = await valid_token(connector, db)
-    async with httpx.AsyncClient() as client:
-        resp = await client.request(
-            method,
-            f"{CAL_API}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-            **kwargs,
-        )
-    if resp.status_code == 401:
-        raise IntegrationError("Google rejected the access token — reconnect the account.")
-    if resp.status_code == 403:
-        detail = ""
-        try:
-            detail = resp.json().get("error", {}).get("message", "")
-        except Exception:
-            detail = resp.text[:200]
-        if "accessNotConfigured" in resp.text or "has not been used" in detail.lower():
-            raise IntegrationError(
-                "Calendar API is not enabled on this Google Cloud project. "
-                "Enable it, then reconnect."
-            )
-        raise IntegrationError(f"Calendar API error (403): {detail or resp.text[:200]}")
-    if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("error", {}).get("message", resp.text[:200])
-        except Exception:
-            detail = resp.text[:200]
-        raise IntegrationError(f"Calendar API error ({resp.status_code}): {detail}")
-    return resp.json() if resp.content else {}
+# Google's CalDAV endpoint — this URL accepts App Passwords.
+# The newer apidata.googleusercontent.com endpoint requires OAuth tokens.
+_CALDAV_BASE = "https://www.google.com/calendar/dav/{email}/events/"
 
 
-async def primary_timezone(connector: Connector, db: AsyncSession) -> str:
-    data = await _call(connector, db, "GET", "/calendars/primary")
-    return str(data.get("timeZone") or DEFAULT_TZ)
+# ── CalDAV sync primitives ────────────────────────────────────────────────────
+
+def _client(email_addr: str, app_password: str):  # type: ignore[return]
+    try:
+        import caldav
+    except ImportError as exc:
+        raise IntegrationError(
+            "caldav library not installed. Run: pip install caldav"
+        ) from exc
+    return caldav.DAVClient(
+        url=_CALDAV_BASE.format(email=email_addr),
+        username=email_addr,
+        password=app_password,
+    )
 
 
-def _rfc3339(value: str, tz_name: str, *, end_of_day: bool = False) -> str:
-    raw = value.strip()
+def _primary_calendar(email_addr: str, app_password: str):
+    """Return the primary calendar object for this account."""
+    try:
+        import caldav
+        client = _client(email_addr, app_password)
+        # The events/ URL directly points to the primary calendar — no principal discovery needed.
+        return caldav.Calendar(client=client, url=_CALDAV_BASE.format(email=email_addr))
+    except IntegrationError:
+        raise
+    except Exception as exc:
+        raise IntegrationError(
+            f"Could not connect to Google Calendar — check the App Password. ({exc})"
+        ) from exc
+
+
+def _to_datetime(value: str, tz_name: str, *, end_of_day: bool = False) -> datetime:
+    """Parse YYYY-MM-DD or YYYY-MM-DDTHH:MM to a timezone-aware datetime."""
     tz = ZoneInfo(tz_name)
-    if "T" in raw:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    raw = value.strip()
+    if "T" in raw or " " in raw:
+        raw = raw.replace(" ", "T")
+        dt = datetime.fromisoformat(raw)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=tz)
-        return dt.isoformat()
+        return dt
     day = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=tz)
     if end_of_day:
-        day = day + timedelta(days=1)
-    return day.isoformat()
+        day += timedelta(days=1)
+    return day
 
+
+def _event_to_dict(event) -> dict[str, Any]:
+    """Convert a caldav Event to a plain dict."""
+    try:
+        comp = event.icalendar_component
+    except Exception:
+        return {}
+
+    def _dt_str(prop_name: str) -> str:
+        prop = comp.get(prop_name)
+        if prop is None:
+            return ""
+        val = prop.dt
+        if isinstance(val, datetime):
+            return val.isoformat()
+        if isinstance(val, date):
+            return val.isoformat()
+        return str(val)
+
+    attendees = []
+    raw_att = comp.get("ATTENDEE")
+    if raw_att:
+        if not isinstance(raw_att, list):
+            raw_att = [raw_att]
+        for a in raw_att:
+            email_val = str(a).replace("mailto:", "")
+            if email_val:
+                attendees.append(email_val)
+
+    return {
+        "id": str(comp.get("UID", "")),
+        "title": str(comp.get("SUMMARY", "(no title)")),
+        "start": _dt_str("DTSTART"),
+        "end": _dt_str("DTEND"),
+        "location": str(comp.get("LOCATION", "")),
+        "description": str(comp.get("DESCRIPTION", "")),
+        "attendees": attendees,
+    }
+
+
+def _list_events_sync(
+    email_addr: str,
+    app_password: str,
+    date_from: str,
+    date_to: str,
+    limit: int,
+    tz_name: str,
+) -> list[dict[str, Any]]:
+    calendar = _primary_calendar(email_addr, app_password)
+    start = _to_datetime(date_from, tz_name)
+    end = _to_datetime(date_to, tz_name, end_of_day=True)
+    try:
+        events = calendar.date_search(start=start, end=end, expand=True)
+    except Exception as exc:
+        raise IntegrationError(f"Calendar search failed: {exc}") from exc
+    results = [d for e in events[:limit] if (d := _event_to_dict(e))]
+    # Sort by start time
+    results.sort(key=lambda e: e.get("start", ""))
+    return results
+
+
+def _create_event_sync(
+    email_addr: str,
+    app_password: str,
+    title: str,
+    start: str,
+    end: str,
+    description: str,
+    location: str,
+    attendees: list[str],
+    tz_name: str,
+) -> dict[str, Any]:
+    try:
+        import icalendar
+    except ImportError as exc:
+        raise IntegrationError("icalendar library not installed (install caldav which pulls it in)") from exc
+
+    calendar = _primary_calendar(email_addr, app_password)
+    tz = ZoneInfo(tz_name)
+
+    start_dt = _to_datetime(start, tz_name)
+    end_dt = _to_datetime(end, tz_name)
+
+    cal = icalendar.Calendar()
+    cal.add("PRODID", "-//Setod//Setod//EN")
+    cal.add("VERSION", "2.0")
+
+    event = icalendar.Event()
+    event.add("SUMMARY", title)
+    event.add("DTSTART", start_dt)
+    event.add("DTEND", end_dt)
+    uid = str(uuid.uuid4())
+    event.add("UID", uid)
+    event.add("DTSTAMP", datetime.now(UTC))
+    if description:
+        event.add("DESCRIPTION", description)
+    if location:
+        event.add("LOCATION", location)
+    for att in attendees:
+        attendee = icalendar.vCalAddress(f"mailto:{att}")
+        attendee.params["CN"] = att
+        event.add("ATTENDEE", attendee)
+
+    cal.add_component(event)
+    try:
+        calendar.save_event(cal.to_ical().decode())
+    except Exception as exc:
+        raise IntegrationError(f"Failed to create calendar event: {exc}") from exc
+    return {"id": uid, "title": title}
+
+
+def _primary_tz_sync(email_addr: str, app_password: str) -> str:
+    """Return the primary calendar's timezone string."""
+    try:
+        calendar = _primary_calendar(email_addr, app_password)
+        # Try to read VTIMEZONE from the calendar object
+        tz = getattr(calendar, "get_supported_components", lambda: None)()
+        # Fallback: read from calendar properties
+        props = calendar.get_properties()
+        for key in props:
+            if "calendar-timezone" in str(key).lower():
+                return str(props[key]) or DEFAULT_TZ
+        return DEFAULT_TZ
+    except Exception:
+        return DEFAULT_TZ
+
+
+# ── Async wrappers ─────────────────────────────────────────────────────────────
 
 async def list_events(
     connector: Connector,
-    db: AsyncSession,
-    *,
     date_from: str,
     date_to: str,
     limit: int,
     timezone: str | None = None,
 ) -> list[dict[str, Any]]:
-    tz = timezone or await primary_timezone(connector, db)
-    data = await _call(
-        connector,
-        db,
-        "GET",
-        "/calendars/primary/events",
-        params={
-            "timeMin": _rfc3339(date_from, tz),
-            "timeMax": _rfc3339(date_to, tz, end_of_day=True),
-            "singleEvents": "true",
-            "orderBy": "startTime",
-            "maxResults": min(limit, 50),
-        },
+    email_addr, pwd = _cfg(connector)
+    tz = timezone or DEFAULT_TZ
+    return await asyncio.to_thread(
+        _list_events_sync, email_addr, pwd, date_from, date_to, limit, tz
     )
-    out = []
-    for ev in data.get("items") or []:
-        start = ev.get("start") or {}
-        end = ev.get("end") or {}
-        out.append({
-            "id": ev.get("id"),
-            "title": ev.get("summary") or "(no title)",
-            "start": start.get("dateTime") or start.get("date") or "",
-            "end": end.get("dateTime") or end.get("date") or "",
-            "location": ev.get("location") or "",
-            "attendees": [
-                a.get("email") for a in (ev.get("attendees") or []) if a.get("email")
-            ],
-        })
-    return out
 
 
 async def create_event(
     connector: Connector,
-    db: AsyncSession,
-    *,
     title: str,
     start: str,
     end: str,
@@ -134,23 +225,18 @@ async def create_event(
     attendees: list[str] | None = None,
     timezone: str | None = None,
 ) -> dict[str, Any]:
-    tz = timezone or await primary_timezone(connector, db)
-    body: dict[str, Any] = {
-        "summary": title,
-        "start": {"dateTime": _rfc3339(start, tz), "timeZone": tz},
-        "end": {"dateTime": _rfc3339(end, tz), "timeZone": tz},
-    }
-    if description:
-        body["description"] = description
-    if location:
-        body["location"] = location
-    if attendees:
-        body["attendees"] = [{"email": a} for a in attendees if a]
-    return await _call(connector, db, "POST", "/calendars/primary/events", json=body)
+    email_addr, pwd = _cfg(connector)
+    tz = timezone or DEFAULT_TZ
+    return await asyncio.to_thread(
+        _create_event_sync,
+        email_addr, pwd, title, start, end, description, location, attendees or [], tz,
+    )
 
+
+# ── Tools ──────────────────────────────────────────────────────────────────────
 
 def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
-    connector, db = ctx.connector, ctx.db
+    connector = ctx.connector
 
     async def list_upcoming(args: dict[str, Any], dry_run: bool) -> str:
         today = datetime.now(UTC).date().isoformat()
@@ -158,9 +244,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         date_to = str(args.get("date_to") or date_from).strip()
         tz = str(args.get("timezone") or "").strip() or None
         limit = min(int(args.get("limit", 20)), 50)
-        events = await list_events(
-            connector, db, date_from=date_from, date_to=date_to, limit=limit, timezone=tz,
-        )
+        events = await list_events(connector, date_from, date_to, limit, tz)
         if not events:
             return f"No events on the primary calendar from {date_from} to {date_to}."
         lines = []
@@ -190,15 +274,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         if dry_run:
             return f"Would have created {title!r} from {start} to {end}."
         ev = await create_event(
-            connector,
-            db,
-            title=title,
-            start=start,
-            end=end,
-            description=description,
-            location=location,
-            attendees=attendees or None,
-            timezone=tz,
+            connector, title, start, end, description, location, attendees or None, tz
         )
         return f"Created event {ev.get('id')} — {title}."
 
@@ -207,9 +283,9 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             ToolSpec(
                 ctx.tool_name("list_calendar_events"),
                 ctx.describe(
-                    "List events on the primary Google Calendar between two dates "
-                    "(YYYY-MM-DD). Defaults to today. Times use the calendar's timezone "
-                    "unless timezone is set (e.g. America/Toronto, America/Vancouver)."
+                    "List events on the primary Google Calendar between two dates (YYYY-MM-DD). "
+                    "Defaults to today. Times use the calendar's timezone unless timezone is set "
+                    "(e.g. America/Toronto, America/Vancouver)."
                 ),
                 {
                     "type": "object",
