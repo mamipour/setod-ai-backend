@@ -22,7 +22,7 @@ from typing import Any
 
 from app.core.crypto import decrypt_json
 from app.core.llm.client import ToolSpec
-from app.db.models import Connector
+from app.db.models import Agent, Connector
 from app.integrations.base import IntegrationError, RegisteredTool, ToolContext
 
 IMAP_HOST = "imap.gmail.com"
@@ -292,8 +292,16 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
     async def read_unread(args: dict[str, Any], dry_run: bool) -> str:
         limit = min(int(args.get("limit", 10)), 25)
 
-        # Phase 1: get ALL unread UIDs (cheap — no body fetch).
-        all_uids = await list_uids(connector, "UNSEEN")
+        # Monitoring starts when the agent is created, not when the mailbox was:
+        # mail that predates the agent is out of scope, so a mailbox with years of
+        # unread backlog never gets excavated. SINCE is day-granular; the tracker
+        # dedupes the sub-day overlap. Month names are hardcoded (locale-safe).
+        agent = await ctx.db.get(Agent, ctx.agent_id)
+        created = agent.created_at
+        since = f"{created.day:02d}-{_MONTHS[created.month - 1]}-{created.year}"
+
+        # Phase 1: get all unread UIDs in scope (cheap — no body fetch).
+        all_uids = await list_uids(connector, f"UNSEEN SINCE {since}")
 
         # Phase 2: filter against the tracker before applying the limit, so
         # already-handled-but-still-unread emails never consume window slots.
