@@ -111,35 +111,56 @@ def _parse_message(uid: str, raw_bytes: bytes) -> dict[str, Any]:
     }
 
 
-def _search_sync(
-    email_addr: str, app_password: str, criteria: str, limit: int
-) -> list[dict[str, Any]]:
-    """IMAP search → fetch message data. Returns newest-first up to limit."""
+def _search_uids_sync(email_addr: str, app_password: str, criteria: str) -> list[str]:
+    """Return all UIDs matching criteria, newest-first. Cheap — no body fetched."""
     imap = _imap_connect(email_addr, app_password)
     try:
         imap.select("INBOX")
         status, data = imap.uid("search", None, criteria)
         if status != "OK":
             return []
-        uids = data[0].split() if data[0] else []
-        uids = uids[-limit:]  # newest UIDs are highest numbers
+        uid_bytes_list = data[0].split() if data[0] else []
+        # IMAP UIDs are ascending; reverse so index 0 = newest
+        return [b.decode() for b in reversed(uid_bytes_list)]
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
 
+
+def _fetch_messages_sync(
+    email_addr: str, app_password: str, uids: list[str]
+) -> list[dict[str, Any]]:
+    """Fetch message bodies for a specific list of UIDs. Returns in the given order."""
+    if not uids:
+        return []
+    imap = _imap_connect(email_addr, app_password)
+    try:
+        imap.select("INBOX")
         results = []
-        for uid_bytes in reversed(uids):
-            uid = uid_bytes.decode()
+        for uid in uids:
             status, msg_data = imap.uid(
                 "fetch", uid, f"(BODY.PEEK[]<0.{_BODY_PREVIEW_BYTES}>)"
             )
             if status != "OK" or not msg_data or not msg_data[0]:
                 continue
-            raw = msg_data[0][1]
-            results.append(_parse_message(uid, raw))
+            results.append(_parse_message(uid, msg_data[0][1]))
         return results
     finally:
         try:
             imap.logout()
         except Exception:
             pass
+
+
+def _search_sync(
+    email_addr: str, app_password: str, criteria: str, limit: int
+) -> list[dict[str, Any]]:
+    """IMAP search → fetch message data. Returns newest-first up to limit.
+    Used by the search tool (no tracker filtering needed there)."""
+    uids = _search_uids_sync(email_addr, app_password, criteria)[:limit]
+    return _fetch_messages_sync(email_addr, app_password, uids)
 
 
 def _get_message_sync(email_addr: str, app_password: str, uid: str) -> dict[str, Any]:
@@ -215,6 +236,18 @@ def _test_connection_sync(email_addr: str, app_password: str) -> None:
 
 # ── Async wrappers ─────────────────────────────────────────────────────────────
 
+async def list_uids(connector: Connector, criteria: str) -> list[str]:
+    """All UIDs matching criteria, newest-first. No body fetch."""
+    email_addr, pwd = _cfg(connector)
+    return await asyncio.to_thread(_search_uids_sync, email_addr, pwd, criteria)
+
+
+async def fetch_messages(connector: Connector, uids: list[str]) -> list[dict[str, Any]]:
+    """Fetch bodies for a specific list of UIDs."""
+    email_addr, pwd = _cfg(connector)
+    return await asyncio.to_thread(_fetch_messages_sync, email_addr, pwd, uids)
+
+
 async def search_messages(
     connector: Connector, criteria: str, limit: int
 ) -> list[dict[str, Any]]:
@@ -258,26 +291,34 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
 
     async def read_unread(args: dict[str, Any], dry_run: bool) -> str:
         limit = min(int(args.get("limit", 10)), 25)
-        msgs = await search_messages(connector, "UNSEEN", limit)
-        ids = [m["id"] for m in msgs]
 
-        fresh_set = await ctx.unprocessed(ids)
-        fresh = [m for m in msgs if m["id"] in fresh_set]
-        skipped = len(msgs) - len(fresh)
+        # Phase 1: get ALL unread UIDs (cheap — no body fetch).
+        all_uids = await list_uids(connector, "UNSEEN")
 
-        if not fresh:
-            return f"No new unread email. ({skipped} already handled in an earlier run.)"
+        # Phase 2: filter against the tracker before applying the limit, so
+        # already-handled-but-still-unread emails never consume window slots.
+        fresh_uids_set = await ctx.unprocessed(all_uids)
+        fresh_uids = [uid for uid in all_uids if uid in fresh_uids_set]
+        already_handled = len(all_uids) - len(fresh_uids)
 
-        for m in fresh:
+        # Phase 3: take the newest `limit` from what is genuinely new, then
+        # fetch their bodies.
+        to_fetch = fresh_uids[:limit]
+        if not to_fetch:
+            return f"No new unread email. ({already_handled} already handled in an earlier run.)"
+
+        msgs = await fetch_messages(connector, to_fetch)
+
+        for m in msgs:
             ctx.note_seen(m["id"])
 
         lines = [
             f"{i + 1}. id={m['id']} from={m['from']} subject={m['subject']!r}\n"
             f"   {m['body'][:300]}"
-            for i, m in enumerate(fresh)
+            for i, m in enumerate(msgs)
         ]
-        suffix = f"\n({skipped} already handled, omitted.)" if skipped else ""
-        return f"{len(fresh)} unread email(s):\n" + "\n".join(lines) + suffix
+        suffix = f"\n({already_handled} already handled, omitted.)" if already_handled else ""
+        return f"{len(msgs)} unread email(s):\n" + "\n".join(lines) + suffix
 
     async def search(args: dict[str, Any], dry_run: bool) -> str:
         query = str(args.get("query", "")).strip()
