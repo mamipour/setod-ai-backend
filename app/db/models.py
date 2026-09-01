@@ -597,6 +597,8 @@ class AgentAssistMessage(SQLModel, table=True):
     )
     role: str  # "user" | "assistant"
     content: str = Field(sa_type=JSONB)  # stored as text, JSONB handles large strings fine
+    prompt_tokens: int = Field(default=0)
+    completion_tokens: int = Field(default=0)
     created_at: datetime = _ts()
 
 # ── Skills ────────────────────────────────────────────────────────────────────

@@ -300,6 +300,22 @@ async def workspace_overview(
     )
     runs_today, failures_today, tokens_today = today.one()
 
+    # Copilot tokens are on AgentAssistMessage, not AgentSession — add them separately.
+    copilot_today = await session.exec(
+        select(
+            func.coalesce(
+                func.sum(AgentAssistMessage.prompt_tokens + AgentAssistMessage.completion_tokens), 0
+            )
+        )
+        .join(Agent, AgentAssistMessage.agent_id == Agent.id)
+        .where(
+            Agent.org_id == org_id,
+            AgentAssistMessage.role == "assistant",
+            AgentAssistMessage.created_at >= midnight,
+        )
+    )
+    tokens_today += copilot_today.one()
+
     yesterday_midnight = midnight - timedelta(days=1)
     yesterday = await session.exec(
         select(
@@ -315,6 +331,22 @@ async def workspace_overview(
         )
     )
     runs_yesterday, failures_yesterday, tokens_yesterday = yesterday.one()
+
+    copilot_yesterday = await session.exec(
+        select(
+            func.coalesce(
+                func.sum(AgentAssistMessage.prompt_tokens + AgentAssistMessage.completion_tokens), 0
+            )
+        )
+        .join(Agent, AgentAssistMessage.agent_id == Agent.id)
+        .where(
+            Agent.org_id == org_id,
+            AgentAssistMessage.role == "assistant",
+            AgentAssistMessage.created_at >= yesterday_midnight,
+            AgentAssistMessage.created_at < midnight,
+        )
+    )
+    tokens_yesterday += copilot_yesterday.one()
 
     # Last 7 days of activity for the dashboard chart, bucketed in the user's local timezone.
     # AT TIME ZONE converts the stored UTC timestamp to local time before truncating to day.
@@ -1314,6 +1346,8 @@ async def assist_chat(
 
     async def event_stream():
         answer = ""
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
         agent_tag = f"agent={agent_id} model={model!r}"
         try:
             # Bounded tool loop: up to RESEARCH_MAX_ROUNDS rounds.  If the model
@@ -1332,6 +1366,8 @@ async def assist_chat(
                     loop_msgs,
                     tools=None if force_text else _research_specs,
                 )
+                total_prompt_tokens += resp.prompt_tokens
+                total_completion_tokens += resp.completion_tokens
 
                 log.info(
                     "[assist] round=%d tool_calls=%d content_len=%d %s",
@@ -1379,10 +1415,14 @@ async def assist_chat(
             log.exception("[assist] ERROR %s", agent_tag)
             yield f"data: [ERROR] {exc}\n\n"
         finally:
-            # Persist only the final answer text; the research trace is ephemeral.
+            # Persist the final answer text and the accumulated token counts.
             if answer:
                 assistant_msg = AgentAssistMessage(
-                    agent_id=agent.id, role="assistant", content=answer
+                    agent_id=agent.id,
+                    role="assistant",
+                    content=answer,
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
                 )
                 session.add(assistant_msg)
                 await session.commit()
