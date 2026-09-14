@@ -1,4 +1,8 @@
-# Setod — API
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mamipour/setod-ai-frontend/main/public/logo.svg" alt="Setod" width="56" />
+</p>
+
+<h1 align="center">Setod — API</h1>
 
 Backend for [Setod](https://setod.com): an AI agent platform for small-business back-office work. You write instructions in plain English, attach the accounts the agent may use, and put it on a schedule. When it wakes up, a model you already pay for (OpenAI or Anthropic) reads the instructions, looks at those accounts, and acts.
 
@@ -106,6 +110,10 @@ app/
   db/             SQLModel models
 alembic/          migrations
 ```
+
+## License
+
+[MIT](LICENSE)
 
 ## Related
 
