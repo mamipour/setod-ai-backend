@@ -582,6 +582,55 @@ async def unpublish_agent(
     return _to_out(agent)
 
 
+@router.post("/{agent_id}/pause", response_model=AgentOut)
+async def pause_agent(
+    agent_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Pause a live agent.
+
+    Sets status to *paused* and keeps `published_config` intact so the agent can be
+    resumed without re-publishing. The worker skips all scheduled runs and inbound
+    events for paused agents.
+    """
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    if agent.status != AgentStatus.published:
+        raise HTTPException(status_code=422, detail="Only a live (published) agent can be paused")
+    agent.status = AgentStatus.paused
+    agent.updated_at = datetime.now(UTC)
+    session.add(agent)
+    await session.commit()
+    await session.refresh(agent)
+    return _to_out(agent)
+
+
+@router.post("/{agent_id}/resume", response_model=AgentOut)
+async def resume_agent(
+    agent_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Resume a paused agent.
+
+    Sets status back to *published*. The existing `published_config` snapshot is used
+    as-is — no new snapshot is created and no re-publish is required.
+    """
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    if agent.status != AgentStatus.paused:
+        raise HTTPException(status_code=422, detail="Only a paused agent can be resumed")
+    if not agent.published_config:
+        # Safety net: if the config somehow got cleared, fall back to draft.
+        agent.status = AgentStatus.draft
+    else:
+        agent.status = AgentStatus.published
+    agent.updated_at = datetime.now(UTC)
+    session.add(agent)
+    await session.commit()
+    await session.refresh(agent)
+    return _to_out(agent)
+
+
 @router.get("/{agent_id}/publish-history")
 async def publish_history(
     agent_id: UUID,

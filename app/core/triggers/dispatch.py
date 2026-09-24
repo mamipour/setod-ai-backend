@@ -125,8 +125,11 @@ async def run_trigger(db: AsyncSession, trigger_id: UUID, *, user_input: str | N
         return None
 
     agent = await db.get(Agent, trigger.agent_id)
-    if agent is None or agent.status != AgentStatus.published or not agent.published_config:
-        log.info("trigger %s skipped — agent is not published", trigger_id)
+    if agent is None or agent.status not in (AgentStatus.published,) or not agent.published_config:
+        if agent and agent.status == AgentStatus.paused:
+            log.info("trigger %s skipped — agent %s is paused", trigger_id, agent.id)
+        else:
+            log.info("trigger %s skipped — agent is not published", trigger_id)
         return None
 
     if await is_running(db, agent.id):

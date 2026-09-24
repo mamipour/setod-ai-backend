@@ -42,6 +42,7 @@ class ConnectorStatus(str, Enum):
 class AgentStatus(str, Enum):
     draft = "draft"
     published = "published"
+    paused = "paused"  # published_config preserved; worker skips all runs until resumed
 
 
 class TriggerType(str, Enum):
