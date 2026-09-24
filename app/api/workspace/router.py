@@ -13,8 +13,9 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
-from app.core.workspace import load_web_settings, save_web_settings
-from app.db.models import Organization, OrganizationMember, User
+from app.core import notify as _notify
+from app.core.workspace import load_web_settings, load_notify_settings, save_web_settings, save_notify_settings
+from app.db.models import Connector, ConnectorType, Organization, OrganizationMember, User
 from app.db.session import get_session
 from app.integrations.websearch import TAVILY_SEARCH_URL
 
@@ -136,3 +137,83 @@ async def test_web_search(
         return TestResult(ok=True, detail="Connection successful.")
     except httpx.HTTPError as exc:
         return TestResult(ok=False, detail=f"Request failed: {type(exc).__name__}")
+
+
+# -- Notification settings ----------------------------------------------------
+
+class NotifySettings(BaseModel):
+    telegram_connector_id: str | None = None
+
+
+@router.get("/{org_id}/notify", response_model=NotifySettings)
+async def get_notify_settings(
+    org_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    org = await _get_org_as_member(session, current_user, org_id)
+    ns = load_notify_settings(org)
+    return NotifySettings(telegram_connector_id=ns.get("telegram_connector_id"))
+
+
+@router.patch("/{org_id}/notify", response_model=NotifySettings)
+async def update_notify_settings(
+    org_id: str,
+    body: NotifySettings,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    org = await _get_org_as_member(session, current_user, org_id)
+
+    if body.telegram_connector_id:
+        connector = await session.get(Connector, body.telegram_connector_id)
+        if connector is None or connector.org_id != org.id:
+            raise HTTPException(status_code=404, detail="Connector not found in this workspace")
+        if connector.type != ConnectorType.telegram_client:
+            raise HTTPException(status_code=422, detail="Only a Telegram Account connector can be used for notifications")
+
+    ns: dict = {"telegram_connector_id": body.telegram_connector_id}
+    save_notify_settings(org, ns)
+    session.add(org)
+    await session.commit()
+    return NotifySettings(**ns)
+
+
+@router.post("/{org_id}/notify/test", response_model=TestResult)
+async def test_notify(
+    org_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    from uuid import UUID as _UUID
+    org = await _get_org_as_member(session, current_user, org_id)
+    ns = load_notify_settings(org)
+
+    sent_via: list[str] = []
+    errors: list[str] = []
+
+    if tg_id := ns.get("telegram_connector_id"):
+        try:
+            connector = await session.get(Connector, tg_id)
+            if connector and connector.config:
+                from app.core.crypto import decrypt_json
+                from app.integrations.telegram import client_send
+                await client_send(decrypt_json(connector.config), "me", "Setod test notification — your alerts are working.")
+                sent_via.append("Telegram")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Telegram: {exc}")
+
+    try:
+        await _notify._send_resend(
+            current_user.email,
+            "Setod test notification",
+            "Your notification settings are working. You will receive alerts here for approvals, run failures, and budget limits.",
+        )
+        sent_via.append("email")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Email: {exc}")
+
+    if errors and not sent_via:
+        return TestResult(ok=False, detail="; ".join(errors))
+    channels = " and ".join(sent_via) if sent_via else "no channels"
+    return TestResult(ok=True, detail=f"Test sent via {channels}.")
