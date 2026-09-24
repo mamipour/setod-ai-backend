@@ -23,6 +23,21 @@ def save_web_settings(org: Organization, settings: dict) -> None:
     org.web_settings = encrypt_json(settings) if settings else None
 
 
+def load_notify_settings(org: Organization) -> dict:
+    """Decrypt the org's notification preferences. Empty dict when unset."""
+    if not org.notify_settings:
+        return {}
+    try:
+        return decrypt_json(org.notify_settings)
+    except Exception:
+        return {}
+
+
+def save_notify_settings(org: Organization, settings: dict) -> None:
+    """Encrypt notification preferences back onto the org row (caller commits)."""
+    org.notify_settings = encrypt_json(settings) if settings else None
+
+
 def get_tavily_key(org: Organization | None) -> str | None:
     """The org's Tavily API key, or None when unset — callers fall back to DuckDuckGo."""
     if org is None:

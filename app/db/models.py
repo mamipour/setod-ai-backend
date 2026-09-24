@@ -93,6 +93,10 @@ class Organization(SQLModel, table=True):
     # Encrypted via Fernet so the key is never stored in plain text. None when
     # no workspace integrations have been configured.
     web_settings: str | None = Field(default=None)
+    # Encrypted notification preferences. Holds:
+    #   {"telegram_connector_id": "<uuid>" | null}
+    # Email always falls back to the owner's login email via Resend.
+    notify_settings: str | None = Field(default=None)
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 
@@ -207,6 +211,8 @@ class Agent(SQLModel, table=True):
     # here, so editing the draft never changes what is running.
     published_config: dict[str, Any] | None = Field(default=None, sa_type=JSONB)
     published_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    # Debounce run-failure notifications: only notify after NOTIFY_FAILURE_DEBOUNCE_H hours.
+    last_failure_notified_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 

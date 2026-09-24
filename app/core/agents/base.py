@@ -28,6 +28,7 @@ from sqlmodel import func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.crypto import decrypt_json
+from app.core import notify as _notify
 from app.core.llm.client import (
     LLMError,
     ToolCall,
@@ -265,6 +266,7 @@ async def run_agent(
                     db, session, SessionStatus.error,
                     error=f"Daily token budget of {budget:,} reached for this agent.",
                 )
+                await _notify.notify_budget_reached(db, agent.org_id, agent, budget)
                 return session
 
             response = await client.chat(
@@ -305,20 +307,25 @@ async def run_agent(
                 )
                 messages.append(tool_message(call.id, call.name, output))
 
-        await _finish(
-            db, session, SessionStatus.error,
-            error=(
-                f"Stopped after {settings['max_iterations']} steps without finishing. "
-                "Raise the step limit in Settings, or simplify the instructions."
-            ),
+        err = (
+            f"Stopped after {settings['max_iterations']} steps without finishing. "
+            "Raise the step limit in Settings, or simplify the instructions."
         )
+        await _finish(db, session, SessionStatus.error, error=err)
+        if not dry_run:
+            await _notify.notify_run_failed(db, agent.org_id, agent, err)
         return session
 
     except LLMError as exc:
         await _finish(db, session, SessionStatus.error, error=str(exc))
+        if not dry_run:
+            await _notify.notify_run_failed(db, agent.org_id, agent, str(exc))
         return session
     except Exception as exc:  # noqa: BLE001 — a crashed run must still close its session
-        await _finish(db, session, SessionStatus.error, error=f"{type(exc).__name__}: {exc}")
+        err = f"{type(exc).__name__}: {exc}"
+        await _finish(db, session, SessionStatus.error, error=err)
+        if not dry_run:
+            await _notify.notify_run_failed(db, agent.org_id, agent, err)
         return session
 
 
@@ -619,6 +626,18 @@ async def _pause_for_approval(
     session.status = SessionStatus.waiting_approval
     db.add(session)
     await db.commit()
+
+    # Best-effort notification — approval was created and committed above, so a
+    # notification failure must never undo it.
+    try:
+        agent_row = await db.get(Agent, session.agent_id)
+        if agent_row:
+            await _notify.notify_approval_pending(
+                db, session.org_id, agent_row.name, summary
+            )
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).error("approval notify failed: %s", exc)
 
 
 async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:

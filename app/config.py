@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Connector credential encryption (Fernet key)
     encryption_key: str
 
+    # Resend — platform-owned transactional email for owner notifications.
+    # When blank, email notifications are silently skipped (dev/test).
+    resend_api_key: str = ""
+
     # Optional platform-owned OAuth apps for MCP catalog servers that refuse DCR
     # (Slack requires a fixed Slack app). When empty, the user pastes their own.
     slack_mcp_client_id: str = ""
