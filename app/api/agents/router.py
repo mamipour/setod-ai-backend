@@ -88,6 +88,7 @@ from app.db.models import (
     AgentLink,
     AgentProcessedItem,
     AgentPublishSnapshot,
+    AgentScenario,
     AgentSession,
     AgentSessionMessage,
     AgentSkillLink,
@@ -1889,3 +1890,130 @@ async def delete_agent_trigger(
     await session.commit()
 
 
+
+# ── Scenarios ─────────────────────────────────────────────────────────────────
+
+class ScenarioBody(BaseModel):
+    name: str
+    input_text: str
+    expected_tools: list[str] = []
+
+
+class ScenarioOut(BaseModel):
+    id: UUID
+    agent_id: UUID
+    name: str
+    input_text: str
+    expected_tools: list[str]
+    last_session_id: UUID | None
+    last_ran_at: datetime | None
+    created_at: datetime
+
+
+class ScenarioRunOut(BaseModel):
+    scenario_id: UUID
+    session: SessionOut
+
+
+@router.get("/{agent_id}/scenarios", response_model=list[ScenarioOut])
+async def list_scenarios(
+    agent_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    rows = await session.exec(
+        select(AgentScenario)
+        .where(AgentScenario.agent_id == agent.id)
+        .order_by(AgentScenario.created_at)
+    )
+    return [ScenarioOut(**r.model_dump()) for r in rows.all()]
+
+
+@router.post("/{agent_id}/scenarios", response_model=ScenarioOut, status_code=201)
+async def create_scenario(
+    agent_id: UUID,
+    body: ScenarioBody,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    sc = AgentScenario(
+        agent_id=agent.id,
+        name=body.name.strip(),
+        input_text=body.input_text.strip(),
+        expected_tools=body.expected_tools,
+    )
+    session.add(sc)
+    await session.commit()
+    await session.refresh(sc)
+    return ScenarioOut(**sc.model_dump())
+
+
+@router.patch("/{agent_id}/scenarios/{scenario_id}", response_model=ScenarioOut)
+async def update_scenario(
+    agent_id: UUID,
+    scenario_id: UUID,
+    body: ScenarioBody,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    sc = await session.get(AgentScenario, scenario_id)
+    if sc is None or sc.agent_id != agent.id:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    sc.name = body.name.strip()
+    sc.input_text = body.input_text.strip()
+    sc.expected_tools = body.expected_tools
+    session.add(sc)
+    await session.commit()
+    await session.refresh(sc)
+    return ScenarioOut(**sc.model_dump())
+
+
+@router.delete("/{agent_id}/scenarios/{scenario_id}", status_code=204)
+async def delete_scenario(
+    agent_id: UUID,
+    scenario_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    sc = await session.get(AgentScenario, scenario_id)
+    if sc is None or sc.agent_id != agent.id:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    await session.delete(sc)
+    await session.commit()
+
+
+@router.post("/{agent_id}/scenarios/{scenario_id}/run", response_model=ScenarioRunOut)
+async def run_scenario(
+    agent_id: UUID,
+    scenario_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Dry-run the agent with the scenario's input_text and return the session."""
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    sc = await session.get(AgentScenario, scenario_id)
+    if sc is None or sc.agent_id != agent.id:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    try:
+        result = await run_agent(
+            session,
+            agent,
+            trigger_type=TriggerType.manual,
+            user_input=sc.input_text,
+            dry_run=True,
+            use_published=False,  # always test the draft
+        )
+    except AgentRunError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    sc.last_session_id = result.id
+    sc.last_ran_at = datetime.now(UTC)
+    session.add(sc)
+    await session.commit()
+
+    return ScenarioRunOut(scenario_id=sc.id, session=_session_out(result))

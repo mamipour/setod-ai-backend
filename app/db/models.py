@@ -741,3 +741,34 @@ class AgentLink(SQLModel, table=True):
     # Shown to the model as the tool description and to the owner in the UI.
     description: str
     created_at: datetime = _ts()
+
+
+# ── AgentScenario ─────────────────────────────────────────────────────────────
+
+class AgentScenario(SQLModel, table=True):
+    """A named test case the owner can run against their agent in dry-run mode.
+
+    The runner injects `input_text` as the trigger message, executes the agent
+    with dry_run=True, and records the resulting AgentSession for inspection.
+    Optional `expected_tools` are checked by the CI scenario harness.
+    """
+
+    __tablename__ = "agent_scenarios"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    agent_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("agents.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
+    name: str  # e.g. "Happy path: new lead"
+    input_text: str  # sample trigger message injected on dry-run
+    # Optional ordered list of tool names CI asserts were called, e.g. ["send_email"]
+    expected_tools: list[str] = Field(default=[], sa_column=Column(JSONB, nullable=False, server_default="'[]'"))
+    # Last dry-run session id (None if never run)
+    last_session_id: UUID | None = Field(default=None)
+    last_ran_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    created_at: datetime = _ts()

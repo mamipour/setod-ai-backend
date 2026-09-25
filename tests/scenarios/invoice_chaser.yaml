@@ -1,0 +1,6 @@
+name: Invoice chaser – overdue follow-up
+template: invoice_chaser
+input: "Run now"
+expected_tools:
+  - read_rows
+  - send_email

@@ -1,0 +1,5 @@
+name: Order confirmation – new order webhook
+template: order_confirmation
+input: '{"order_id": "ORD-42", "customer_email": "buyer@example.com", "total": 99.99}'
+expected_tools:
+  - send_email

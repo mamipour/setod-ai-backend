@@ -1,0 +1,5 @@
+name: Support triage – billing complaint
+template: support_triage
+input: "Hi, I was charged twice for my subscription last month. Can you help?"
+expected_tools:
+  - send_email

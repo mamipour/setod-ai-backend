@@ -1,0 +1,6 @@
+name: Inbox digest – morning summary
+template: inbox_digest
+input: "Run now"
+expected_tools:
+  - list_emails
+  - send_telegram_message

@@ -1,0 +1,6 @@
+name: Lead finder – SaaS keywords
+template: telegram_lead_finder
+input: "Run now"
+expected_tools:
+  - web_search
+  - send_telegram_message
