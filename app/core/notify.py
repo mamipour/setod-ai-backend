@@ -43,7 +43,7 @@ from app.db.models import (
 log = logging.getLogger(__name__)
 
 DEBOUNCE_H = 1  # minimum hours between run_failed notifications per agent
-FROM_EMAIL = "Setod <notifications@setod.com>"
+FROM_EMAIL = "Setod <notifications@setod.com>"  # overridden at runtime by settings.resend_from_email
 
 
 # -- Internal helpers ----------------------------------------------------------
@@ -66,17 +66,18 @@ async def _owner(db: AsyncSession, org_id: UUID) -> tuple[User | None, Organizat
 
 
 async def _send_resend(to: str, subject: str, body_text: str) -> None:
-    """Send a plain-text email via Resend. Logs and returns on any failure."""
+    """Send a plain-text email via Resend. Raises on failure so callers can surface errors."""
     if not settings.resend_api_key:
-        log.debug("RESEND_API_KEY not set -- skipping email to %s", to)
-        return
+        raise RuntimeError(
+            "RESEND_API_KEY is not configured. Add it to the server .env file to enable email notifications."
+        )
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 "https://api.resend.com/emails",
                 headers={"Authorization": f"Bearer {settings.resend_api_key}"},
                 json={
-                    "from": FROM_EMAIL,
+                    "from": settings.resend_from_email,
                     "to": [to],
                     "subject": subject,
                     "text": body_text,
