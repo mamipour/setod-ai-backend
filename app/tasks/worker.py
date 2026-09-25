@@ -25,6 +25,7 @@ from app.integrations.registry import release_abandoned_reservations
 from app.core.triggers.dispatch import (
     claim_due,
     claim_inbound,
+    prune_sessions,
     reap_stale_sessions,
     run_inbound,
     run_trigger,
@@ -41,6 +42,7 @@ BATCH = 10
 # Runs are IO-bound on the provider, so this can exceed the core count comfortably.
 MAX_CONCURRENT_RUNS = 4
 REAP_EVERY = timedelta(minutes=10)
+PRUNE_EVERY = timedelta(hours=24)
 
 
 async def _run_scheduled(trigger_id: UUID, limiter: asyncio.Semaphore) -> None:
@@ -196,6 +198,7 @@ async def main() -> None:
 
     limiter = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
     next_reap = datetime.now(UTC)
+    next_prune = datetime.now(UTC)
     log.info("scheduler started — polling every %ds", POLL_SECONDS)
 
     try:
@@ -207,6 +210,19 @@ async def main() -> None:
                     if reaped:
                         log.warning("closed %d abandoned session(s)", reaped)
                     next_reap = datetime.now(UTC) + REAP_EVERY
+
+                if datetime.now(UTC) >= next_prune:
+                    try:
+                        async with AsyncSessionLocal() as db:
+                            counts = await prune_sessions(db)
+                        if counts["deleted"] or counts["scrubbed"]:
+                            log.info(
+                                "retention: deleted=%d scrubbed=%d",
+                                counts["deleted"], counts["scrubbed"],
+                            )
+                    except Exception:
+                        log.exception("retention prune failed")
+                    next_prune = datetime.now(UTC) + PRUNE_EVERY
 
                 await poll_once(limiter)
             except Exception:

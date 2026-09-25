@@ -100,6 +100,12 @@ class Organization(SQLModel, table=True):
     #   {"telegram_connector_id": "<uuid>" | null}
     # Email always falls back to the owner's login email via Resend.
     notify_settings: str | None = Field(default=None)
+    # Data retention policy. None = keep forever.
+    # Sessions older than this many days are pruned by the nightly worker.
+    data_retention_days: int | None = Field(default=None)
+    # When True, prune only deletes message content (PII scrub) rather than the whole session row.
+    # The session header (status, token counts, name, timestamps) is kept for cost reporting.
+    scrub_content_only: bool = Field(default=False)
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 

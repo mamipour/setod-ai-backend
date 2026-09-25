@@ -211,3 +211,82 @@ async def run_inbound(db: AsyncSession, event_id: UUID) -> list[AgentSession]:
         db.add(event)
         await db.commit()
     return sessions
+
+
+# ── Data retention pruning ─────────────────────────────────────────────────────
+
+async def prune_sessions(db: AsyncSession) -> dict[str, int]:
+    """Delete or scrub sessions older than each org's retention policy.
+
+    Returns a dict with counts: {"deleted": N, "scrubbed": N}.
+
+    Called nightly by the worker.  Safe to call multiple times — idempotent.
+
+    Scrub mode:
+        Deletes AgentSessionMessage rows for old sessions (removes PII in the
+        message content) but keeps the AgentSession header so token/cost
+        aggregates remain accurate for reporting.
+
+    Delete mode:
+        Deletes the AgentSession rows entirely; messages cascade automatically.
+    """
+    from datetime import timedelta
+    from sqlmodel import delete as sql_delete
+
+    from app.db.models import AgentSessionMessage, Organization
+
+    log.info("retention: starting nightly prune")
+
+    orgs_result = await db.exec(
+        select(Organization).where(Organization.data_retention_days.is_not(None))
+    )
+    orgs = orgs_result.all()
+
+    deleted = 0
+    scrubbed = 0
+    now = datetime.now(UTC)
+
+    for org in orgs:
+        cutoff = now - timedelta(days=org.data_retention_days)
+
+        if org.scrub_content_only:
+            # Delete just the messages for old sessions in this org.
+            old_sessions = await db.exec(
+                select(AgentSession.id).where(
+                    AgentSession.org_id == org.id,
+                    AgentSession.started_at < cutoff,
+                )
+            )
+            old_ids = [r for r in old_sessions.all()]
+            if old_ids:
+                await db.exec(
+                    sql_delete(AgentSessionMessage).where(
+                        AgentSessionMessage.session_id.in_(old_ids)
+                    )
+                )
+                scrubbed += len(old_ids)
+                log.info(
+                    "retention: scrubbed messages for %d sessions in org %s",
+                    len(old_ids), org.id,
+                )
+        else:
+            # Hard delete old sessions (messages cascade).
+            old_sessions = await db.exec(
+                select(AgentSession).where(
+                    AgentSession.org_id == org.id,
+                    AgentSession.started_at < cutoff,
+                )
+            )
+            sessions_to_delete = old_sessions.all()
+            for s in sessions_to_delete:
+                await db.delete(s)
+            deleted += len(sessions_to_delete)
+            if sessions_to_delete:
+                log.info(
+                    "retention: deleted %d sessions for org %s",
+                    len(sessions_to_delete), org.id,
+                )
+
+    await db.commit()
+    log.info("retention: done — deleted=%d scrubbed=%d", deleted, scrubbed)
+    return {"deleted": deleted, "scrubbed": scrubbed}

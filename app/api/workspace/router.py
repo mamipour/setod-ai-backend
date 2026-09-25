@@ -392,3 +392,59 @@ async def remove_member(
 
     await session.delete(member)
     await session.commit()
+
+
+# ── Data retention ─────────────────────────────────────────────────────────────
+
+ALLOWED_RETENTION_DAYS = {7, 30, 90, 180, 365}
+
+
+class RetentionOut(BaseModel):
+    data_retention_days: int | None
+    scrub_content_only: bool
+
+
+class RetentionBody(BaseModel):
+    data_retention_days: int | None  # None = keep forever
+    scrub_content_only: bool = False
+
+
+@router.get("/{org_id}/retention", response_model=RetentionOut)
+async def get_retention(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Return this workspace's data-retention policy."""
+    await _get_org_as_member(session, current_user, org_id)
+    org = await session.get(Organization, org_id)
+    return RetentionOut(
+        data_retention_days=org.data_retention_days,
+        scrub_content_only=org.scrub_content_only,
+    )
+
+
+@router.patch("/{org_id}/retention", response_model=RetentionOut)
+async def update_retention(
+    org_id: UUID,
+    body: RetentionBody,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Update this workspace's data-retention policy. Owners only."""
+    if body.data_retention_days is not None and body.data_retention_days not in ALLOWED_RETENTION_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"data_retention_days must be one of {sorted(ALLOWED_RETENTION_DAYS)} or null.",
+        )
+    org = await session.get(Organization, org_id)
+    org.data_retention_days = body.data_retention_days
+    org.scrub_content_only = body.scrub_content_only
+    org.updated_at = datetime.now(UTC)
+    session.add(org)
+    await session.commit()
+    await session.refresh(org)
+    return RetentionOut(
+        data_retention_days=org.data_retention_days,
+        scrub_content_only=org.scrub_content_only,
+    )
