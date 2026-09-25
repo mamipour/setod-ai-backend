@@ -261,7 +261,7 @@ async def list_members(
         select(OrganizationMember, User)
         .join(User, User.id == OrganizationMember.user_id)
         .where(OrganizationMember.organization_id == org_id)
-        .order_by(OrganizationMember.created_at)
+        .order_by(OrganizationMember.joined_at)
     )
     return [
         MemberOut(
