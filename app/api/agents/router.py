@@ -164,7 +164,7 @@ async def _with_health(session: AsyncSession, out: AgentOut) -> AgentOut:
     """
     try:
         rows = await session.exec(
-            select(AgentSession.status)
+            select(AgentSession.status, AgentSession.started_at)
             .where(
                 AgentSession.agent_id == out.id,
                 AgentSession.dry_run.is_(False),
@@ -172,10 +172,12 @@ async def _with_health(session: AsyncSession, out: AgentOut) -> AgentOut:
             .order_by(AgentSession.started_at.desc())
             .limit(20)
         )
-        statuses = rows.all()
-        if statuses:
+        records = rows.all()
+        if records:
+            statuses = [r[0] for r in records]
             succeeded = sum(1 for s in statuses if s == SessionStatus.succeeded)
             out.health_score = round(succeeded / len(statuses), 3)
+            out.last_run_at = records[0][1]  # most recent started_at
     except Exception:  # noqa: BLE001
         pass
     return out

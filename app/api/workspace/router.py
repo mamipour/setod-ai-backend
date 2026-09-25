@@ -321,6 +321,7 @@ async def invite_member(
     org = await session.get(Organization, org_id)
     org_name = org.name if org else "your workspace"
 
+    accept_url = f"https://setod.com/accept-invite?token={invite.token}"
     try:
         await _notify._send_resend(
             body.email,
@@ -328,8 +329,10 @@ async def invite_member(
             (
                 f"Hi,\n\n{current_user.name} ({current_user.email}) has invited you to join "
                 f"{org_name} on Setod as a {role.value}.\n\n"
-                "Sign up or log in at https://setod.com to accept.\n\n"
-                "This invitation expires in 7 days."
+                f"Accept your invitation:\n{accept_url}\n\n"
+                "This link expires in 7 days. If you don't have an account, "
+                "sign up with this email address at https://setod.com first, "
+                "then click the link."
             ),
         )
     except Exception as exc:  # noqa: BLE001 — email failure must not block the invite record
@@ -449,3 +452,178 @@ async def update_retention(
         data_retention_days=org.data_retention_days,
         scrub_content_only=org.scrub_content_only,
     )
+
+
+# ── Workspace CRUD ────────────────────────────────────────────────────────────
+
+class CreateOrgBody(BaseModel):
+    name: str
+
+
+class OrgOut(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+
+
+class RenameOrgBody(BaseModel):
+    name: str
+
+
+@router.post("/", response_model=OrgOut, status_code=201)
+async def create_workspace(
+    body: CreateOrgBody,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Create a new organisation. The caller becomes its owner."""
+    import re, secrets as _secrets
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Name cannot be blank")
+
+    # Generate a URL-safe slug, then make it unique with a short suffix.
+    base_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40]
+    slug = f"{base_slug}-{_secrets.token_hex(3)}"
+
+    from app.db.models import Skill
+    from app.core.agents.skills import DEFAULT_SKILLS
+
+    org = Organization(name=name, slug=slug)
+    session.add(org)
+    await session.flush()  # get org.id
+
+    session.add(OrganizationMember(
+        organization_id=org.id,
+        user_id=current_user.id,
+        role=MemberRole.owner,
+    ))
+
+    # Seed default skills like the sign-up flow does.
+    for s in DEFAULT_SKILLS:
+        session.add(Skill(
+            org_id=org.id,
+            key=s.key,
+            name=s.name,
+            tagline=s.tagline,
+            category=s.category,
+            content=s.content,
+            is_default=True,
+        ))
+
+    await session.commit()
+    await session.refresh(org)
+    return OrgOut(id=org.id, name=org.name, slug=org.slug)
+
+
+@router.patch("/{org_id}", response_model=OrgOut)
+async def rename_workspace(
+    org_id: UUID,
+    body: RenameOrgBody,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Rename a workspace. Owners only."""
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Name cannot be blank")
+    org = await session.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    org.name = name
+    org.updated_at = datetime.now(UTC)
+    session.add(org)
+    await session.commit()
+    await session.refresh(org)
+    return OrgOut(id=org.id, name=org.name, slug=org.slug)
+
+
+# ── Invitation management ─────────────────────────────────────────────────────
+
+class InvitationOut(BaseModel):
+    id: UUID
+    email: str
+    role: str
+    created_at: datetime
+    expires_at: datetime
+    accepted: bool
+
+
+@router.get("/{org_id}/invitations", response_model=list[InvitationOut])
+async def list_invitations(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """List all invitations for a workspace (pending and accepted). Owners only."""
+    rows = await session.exec(
+        select(Invitation)
+        .where(Invitation.organization_id == org_id)
+        .order_by(Invitation.created_at.desc())
+    )
+    return [
+        InvitationOut(
+            id=inv.id,
+            email=inv.email,
+            role=inv.role.value,
+            created_at=inv.created_at,
+            expires_at=inv.expires_at,
+            accepted=inv.accepted_at is not None,
+        )
+        for inv in rows.all()
+    ]
+
+
+@router.delete("/{org_id}/invitations/{invitation_id}", status_code=204)
+async def withdraw_invitation(
+    org_id: UUID,
+    invitation_id: UUID,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Cancel / withdraw a pending invitation. Owners only."""
+    inv = await session.get(Invitation, invitation_id)
+    if inv is None or inv.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if inv.accepted_at is not None:
+        raise HTTPException(status_code=409, detail="Invitation already accepted")
+    await session.delete(inv)
+    await session.commit()
+
+
+# ── Leave workspace ───────────────────────────────────────────────────────────
+
+@router.delete("/{org_id}/members/me", status_code=204)
+async def leave_workspace(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Leave a workspace. The last owner cannot leave (would orphan the org)."""
+    membership = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == current_user.id,
+        )
+    )
+    member = membership.first()
+    if member is None:
+        raise HTTPException(status_code=404, detail="Not a member of this workspace")
+
+    if member.role == MemberRole.owner:
+        # Count other owners — can't leave if you're the last one.
+        other_owners = await session.exec(
+            select(OrganizationMember).where(
+                OrganizationMember.organization_id == org_id,
+                OrganizationMember.role == MemberRole.owner,
+                OrganizationMember.user_id != current_user.id,
+            )
+        )
+        if other_owners.first() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="You are the only owner. Transfer ownership or delete the workspace first.",
+            )
+
+    await session.delete(member)
+    await session.commit()
