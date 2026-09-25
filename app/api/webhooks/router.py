@@ -266,11 +266,16 @@ async def receive_instagram(
         raise HTTPException(status_code=503, detail="Instagram is not configured")
 
     import hashlib as _hashlib
-    expected_sig = "sha256=" + hmac.new(
+    expected_sig_fb = "sha256=" + hmac.new(
         hmac_secret.encode(), body, _hashlib.sha256
     ).hexdigest()
-    if not hmac.compare_digest(x_hub_signature_256 or "", expected_sig):
-        log.warning("rejected unsigned Instagram delivery")
+    expected_sig_ig = "sha256=" + hmac.new(
+        (settings.instagram_app_secret or hmac_secret).encode(), body, _hashlib.sha256
+    ).hexdigest()
+    received_sig = x_hub_signature_256 or ""
+    log.info("Instagram webhook sig received=%s expected_fb=%s expected_ig=%s", received_sig[:20], expected_sig_fb[:20], expected_sig_ig[:20])
+    if not (hmac.compare_digest(received_sig, expected_sig_fb) or hmac.compare_digest(received_sig, expected_sig_ig)):
+        log.warning("rejected Instagram delivery: sig mismatch received=%s", received_sig)
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     import json as _json
