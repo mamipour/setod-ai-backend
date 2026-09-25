@@ -68,3 +68,27 @@ async def require_owner(
             detail="Only workspace owners can perform this action",
         )
     return current_user
+
+
+async def assert_org_owner(session: AsyncSession, user: User, org_id: UUID) -> None:
+    """Raise 403 unless *user* is an owner of *org_id*.
+
+    Use this inside route handlers that already look up a resource (and therefore
+    know the org_id at runtime) rather than as a FastAPI Depends() parameter.
+    Complements ``require_owner`` which is injected via Depends when org_id is a
+    path / query parameter.
+    """
+    result = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == user.id,
+        )
+    )
+    member = result.first()
+    if member is None:
+        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+    if member.role != MemberRole.owner:
+        raise HTTPException(
+            status_code=403,
+            detail="Only workspace owners can perform this action",
+        )

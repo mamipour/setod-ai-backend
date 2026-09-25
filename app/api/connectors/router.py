@@ -44,7 +44,7 @@ from telethon.sessions import StringSession
 
 from pydantic import BaseModel
 
-from app.api.auth.dependencies import get_current_user
+from app.api.auth.dependencies import assert_org_owner, get_current_user
 from app.api.connectors.schemas import ConnectorOut, TestResult
 from app.config import settings
 from app.core.crypto import decrypt_json, encrypt_json
@@ -92,7 +92,7 @@ async def delete_connector(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_owner(session, current_user, org_id)
     connector = await session.get(Connector, connector_id)
     if not connector or connector.org_id != org_id:
         raise HTTPException(status_code=404, detail="Connector not found")
@@ -262,7 +262,7 @@ async def create_telegram_bot(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
 
     # Re-validate token server-side before storing anything
     async with httpx.AsyncClient() as client:
@@ -367,7 +367,7 @@ async def create_llm_connector(
     if body.provider not in (ConnectorType.openai, ConnectorType.anthropic):
         raise HTTPException(status_code=422, detail="Unsupported LLM provider")
 
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
 
     check = await _check_llm_key(body.provider, body.api_key)
     if not check.ok:
@@ -407,7 +407,7 @@ async def update_llm_key(
     ON DELETE SET NULL, so deleting it would silently unbind every agent using this
     provider as its model.
     """
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
 
     connector = await session.get(Connector, connector_id)
     if not connector or connector.org_id != body.org_id:
@@ -574,7 +574,7 @@ async def tg_client_save(
     if not pending or not pending.get("user_info"):
         raise HTTPException(status_code=404, detail="Session expired or not yet verified")
 
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
 
     client: TelegramClient = pending["client"]
     session_string = client.session.save()
@@ -621,7 +621,7 @@ async def create_gmail_connector(
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
     """Save a Gmail connector backed by an App Password (IMAP + SMTP + CalDAV)."""
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
 
     # Verify credentials before storing
     from app.integrations.base import IntegrationError as _IntegrationError
@@ -744,7 +744,7 @@ async def create_twilio(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
 
     result = await _twilio_validate(body.account_sid, body.auth_token, body.phone_number)
     if not result.ok:
@@ -902,7 +902,7 @@ async def create_mcp_connector(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
     if body.catalog_key not in mcp.CATALOG:
         raise HTTPException(status_code=422, detail="Unknown MCP catalog key")
     try:
@@ -1090,7 +1090,7 @@ async def mcp_oauth_start_post(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
     location = await _begin_mcp_oauth(
         request,
         org_id=body.org_id,
@@ -1193,7 +1193,7 @@ async def resync_mcp_tools(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_owner(session, current_user, org_id)
     connector = await session.get(Connector, connector_id)
     if not connector or connector.org_id != org_id or connector.type != ConnectorType.mcp:
         raise HTTPException(status_code=404, detail="Connector not found")
@@ -1236,7 +1236,7 @@ async def create_webhook_connector(
     Returns the endpoint URL and a signing secret. The secret is shown once; it's stored
     hashed so it cannot be recovered later (use regen-secret to rotate).
     """
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
     raw_secret = secrets.token_urlsafe(32)
 
     connector = Connector(
@@ -1269,7 +1269,7 @@ async def regen_webhook_secret(
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
     """Rotate the signing secret for a webhook connector. Old secret stops working immediately."""
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_owner(session, current_user, org_id)
     connector = await session.get(Connector, connector_id)
     if not connector or connector.org_id != org_id or connector.type != ConnectorType.webhook:
         raise HTTPException(status_code=404, detail="Webhook connector not found")
@@ -1314,7 +1314,7 @@ async def create_slack_webhook(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
     try:
         await slack.validate(body.webhook_url)
     except slack.IntegrationError as exc:
@@ -1358,7 +1358,7 @@ async def create_sheets_connector(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
     try:
         sa_dict = json.loads(body.sa_json)
         email = await sheets.validate(body.sa_json)
@@ -1410,7 +1410,7 @@ async def create_whatsapp_connector(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_owner(session, current_user, body.org_id)
     try:
         display = await whatsapp.validate(body.phone_number_id, body.access_token)
     except whatsapp.IntegrationError as exc:

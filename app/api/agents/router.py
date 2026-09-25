@@ -58,7 +58,7 @@ from app.api.agents.schemas import (
     TriggerOut,
     TriggerUpsert,
 )
-from app.api.auth.dependencies import get_current_user
+from app.api.auth.dependencies import assert_org_owner, get_current_user
 from app.core.agents import templates
 from app.core.agents.base import AgentRunError, RegisteredTool, run_agent, snapshot_config
 from app.core.agents.templates import TEMPLATES
@@ -135,6 +135,15 @@ async def _get_owned_agent(session: AsyncSession, user: User, agent_id: UUID) ->
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     await _assert_org_member(session, user, agent.org_id)
+    return agent
+
+
+async def _get_owner_only_agent(session: AsyncSession, user: User, agent_id: UUID) -> Agent:
+    """Like _get_owned_agent but additionally enforces the caller is a workspace owner."""
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    await assert_org_owner(session, user, agent.org_id)
     return agent
 
 
@@ -501,7 +510,7 @@ async def delete_agent(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    agent = await _get_owned_agent(session, current_user, agent_id)
+    agent = await _get_owner_only_agent(session, current_user, agent_id)
 
     # No ON DELETE CASCADE on these FKs, so children go first.
     sessions = await session.exec(select(AgentSession.id).where(AgentSession.agent_id == agent.id))
@@ -530,7 +539,7 @@ async def publish_agent(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    agent = await _get_owned_agent(session, current_user, agent_id)
+    agent = await _get_owner_only_agent(session, current_user, agent_id)
     if agent.model_connector_id is None:
         raise HTTPException(status_code=422, detail="Choose an AI model before publishing")
     if not agent.instructions.strip():
@@ -571,7 +580,7 @@ async def unpublish_agent(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    agent = await _get_owned_agent(session, current_user, agent_id)
+    agent = await _get_owner_only_agent(session, current_user, agent_id)
     agent.published_config = None
     agent.status = AgentStatus.draft
     agent.published_at = None
@@ -594,7 +603,7 @@ async def pause_agent(
     resumed without re-publishing. The worker skips all scheduled runs and inbound
     events for paused agents.
     """
-    agent = await _get_owned_agent(session, current_user, agent_id)
+    agent = await _get_owner_only_agent(session, current_user, agent_id)
     if agent.status != AgentStatus.published:
         raise HTTPException(status_code=422, detail="Only a live (published) agent can be paused")
     agent.status = AgentStatus.paused
@@ -616,7 +625,7 @@ async def resume_agent(
     Sets status back to *published*. The existing `published_config` snapshot is used
     as-is — no new snapshot is created and no re-publish is required.
     """
-    agent = await _get_owned_agent(session, current_user, agent_id)
+    agent = await _get_owner_only_agent(session, current_user, agent_id)
     if agent.status != AgentStatus.paused:
         raise HTTPException(status_code=422, detail="Only a paused agent can be resumed")
     if not agent.published_config:
@@ -665,7 +674,7 @@ async def rollback_agent(
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
     """Restore a past snapshot to the draft (does not auto-publish)."""
-    agent = await _get_owned_agent(session, current_user, agent_id)
+    agent = await _get_owner_only_agent(session, current_user, agent_id)
     snapshot = await session.get(AgentPublishSnapshot, snapshot_id)
     if snapshot is None or snapshot.agent_id != agent.id:
         raise HTTPException(status_code=404, detail="Snapshot not found")

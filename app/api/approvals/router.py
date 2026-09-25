@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.auth.dependencies import get_current_user
+from app.api.auth.dependencies import assert_org_owner, get_current_user
 from app.db.models import (
     Agent,
     ApprovalRequest,
@@ -83,6 +83,17 @@ async def _get_owned_request(
     return req
 
 
+async def _get_owner_request(
+    session: AsyncSession, user: User, request_id: UUID
+) -> ApprovalRequest:
+    """Like _get_owned_request but requires the caller to be a workspace owner."""
+    req = await session.get(ApprovalRequest, request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    await assert_org_owner(session, user, req.org_id)
+    return req
+
+
 async def _enrich(session: AsyncSession, req: ApprovalRequest) -> ApprovalRequestOut:
     agent = await session.get(Agent, req.agent_id)
     out = ApprovalRequestOut.model_validate(req)
@@ -144,7 +155,7 @@ async def approve(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    req = await _get_owned_request(session, current_user, request_id)
+    req = await _get_owner_request(session, current_user, request_id)
     if req.status != ApprovalStatus.pending:
         raise HTTPException(status_code=409, detail=f"Request is already {req.status.value}.")
     req.status = ApprovalStatus.approved
@@ -163,7 +174,7 @@ async def reject(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    req = await _get_owned_request(session, current_user, request_id)
+    req = await _get_owner_request(session, current_user, request_id)
     if req.status != ApprovalStatus.pending:
         raise HTTPException(status_code=409, detail=f"Request is already {req.status.value}.")
     req.status = ApprovalStatus.rejected
