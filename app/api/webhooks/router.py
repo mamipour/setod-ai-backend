@@ -280,15 +280,15 @@ async def receive_instagram(
     except Exception:
         return  # malformed JSON — acknowledge so Meta stops retrying
 
-    log.info("Instagram webhook payload object=%s entries=%d body_preview=%s", payload.get("object"), len(payload.get("entry", [])), str(body[:200]))
+    log.warning("IG_DBG payload object=%s entries=%d body=%s", payload.get("object"), len(payload.get("entry", [])), str(body[:300]))
 
     if payload.get("object") != "instagram":
-        log.warning("Instagram webhook: unexpected object type %s", payload.get("object"))
+        log.warning("IG_DBG unexpected object type %s", payload.get("object"))
         return
 
     for entry in payload.get("entry", []):
         ig_user_id = str(entry.get("id", ""))
-        log.info("Instagram webhook entry ig_user_id=%s messaging=%d changes=%d", ig_user_id, len(entry.get("messaging", [])), len(entry.get("changes", [])))
+        log.warning("IG_DBG entry ig_user_id=%s messaging=%d changes=%d", ig_user_id, len(entry.get("messaging", [])), len(entry.get("changes", [])))
         if not ig_user_id:
             continue
 
@@ -304,7 +304,7 @@ async def receive_instagram(
         for c in ig_rows.all():
             try:
                 stored_id = _dj(c.config).get("ig_user_id")
-                log.info("Instagram webhook checking connector %s stored_ig_user_id=%s vs payload=%s", c.id, stored_id, ig_user_id)
+                log.warning("IG_DBG connector %s stored=%s payload=%s match=%s", c.id, stored_id, ig_user_id, stored_id == ig_user_id)
                 if stored_id == ig_user_id:
                     connector = c
                     break
@@ -312,14 +312,14 @@ async def receive_instagram(
                 continue
 
         if connector is None:
-            log.warning("Instagram webhook: no connector found for ig_user_id=%s", ig_user_id)
+            log.warning("IG_DBG no connector found for ig_user_id=%s", ig_user_id)
             continue
 
         # ── DMs ───────────────────────────────────────────────────────────────
         for msg_event in entry.get("messaging", []):
             msg = msg_event.get("message", {})
             text = msg.get("text", "")
-            log.info("Instagram webhook DM event text=%r", text[:50] if text else "")
+            log.warning("IG_DBG DM text=%r sender=%s", text[:50] if text else "", msg_event.get("sender", {}).get("id"))
             if not text:
                 continue
             mid = msg.get("mid", "")
