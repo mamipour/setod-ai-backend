@@ -50,7 +50,10 @@ from app.config import settings
 from app.core.crypto import decrypt_json, encrypt_json
 from app.db.models import Agent, AgentTool, Connector, ConnectorStatus, ConnectorType, OrganizationMember, User
 from app.db.session import get_session
-from app.integrations import gmail, mcp, telegram, twilio
+import json
+import secrets
+
+from app.integrations import gmail, mcp, sheets, slack, telegram, twilio, whatsapp
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -1207,3 +1210,225 @@ async def resync_mcp_tools(
     session.add(connector)
     await session.commit()
     return TestResult(ok=True, detail=f"Updated — {len(tools)} tool(s) frozen")
+
+
+# ── Generic inbound webhook ───────────────────────────────────────────────────
+
+class WebhookCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+
+
+class WebhookOut(BaseModel):
+    connector: ConnectorOut
+    webhook_url: str
+    secret: str  # returned once — not re-derivable from stored config
+
+
+@router.post("/webhook", response_model=WebhookOut, status_code=201)
+async def create_webhook_connector(
+    body: WebhookCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Create a generic inbound webhook connector.
+
+    Returns the endpoint URL and a signing secret. The secret is shown once; it's stored
+    hashed so it cannot be recovered later (use regen-secret to rotate).
+    """
+    await _assert_org_member(session, current_user, body.org_id)
+    raw_secret = secrets.token_urlsafe(32)
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or "Inbound Webhook",
+        type=ConnectorType.webhook,
+        status=ConnectorStatus.active,
+        # Store the raw secret inside encrypt_json — it's Fernet-encrypted at rest.
+        # The /hooks/ receiver re-derives the HMAC from this plaintext secret.
+        config=encrypt_json({"secret": raw_secret}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+
+    url = f"{settings.public_base_url or 'http://localhost:8000'}/hooks/{connector.id}"
+    return WebhookOut(
+        connector=ConnectorOut.model_validate(connector),
+        webhook_url=url,
+        secret=raw_secret,
+    )
+
+
+@router.post("/{connector_id}/regen-secret", response_model=WebhookOut)
+async def regen_webhook_secret(
+    connector_id: UUID,
+    org_id: Annotated[UUID, Query()],
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Rotate the signing secret for a webhook connector. Old secret stops working immediately."""
+    await _assert_org_member(session, current_user, org_id)
+    connector = await session.get(Connector, connector_id)
+    if not connector or connector.org_id != org_id or connector.type != ConnectorType.webhook:
+        raise HTTPException(status_code=404, detail="Webhook connector not found")
+
+    raw_secret = secrets.token_urlsafe(32)
+    config = decrypt_json(connector.config)
+    config["secret"] = raw_secret
+    connector.config = encrypt_json(config)
+    connector.updated_at = datetime.now(UTC)
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+
+    url = f"{settings.public_base_url or 'http://localhost:8000'}/hooks/{connector.id}"
+    return WebhookOut(
+        connector=ConnectorOut.model_validate(connector),
+        webhook_url=url,
+        secret=raw_secret,
+    )
+
+
+# ── Slack outgoing webhook ────────────────────────────────────────────────────
+
+class SlackWebhookCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    webhook_url: str
+
+
+@router.post("/slack-webhook/validate", response_model=TestResult)
+async def validate_slack_webhook(body: SlackWebhookCreate):
+    try:
+        await slack.validate(body.webhook_url)
+        return TestResult(ok=True, detail="Connected — test message posted to Slack")
+    except slack.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/slack-webhook", response_model=ConnectorOut, status_code=201)
+async def create_slack_webhook(
+    body: SlackWebhookCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await _assert_org_member(session, current_user, body.org_id)
+    try:
+        await slack.validate(body.webhook_url)
+    except slack.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or "Slack",
+        type=ConnectorType.slack_webhook,
+        status=ConnectorStatus.active,
+        config=encrypt_json({"webhook_url": body.webhook_url}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── Google Sheets ─────────────────────────────────────────────────────────────
+
+class SheetsCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    sa_json: str  # service-account JSON string
+    default_spreadsheet_id: str = ""
+
+
+@router.post("/sheets/validate", response_model=TestResult)
+async def validate_sheets(body: SheetsCreate):
+    try:
+        email = await sheets.validate(body.sa_json)
+        return TestResult(ok=True, detail=f"Valid — share your spreadsheets with {email}")
+    except sheets.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/sheets", response_model=ConnectorOut, status_code=201)
+async def create_sheets_connector(
+    body: SheetsCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await _assert_org_member(session, current_user, body.org_id)
+    try:
+        sa_dict = json.loads(body.sa_json)
+        email = await sheets.validate(body.sa_json)
+    except sheets.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or f"Sheets · {email}",
+        type=ConnectorType.google_sheets,
+        status=ConnectorStatus.active,
+        config=encrypt_json({
+            "sa_json": sa_dict,
+            "service_account_email": email,
+            "default_spreadsheet_id": body.default_spreadsheet_id,
+        }),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── WhatsApp Business ─────────────────────────────────────────────────────────
+
+class WhatsAppCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    phone_number_id: str
+    access_token: str
+    verify_token: str
+
+
+@router.post("/whatsapp/validate", response_model=TestResult)
+async def validate_whatsapp(body: WhatsAppCreate):
+    try:
+        display = await whatsapp.validate(body.phone_number_id, body.access_token)
+        return TestResult(ok=True, detail=f"Connected — {display}")
+    except whatsapp.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/whatsapp", response_model=ConnectorOut, status_code=201)
+async def create_whatsapp_connector(
+    body: WhatsAppCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await _assert_org_member(session, current_user, body.org_id)
+    try:
+        display = await whatsapp.validate(body.phone_number_id, body.access_token)
+    except whatsapp.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or f"WhatsApp · {display}",
+        type=ConnectorType.whatsapp,
+        status=ConnectorStatus.active,
+        config=encrypt_json({
+            "phone_number_id": body.phone_number_id,
+            "access_token": body.access_token,
+            "verify_token": body.verify_token,
+        }),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector

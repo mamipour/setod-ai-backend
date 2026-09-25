@@ -14,6 +14,7 @@ from app.api.connectors.router import router as connectors_router
 from app.api.notes.router import router as notes_router
 from app.api.skills.router import router as skills_router
 from app.api.webhooks.router import router as webhooks_router
+from app.api.hooks.router import router as hooks_router
 from app.api.workspace.router import router as workspace_router
 from app.config import settings
 import app.db.models  # noqa: F401 — registers all SQLModel tables
@@ -83,6 +84,7 @@ app.include_router(approvals_router)
 app.include_router(notes_router)
 app.include_router(skills_router)
 app.include_router(webhooks_router)
+app.include_router(hooks_router)
 app.include_router(workspace_router)
 
 
