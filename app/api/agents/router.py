@@ -1023,7 +1023,7 @@ Never write memory syntax, tool call counts, or platform mechanics into the prom
 - Writing tools (send email, send SMS, send Telegram) should fire once per run unless the prompt explicitly allows more — write this in plain English ("send one notification per run"), never reference tool call counts
 - There is no file system and no code execution. Web search is a settings toggle. MCP tools only exist if the user attached an MCP connector.
 - **`query_data`** exists only when the agent has a CSV or Excel file in its Knowledge tab. It runs one read-only SQL statement (DuckDB dialect) over those files as tables and returns up to 200 rows. The agent already sees every table's columns, types and a sample row in the tool description — prompts should say *what* to find ("tenders closing in the next 14 days in the IT category"), never write SQL or column names. Suggest it whenever a prompt would otherwise ask the agent to "read the file" or "go through all rows".
-- Cross-run memory for web/CSV monitoring is handled by the platform's "remember past runs" setting — do not write memory syntax or identifier tracking into the prompt; write the intent instead ("don't notify about the same item twice")
+- **Two kinds of cross-run memory, pick the right one.** *Remember past runs* (a Settings toggle, `episodic_memory`) gives the agent fuzzy recall of what it observed and did — right for "don't notify about the same listing twice" where matching is by meaning. `memory_get` / `memory_set` / `memory_delete` / `memory_list` (on by default, setting `kv_memory`) store exact values the agent chooses to keep — the last order id it confirmed, the tender refs it already reported, how many reminders it sent someone. Keys starting with `shared:` are visible to every agent in the workspace. When a prompt needs exactness ("only process orders newer than the last one you handled", "never remind the same client more than twice"), say so in plain English and name what to remember ("keep the id of the last order you confirmed") — do not write tool syntax, JSON shapes, or key names; the agent picks those. The owner can see and edit every stored value on the agent's Memory tab, so mention that when the state matters ("you can reset the last-processed id on the Memory tab if a run goes wrong").
 
 Human approval:
 - Individual tools can be flagged "requires approval" — the agent will pause and wait before executing them
@@ -1068,7 +1068,7 @@ When the user wants the agent to periodically check a website for new or changed
 3. **Verify the best endpoint** by fetching it. Confirm you get readable, structured content.
 4. **Write instructions that embed the verified endpoint** — the exact URL the agent should fetch — plus extraction hints (column names, keywords to filter on, what a match looks like). Do not leave URL discovery to the agent at runtime.
    - **For date-ordered results, never use web search.** Web search (`search_web`) returns results sorted by relevance, not by date. An agent told to "stop when you see items older than 7 days" will not work reliably with search results — it may never find recent items or may report old ones as new. Instead, use `fetch_page` on a listing URL that has an explicit newest-first sort (look for query parameters like `sort=date`, `order=newest`, `sort=desc`). Write that sorted URL directly into the instructions.
-   - **Always tell the agent to avoid acting on the same item twice.** Write this in plain English: "skip any items you have already notified about", "only report each opportunity once". Tell the user to enable "Remember past runs" in the agent's Settings tab — the platform handles the memory mechanics automatically. Do not write memory syntax, identifier list formats, or implementation details into the prompt.
+   - **Always tell the agent to avoid acting on the same item twice.** Write this in plain English: "skip any items you have already notified about", "only report each opportunity once". If the items have a stable reference (an id, a reference number, a URL), tell the agent to *remember the references it has already reported* — it will keep them in its key-value memory, which is exact and visible on the Memory tab. If there is no stable reference, tell the user to enable "Remember past runs" in the agent's Settings tab for fuzzy recall instead. Either way, do not write memory syntax, key names, or list formats into the prompt.
    - **If only HTML listings exist**, write instructions that use the site's own filters and sorting (query parameters for category, status, newest-first) so one page carries the most relevant rows. Give the agent a stop rule in plain English: "stop as soon as you reach items older than N days." Fetched pages may end with a "[truncated — showing X of Y lines]" note; that means the page continued, so narrow the filters or follow the pagination link.
 5. **Check the agent's web settings** (shown in `<agent_context>`). If web search or live page access is off, tell the user: "Go to this agent's Settings tab and enable Web search and Live page access — the agent needs those to fetch URLs during its runs."
 6. **If the page returns almost no text** (likely a JavaScript-rendered SPA), say so honestly: "This page appears to need a browser to load — the agent's built-in fetch tool will not see content here. Look for an RSS feed, API, or data download on the site instead."
@@ -1289,6 +1289,18 @@ async def _build_agent_context_block(session: AsyncSession, agent: Agent) -> str
         if web_on
         else "Web search OFF (both toggles off)"
     )
+    memory_status = (
+        f"Remember past runs (episodic) {'ON' if settings.get('episodic_memory') else 'OFF'}; "
+        f"key-value memory tools {'ON' if settings.get('kv_memory', True) else 'OFF'}"
+    )
+    # Key names + previews only (decision #12): values are agent-written and must not be
+    # able to steer the copilot by being quoted at it in full.
+    kv_lines: list[str] = []
+    if settings.get("kv_memory", True):
+        kv_lines = [
+            f"  - {kv.SHARED_PREFIX if e.agent_id is None else ''}{e.key} = {kv.preview(e.value)}"
+            for e in (await kv.list_entries(session, agent.org_id, agent.id))[: kv.DESCRIPTION_MAX_KEYS]
+        ]
 
     # Resolve the effective model label from the connector, since agent.model is often null
     # while model_connector_id points to the real provider. Show the connector name so the
@@ -1304,8 +1316,11 @@ async def _build_agent_context_block(session: AsyncSession, agent: Agent) -> str
         f"<agent_context>\n"
         f"Agent: {agent.name}\n"
         f"Model: {model_label}\n"
-        f"Web settings: {web_status}\n\n"
+        f"Web settings: {web_status}\n"
+        f"Memory settings: {memory_status}\n\n"
         f"Current instructions:\n```\n{agent.instructions or '(empty)'}\n```\n\n"
+        f"Stored key-value memory (key = preview; the owner can edit these on the Memory tab):\n"
+        f"{chr(10).join(kv_lines) or '  (nothing stored)'}\n\n"
         f"Attached tools:\n{chr(10).join(tool_lines) or '  (none)'}\n\n"
         f"Attached skills:\n{chr(10).join(skill_lines) or '  (none)'}\n\n"
         f"Agents it can call:\n{chr(10).join(call_lines) or '  (none)'}\n\n"
