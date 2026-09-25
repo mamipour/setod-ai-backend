@@ -1464,12 +1464,16 @@ async def instagram_oauth_start(
         raise HTTPException(status_code=503, detail="Instagram is not configured on this server.")
 
     from urllib.parse import urlencode
+    import base64, json as _json
+    state_payload = base64.urlsafe_b64encode(
+        _json.dumps({"org_id": str(org_id), "user_id": str(current_user.id)}).encode()
+    ).decode()
     params = urlencode({
         "client_id": settings.instagram_app_id,
         "redirect_uri": settings.instagram_redirect_uri,
         "scope": "instagram_business_basic,instagram_business_manage_comments,instagram_business_manage_messages",
         "response_type": "code",
-        "state": str(org_id),
+        "state": state_payload,
     })
     from fastapi.responses import RedirectResponse
     return RedirectResponse(f"https://www.instagram.com/oauth/authorize?{params}")
@@ -1492,8 +1496,11 @@ async def instagram_oauth_callback(
         return RedirectResponse(f"{frontend}/connectors?error=instagram_denied")
 
     try:
-        org_id = UUID(state)
-    except ValueError:
+        import base64, json as _json
+        state_data = _json.loads(base64.urlsafe_b64decode(state + "==").decode())
+        org_id = UUID(state_data["org_id"])
+        user_id = UUID(state_data["user_id"])
+    except Exception:
         from fastapi.responses import RedirectResponse
         return RedirectResponse(f"{frontend}/connectors?error=instagram_state")
 
@@ -1511,6 +1518,7 @@ async def instagram_oauth_callback(
     username = config.get("username", "")
     connector = Connector(
         org_id=org_id,
+        created_by=user_id,
         name=f"Instagram · @{username}" if username else "Instagram",
         type=ConnectorType.instagram,
         status=ConnectorStatus.active,
