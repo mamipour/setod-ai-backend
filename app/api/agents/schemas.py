@@ -202,4 +202,19 @@ class KnowledgeFileOut(BaseModel):
     # Non-empty for CSV/XLSX uploads the agent can query with `query_data`.
     tables: list[DataTableOut] = []
 
+
+class MemoryEntryOut(BaseModel):
+    """One key-value memory entry as the Memory tab shows it. `key` carries the `shared:`
+    prefix for workspace-scoped rows so the UI and the model see the same name."""
+
+    key: str
+    shared: bool
+    value: Any
+    updated_at: datetime
+    updated_by_session_id: UUID | None = None
+
+
+class MemoryEntryIn(BaseModel):
+    value: Any
+
     model_config = {"from_attributes": True}

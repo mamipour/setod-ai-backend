@@ -184,6 +184,9 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     "search_context": "medium",
     "reasoning": False,
     "episodic_memory": False,
+    # Key-value memory tools (memory_get/set/delete/list). On by default: "the last id I
+    # processed" is the core need of nearly every scheduled agent.
+    "kv_memory": True,
     "daily_token_budget": 500_000,
 }
 
@@ -536,6 +539,41 @@ class AgentDataTable(SQLModel, table=True):
     sample: list[list[str]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
     parquet: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
     created_at: datetime = _ts()
+
+
+class AgentKV(SQLModel, table=True):
+    """One key-value entry an agent wrote for its future self (or for its workspace).
+
+    `agent_id` NULL means workspace-shared: any agent in the org reads and writes it through
+    the `shared:` key prefix. The uniqueness constraint is declared NULLS NOT DISTINCT so
+    two shared rows cannot hold the same key — plain UNIQUE would treat the NULL agent_ids
+    as distinct and the upsert's ON CONFLICT would never fire.
+
+    Values are JSON (number, string, list, object) rather than text so a "last processed
+    id" round-trips as the number the agent stored. Kept deliberately small (see
+    `app.core.kv` limits): this is state, not a document store.
+    """
+
+    __tablename__ = "agent_kv"
+    __table_args__ = (
+        UniqueConstraint("org_id", "agent_id", "key", name="uq_agent_kv_scope_key", postgresql_nulls_not_distinct=True),
+        Index("ix_agent_kv_org_agent", "org_id", "agent_id"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", nullable=False)
+    # CASCADE: an agent's private state dies with it. Shared rows have no agent and survive.
+    agent_id: UUID | None = Field(
+        default=None,
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=True),
+    )
+    # Stored without the `shared:` prefix; the scope is the agent_id column.
+    key: str
+    value: Any = Field(sa_column=Column(JSONB, nullable=False))
+    # Which run last wrote it — lets the Memory tab link "set by run …".
+    updated_by_session_id: UUID | None = Field(default=None, sa_type=PGUUID(as_uuid=True))
+    created_at: datetime = _ts()
+    updated_at: datetime = _ts()
 
 
 # ── Episodic memory ────────────────────────────────────────────────────────────

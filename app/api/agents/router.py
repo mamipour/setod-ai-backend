@@ -54,6 +54,8 @@ from app.api.agents.schemas import (
     AgentUpdate,
     DataTableOut,
     KnowledgeFileOut,
+    MemoryEntryIn,
+    MemoryEntryOut,
     SessionDetailOut,
     SessionOut,
     ToolOut,
@@ -64,7 +66,7 @@ from app.api.auth.dependencies import assert_org_owner, get_current_user
 from app.core.agents import templates
 from app.core.agents.base import AgentRunError, RegisteredTool, run_agent, snapshot_config
 from app.core.agents.templates import TEMPLATES
-from app.core import knowledge, tabular
+from app.core import knowledge, kv, tabular
 import secrets
 
 from app.config import settings
@@ -87,6 +89,7 @@ from app.db.models import (
     Agent,
     AgentAssistMessage,
     AgentDataTable,
+    AgentKV,
     AgentKnowledgeFile,
     AgentLink,
     AgentProcessedItem,
@@ -1731,6 +1734,82 @@ async def add_knowledge_url(
     await session.commit()
     await session.refresh(row)
     return row
+
+
+# ── Key-value memory ───────────────────────────────────────────────────────────
+#
+# The owner's window onto the agent's exact state. Keys carry the `shared:` prefix in the
+# URL and the payload exactly as the model uses them; `kv.resolve` maps them to a scope.
+
+
+def _memory_out(row: AgentKV) -> MemoryEntryOut:
+    shared = row.agent_id is None
+    return MemoryEntryOut(
+        key=f"{kv.SHARED_PREFIX}{row.key}" if shared else row.key,
+        shared=shared,
+        value=row.value,
+        updated_at=row.updated_at,
+        updated_by_session_id=row.updated_by_session_id,
+    )
+
+
+@router.get("/{agent_id}/memory", response_model=list[MemoryEntryOut])
+async def list_memory(
+    agent_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Every key this agent can see: its own, then the workspace's `shared:` keys."""
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    rows = await kv.list_entries(session, agent.org_id, agent.id)
+    return [_memory_out(r) for r in rows]
+
+
+@router.put("/{agent_id}/memory/{key}", response_model=MemoryEntryOut)
+async def put_memory(
+    agent_id: UUID,
+    key: str,
+    body: MemoryEntryIn,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Create or overwrite one entry. Same limits as the agent's `memory_set`."""
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    try:
+        scope = kv.resolve(agent.org_id, agent.id, key)
+        row = await kv.set_entry(session, scope, body.value, session_id=None)
+    except kv.KVError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _memory_out(row)
+
+
+@router.delete("/{agent_id}/memory/{key}", status_code=204)
+async def delete_memory(
+    agent_id: UUID,
+    key: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    try:
+        scope = kv.resolve(agent.org_id, agent.id, key)
+    except kv.KVError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not await kv.delete_entry(session, scope):
+        raise HTTPException(status_code=404, detail="Key not found")
+
+
+@router.delete("/{agent_id}/memory")
+async def clear_memory(
+    agent_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Delete all of this agent's private keys. Shared keys are untouched — other agents may
+    rely on them; remove those one at a time."""
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    deleted = await kv.clear_private(session, agent.org_id, agent.id)
+    return {"deleted": deleted}
 
 
 # ── Session explain ────────────────────────────────────────────────────────────

@@ -164,7 +164,7 @@ async def run_agent(
     pattern). When set, no call_* tools are added — depth is capped at 1.
     """
     # Imported here because the integrations build on RegisteredTool from this module.
-    from app.core import knowledge, notes, tabular
+    from app.core import knowledge, kv, notes, tabular
     from app.core.agents import calls
     from app.integrations import websearch
     from app.integrations.registry import build_tools_for_agent, confirm_seen, flush_seen
@@ -209,6 +209,9 @@ async def run_agent(
         data_tool = await tabular.build_tool(db, agent.id)
         if data_tool is not None:
             tools = tools + [data_tool]
+        # Key-value memory: exact state between runs. Gated by a setting, on by default.
+        if settings.get("kv_memory", True):
+            tools = tools + await kv.build_tools(db, agent, session.id)
         # Only offered when there are open resolvable tasks in scope.
         notes_tool = await notes.build_tool(db, agent.org_id, agent.id)
         if notes_tool is not None:
@@ -787,7 +790,7 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
     any non-gated tool calls in the same batch, injects the approval result for the gated
     call, then hands back to the normal reasoning loop.
     """
-    from app.core import knowledge, notes, tabular
+    from app.core import knowledge, kv, notes, tabular
     from app.core.agents import calls
     from app.integrations import websearch
     from app.integrations.registry import build_tools_for_agent, confirm_seen, flush_seen
@@ -829,6 +832,8 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
     data_tool = await tabular.build_tool(db, agent.id)
     if data_tool is not None:
         tools = tools + [data_tool]
+    if settings.get("kv_memory", True):
+        tools = tools + await kv.build_tools(db, agent, session.id)
     notes_tool = await notes.build_tool(db, agent.org_id, agent.id)
     if notes_tool is not None:
         tools = tools + [notes_tool]
