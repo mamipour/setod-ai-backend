@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="after_hours",
     name="After Hours Responder",
     icon="moon",
+    category="Customer communication",
     tagline="Answers messages that arrive at night, so nobody waits until morning wondering.",
     description=(
         "Replies to anyone who messages outside business hours: confirms you got it, says "

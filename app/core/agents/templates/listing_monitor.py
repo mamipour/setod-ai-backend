@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="listing_monitor",
     name="Listing Monitor",
     icon="search",
+    category="Sales & leads",
     tagline="Watches the web for new listings, job posts, or products matching your criteria.",
     description=(
         "Searches the web for a query you define, compares results to what it already knows "

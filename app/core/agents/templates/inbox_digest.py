@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="inbox_digest",
     name="Daily Inbox Digest",
     icon="mail",
+    category="Operations",
     tagline="One crisp briefing every morning — what arrived, what needs a reply, what can wait.",
     description=(
         "Reads all unread emails, groups them by urgency, and sends you a single Telegram "

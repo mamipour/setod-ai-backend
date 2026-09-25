@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="invoice_chaser",
     name="Invoice Chaser",
     icon="receipt",
+    category="Finance",
     tagline="Automatically follows up on overdue invoices so you never have to chase manually.",
     description=(
         "Reads a Google Sheet with invoice data, identifies rows that are past due and "

@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="appointment_reminder",
     name="Appointment Reminder",
     icon="calendar-clock",
+    category="Customer communication",
     tagline="Texts tomorrow's appointments today, so fewer people forget to show up.",
     description=(
         "Sends a short reminder the day before each appointment and asks people to reply if "

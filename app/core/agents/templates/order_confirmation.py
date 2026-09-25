@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="order_confirmation",
     name="Order Confirmation",
     icon="package",
+    category="Customer communication",
     tagline="Instantly confirms orders from your store and logs them to a Google Sheet.",
     description=(
         "Triggered by an inbound webhook from your e-commerce platform or form, it sends "

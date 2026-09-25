@@ -38,6 +38,9 @@ class Template:
     # What it actually does, two or three sentences, shown on the card's back or below it.
     description: str
     instructions: str
+    # Section heading on the Templates page. Free text, but keep to the handful in CATEGORIES
+    # so the page does not end up with one heading per template.
+    category: str = "Operations"
     required_connectors: tuple[ConnectorType, ...] = ()
     optional_connectors: tuple[ConnectorType, ...] = ()
     trigger_type: TriggerType = TriggerType.manual
@@ -56,6 +59,7 @@ class Template:
             "tagline": self.tagline,
             "description": self.description,
             "instructions": self.instructions,
+            "category": self.category,
             "required_connectors": [c.value for c in self.required_connectors],
             "optional_connectors": [c.value for c in self.optional_connectors],
             "trigger_type": self.trigger_type.value,
@@ -63,6 +67,11 @@ class Template:
             "settings": self.settings,
             "default_tools": self.default_tools,
         }
+
+
+# Display order of the Templates page sections. A template whose category is not listed here
+# still renders — it lands after these, alphabetically.
+CATEGORIES: tuple[str, ...] = ("Customer communication", "Sales & leads", "Finance", "Operations")
 
 
 # Shared closing rule. Repeated in every template rather than appended automatically, because

@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="review_responder",
     name="Review Responder",
     icon="star",
+    category="Customer communication",
     tagline="Replies to good reviews, and hands you the bad ones before anything is said.",
     description=(
         "Thanks people who left a positive review, in their own words rather than a template. "

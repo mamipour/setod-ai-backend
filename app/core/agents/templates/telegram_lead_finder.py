@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="telegram_lead_finder",
     name="Telegram Group Lead Finder",
     icon="search",
+    category="Sales & leads",
     tagline="Watches your Telegram groups and pings you the moment someone is looking for your service.",
     description=(
         "Scans unread messages across your Telegram groups and identifies people actively "

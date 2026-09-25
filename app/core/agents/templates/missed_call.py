@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="missed_call",
     name="Missed Call Recovery",
     icon="phone-missed",
+    category="Sales & leads",
     tagline="Texts back anyone whose call you missed, before they call a competitor.",
     description=(
         "Every missed call is a customer deciding whether to try you again or try someone "

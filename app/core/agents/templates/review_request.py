@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="review_request",
     name="Review Request",
     icon="star",
+    category="Customer communication",
     tagline="Automatically asks satisfied clients for a review 24 hours after their appointment.",
     description=(
         "Reads a Google Sheet of recent appointments, finds ones completed yesterday that "

@@ -1,6 +1,6 @@
 """The template gallery."""
 
-from app.core.agents.templates.base import Template
+from app.core.agents.templates.base import CATEGORIES, Template
 from app.core.agents.templates.support_triage import TEMPLATE as support_triage
 from app.core.agents.templates.telegram_lead_finder import TEMPLATE as telegram_lead_finder
 from app.core.agents.templates.inbox_digest import TEMPLATE as inbox_digest
@@ -26,4 +26,4 @@ def get(key: str) -> Template | None:
     return BY_KEY.get(key)
 
 
-__all__ = ["BY_KEY", "TEMPLATES", "Template", "get"]
+__all__ = ["BY_KEY", "CATEGORIES", "TEMPLATES", "Template", "get"]

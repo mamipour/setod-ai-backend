@@ -289,8 +289,15 @@ async def list_templates(
     )
     owned = {c.type for c in rows.all()}
 
+    # Sorted by category display order, then by gallery order within a category, so the
+    # Templates page and the create-flow picker agree without the browser knowing the order.
+    rank = {c: i for i, c in enumerate(templates.CATEGORIES)}
+    ordered = sorted(
+        enumerate(TEMPLATES),
+        key=lambda p: (rank.get(p[1].category, len(rank)), p[1].category, p[0]),
+    )
     out = []
-    for template in TEMPLATES:
+    for _, template in ordered:
         missing = [c.value for c in template.required_connectors if c not in owned]
         out.append({**template.as_dict(), "missing_connectors": missing, "ready": not missing})
     return out

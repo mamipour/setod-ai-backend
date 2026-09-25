@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="lead_qualifier",
     name="Lead Qualifier",
     icon="user-search",
+    category="Sales & leads",
     tagline="Asks every new enquiry the three questions you'd ask anyway, before you call back.",
     description=(
         "When someone enquires, this agent replies and asks what they need, when they need "

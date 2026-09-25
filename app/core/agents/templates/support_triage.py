@@ -7,6 +7,7 @@ TEMPLATE = Template(
     key="support_triage",
     name="Emergency Email Triage",
     icon="inbox",
+    category="Customer communication",
     tagline="Watches your inbox overnight and wakes you up only when something truly can't wait.",
     description=(
         "Filters your inbox for real emergencies — outages, payment disputes, angry customers, "
