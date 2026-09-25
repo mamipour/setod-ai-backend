@@ -27,6 +27,7 @@ The static routes above are declared before `/{agent_id}`, since FastAPI matches
 declaration order and would otherwise read "templates" as an agent id.
 """
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -51,6 +52,7 @@ from app.api.agents.schemas import (
     AgentToolAttach,
     AgentToolOut,
     AgentUpdate,
+    DataTableOut,
     KnowledgeFileOut,
     SessionDetailOut,
     SessionOut,
@@ -62,7 +64,7 @@ from app.api.auth.dependencies import assert_org_owner, get_current_user
 from app.core.agents import templates
 from app.core.agents.base import AgentRunError, RegisteredTool, run_agent, snapshot_config
 from app.core.agents.templates import TEMPLATES
-from app.core import knowledge
+from app.core import knowledge, tabular
 import secrets
 
 from app.config import settings
@@ -84,6 +86,7 @@ from app.integrations.registry import BUILDERS, INBOUND_TYPES
 from app.db.models import (
     Agent,
     AgentAssistMessage,
+    AgentDataTable,
     AgentKnowledgeFile,
     AgentLink,
     AgentProcessedItem,
@@ -1550,7 +1553,33 @@ async def list_knowledge_files(
         .where(AgentKnowledgeFile.agent_id == agent.id)
         .order_by(AgentKnowledgeFile.created_at.desc())
     )
-    return list(result.all())
+    files = list(result.all())
+    tables = await _tables_by_file(session, agent.id)
+    return [_knowledge_out(f, tables.get(f.id, [])) for f in files]
+
+
+async def _tables_by_file(session: AsyncSession, agent_id: UUID) -> dict[UUID, list[AgentDataTable]]:
+    """Table metadata per file, without the Parquet column — that is bytes the UI never needs."""
+    rows = await session.exec(
+        select(
+            AgentDataTable.file_id, AgentDataTable.name, AgentDataTable.sheet,
+            AgentDataTable.row_count, AgentDataTable.columns,
+        )
+        .where(AgentDataTable.agent_id == agent_id)
+        .order_by(AgentDataTable.created_at)
+    )
+    out: dict[UUID, list] = {}
+    for file_id, name, sheet, row_count, columns in rows.all():
+        out.setdefault(file_id, []).append(
+            {"name": name, "sheet": sheet, "row_count": row_count, "column_count": len(columns)}
+        )
+    return out
+
+
+def _knowledge_out(file: AgentKnowledgeFile, tables: list[dict]) -> KnowledgeFileOut:
+    out = KnowledgeFileOut.model_validate(file)
+    out.tables = [DataTableOut(**t) for t in tables]
+    return out
 
 
 @router.post("/{agent_id}/knowledge", response_model=KnowledgeFileOut, status_code=201)
@@ -1580,22 +1609,55 @@ async def upload_knowledge_file(
             detail=f"Files are limited to {knowledge.MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
         )
 
-    try:
-        text = knowledge.extract_text(file.filename or "upload", data)
-    except knowledge.KnowledgeError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    filename = file.filename or "upload"
+    lower = filename.lower()
+
+    # Tabular files additionally become SQL tables for `query_data`. For XLSX this is the
+    # only parser, so its failure is the upload's failure; for CSV the text path stands on
+    # its own and a table that cannot be inferred is logged and skipped, not fatal.
+    drafts: list[tabular.TableDraft] = []
+    if lower.endswith(tabular.TABULAR_EXTENSIONS):
+        taken = {t.name for t in await tabular.tables_for_agent(session, agent.id)}
+        try:
+            drafts = await asyncio.to_thread(tabular.ingest, filename, data, taken=taken)
+        except tabular.TabularError as exc:
+            if lower.endswith(".xlsx"):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            log.info("knowledge: %s not queryable: %s", filename, exc)
+
+    if lower.endswith(".xlsx"):
+        text = "\n\n".join(d.text for d in drafts)
+        if len(text) > knowledge.MAX_TEXT_CHARS:
+            text = text[: knowledge.MAX_TEXT_CHARS]
+    else:
+        try:
+            text = knowledge.extract_text(filename, data)
+        except knowledge.KnowledgeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     row = AgentKnowledgeFile(
         agent_id=agent.id,
         org_id=agent.org_id,
-        filename=file.filename or "upload",
+        filename=filename,
         size_bytes=len(data),
         text=text,
     )
     session.add(row)
+    await session.flush()
+    for d in drafts:
+        session.add(
+            AgentDataTable(
+                file_id=row.id, agent_id=agent.id, org_id=agent.org_id,
+                name=d.name, sheet=d.sheet, row_count=d.row_count,
+                columns=d.columns, sample=d.sample, parquet=d.parquet,
+            )
+        )
     await session.commit()
     await session.refresh(row)
-    return row
+    return _knowledge_out(
+        row,
+        [{"name": d.name, "sheet": d.sheet, "row_count": d.row_count, "column_count": len(d.columns)} for d in drafts],
+    )
 
 
 @router.delete("/{agent_id}/knowledge/{file_id}", status_code=204)

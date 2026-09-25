@@ -164,7 +164,7 @@ async def run_agent(
     pattern). When set, no call_* tools are added — depth is capped at 1.
     """
     # Imported here because the integrations build on RegisteredTool from this module.
-    from app.core import knowledge, notes
+    from app.core import knowledge, notes, tabular
     from app.core.agents import calls
     from app.integrations import websearch
     from app.integrations.registry import build_tools_for_agent, confirm_seen, flush_seen
@@ -205,6 +205,10 @@ async def run_agent(
         knowledge_tool = await knowledge.build_tool(db, agent.id)
         if knowledge_tool is not None:
             tools = tools + [knowledge_tool]
+        # Only offered when the agent has CSV/XLSX tables to query.
+        data_tool = await tabular.build_tool(db, agent.id)
+        if data_tool is not None:
+            tools = tools + [data_tool]
         # Only offered when there are open resolvable tasks in scope.
         notes_tool = await notes.build_tool(db, agent.org_id, agent.id)
         if notes_tool is not None:
@@ -783,7 +787,7 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
     any non-gated tool calls in the same batch, injects the approval result for the gated
     call, then hands back to the normal reasoning loop.
     """
-    from app.core import knowledge, notes
+    from app.core import knowledge, notes, tabular
     from app.core.agents import calls
     from app.integrations import websearch
     from app.integrations.registry import build_tools_for_agent, confirm_seen, flush_seen
@@ -822,6 +826,9 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
     knowledge_tool = await knowledge.build_tool(db, agent.id)
     if knowledge_tool is not None:
         tools = tools + [knowledge_tool]
+    data_tool = await tabular.build_tool(db, agent.id)
+    if data_tool is not None:
+        tools = tools + [data_tool]
     notes_tool = await notes.build_tool(db, agent.org_id, agent.id)
     if notes_tool is not None:
         tools = tools + [notes_tool]

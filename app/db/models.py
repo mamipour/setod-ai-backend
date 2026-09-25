@@ -5,7 +5,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Column, DateTime, ForeignKey, Index, UniqueConstraint, text
+from sqlalchemy import Column, DateTime, ForeignKey, Index, LargeBinary, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Field, SQLModel
@@ -499,6 +499,43 @@ class AgentKnowledgeChunk(SQLModel, table=True):
     seq: int = Field(default=0)
     content: str
     embedding: Any = Field(sa_column=Column(Vector(EMBEDDING_DIMENSIONS)))
+
+
+class AgentDataTable(SQLModel, table=True):
+    """One queryable table derived from a CSV or XLSX knowledge file (one row per sheet).
+
+    The data is kept as Parquet bytes on the row rather than in a directory on the VPS: it
+    keeps Postgres the only datastore, so backups and deletes stay one mechanism. A 10 MB
+    CSV is typically well under a megabyte as Parquet. `columns` and `sample` are rendered
+    into the `query_data` tool description so the model knows the schema before it writes
+    SQL; storing them avoids re-parsing the Parquet on every run.
+    """
+
+    __tablename__ = "agent_data_tables"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    # CASCADE: derived from the file; never outlives it.
+    file_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("agent_knowledge_files.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
+    agent_id: UUID = Field(foreign_key="agents.id", index=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    # SQL identifier the model uses: sanitised filename (+ sheet), unique per agent.
+    name: str
+    # Sheet name for XLSX; None for CSV.
+    sheet: str | None = Field(default=None)
+    row_count: int = Field(default=0)
+    # [{"name": "ref_no", "type": "VARCHAR", "original": "Ref No"}, ...]
+    columns: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
+    # Up to three rows as lists of strings, for the tool description.
+    sample: list[list[str]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
+    parquet: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    created_at: datetime = _ts()
 
 
 # ── Episodic memory ────────────────────────────────────────────────────────────

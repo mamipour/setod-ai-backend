@@ -178,6 +178,15 @@ class SessionDetailOut(SessionOut):
     messages: list[SessionMessageOut] = Field(default_factory=list)
 
 
+class DataTableOut(BaseModel):
+    """A queryable table derived from a CSV/XLSX file — metadata only, never the bytes."""
+
+    name: str
+    sheet: str | None = None
+    row_count: int
+    column_count: int
+
+
 class KnowledgeFileOut(BaseModel):
     """One uploaded document, as the Knowledge tab lists it. The extracted text stays
     server-side - the UI only ever needs the filename and indexing state."""
@@ -190,5 +199,7 @@ class KnowledgeFileOut(BaseModel):
     chunk_count: int
     source_url: str | None = None
     created_at: datetime
+    # Non-empty for CSV/XLSX uploads the agent can query with `query_data`.
+    tables: list[DataTableOut] = []
 
     model_config = {"from_attributes": True}

@@ -44,7 +44,8 @@ CHUNK_OVERLAP = 200
 # OpenAI accepts up to 2048 inputs per call; smaller batches keep request bodies sane.
 EMBED_BATCH = 128
 
-ACCEPTED_EXTENSIONS = (".pdf", ".txt", ".md", ".csv")
+# .xlsx is parsed by `tabular` (openpyxl); it has no text path of its own here.
+ACCEPTED_EXTENSIONS = (".pdf", ".txt", ".md", ".csv", ".xlsx")
 
 # Caps. A price list is kilobytes; anything near these limits is probably the wrong tool.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -74,6 +75,8 @@ def extract_text(filename: str, data: bytes) -> str:
                 "This PDF contains no extractable text. Scanned documents are images — "
                 "they would need OCR, which is not supported."
             )
+    elif lower.endswith(".xlsx"):
+        raise KnowledgeError("Workbooks are parsed by the tabular pipeline.")  # see router
     elif lower.endswith(ACCEPTED_EXTENSIONS):
         try:
             text = data.decode("utf-8")

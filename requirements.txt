@@ -38,6 +38,10 @@ telethon
 # workspace's own OpenAI key so document indexing is billed to the user like everything else.
 pgvector
 pypdf
+# Tabular knowledge: CSV/XLSX become Parquet tables the agent queries with SQL in-process.
+# DuckDB writes Parquet natively, so no pandas/pyarrow. openpyxl reads workbooks at upload.
+duckdb
+openpyxl
 
 # ── HTTP client ───────────────────────────────────────────────────────────────
 httpx
