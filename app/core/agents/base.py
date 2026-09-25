@@ -279,6 +279,8 @@ async def run_agent(
 
     budget = settings["daily_token_budget"]
     spent_before = await _tokens_used_today(db, agent.id)
+    _any_tool_called = False      # tracks whether any tool was ever called
+    _any_tool_succeeded = False   # tracks whether at least one tool call completed without error
 
     try:
         for iteration in range(settings["max_iterations"]):
@@ -317,7 +319,14 @@ async def run_agent(
                             closing_message=response.content,
                             openai_key=_openai_key_for_memory,
                         )
-                await _finish(db, session, SessionStatus.succeeded)
+                # If the agent called tools but every single one errored, mark as error
+                # rather than succeeded — the agent acknowledged failure without completing its task.
+                final_status = (
+                    SessionStatus.error
+                    if _any_tool_called and not _any_tool_succeeded
+                    else SessionStatus.succeeded
+                )
+                await _finish(db, session, final_status)
                 await _name_session(db, session, client, opening, response.content)
                 return session
 
@@ -339,6 +348,9 @@ async def run_agent(
                     tool_name=call.name, tool_args=call.arguments,
                 )
                 messages.append(tool_message(call.id, call.name, output))
+                _any_tool_called = True
+                if not output.startswith("Error:"):
+                    _any_tool_succeeded = True
 
         err = (
             f"Stopped after {settings['max_iterations']} steps without finishing. "
@@ -899,6 +911,8 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
 
     budget = settings["daily_token_budget"]
     spent_before = await _tokens_used_today(db, agent.id)
+    _any_tool_called = False
+    _any_tool_succeeded = False
 
     try:
         for iteration in range(session.iterations, settings["max_iterations"]):
@@ -921,7 +935,12 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
                 # in_flight reservations from the original (pre-pause) portion.
                 await flush_seen(db, agent.id, contexts, session.id)
                 await confirm_seen(db, session.id)
-                await _finish(db, session, SessionStatus.succeeded)
+                final_status = (
+                    SessionStatus.error
+                    if _any_tool_called and not _any_tool_succeeded
+                    else SessionStatus.succeeded
+                )
+                await _finish(db, session, final_status)
                 await _name_session(db, session, client, opening, response.content)
                 return session
 
@@ -938,6 +957,9 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
             for call, output in results:
                 seq = await _record(db, session, seq, MessageRole.tool, output, tool_name=call.name, tool_args=call.arguments)
                 messages.append(tool_message(call.id, call.name, output))
+                _any_tool_called = True
+                if not output.startswith("Error:"):
+                    _any_tool_succeeded = True
 
         await _finish(db, session, SessionStatus.error, error=f"Stopped after {settings['max_iterations']} steps.")
         return session
