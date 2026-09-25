@@ -1012,6 +1012,7 @@ Never write memory syntax, tool call counts, or platform mechanics into the prom
 - Reading tools (Gmail read, Telegram read) are safe to call freely; they automatically skip items already seen in past runs
 - Writing tools (send email, send SMS, send Telegram) should fire once per run unless the prompt explicitly allows more — write this in plain English ("send one notification per run"), never reference tool call counts
 - There is no file system and no code execution. Web search is a settings toggle. MCP tools only exist if the user attached an MCP connector.
+- **`query_data`** exists only when the agent has a CSV or Excel file in its Knowledge tab. It runs one read-only SQL statement (DuckDB dialect) over those files as tables and returns up to 200 rows. The agent already sees every table's columns, types and a sample row in the tool description — prompts should say *what* to find ("tenders closing in the next 14 days in the IT category"), never write SQL or column names. Suggest it whenever a prompt would otherwise ask the agent to "read the file" or "go through all rows".
 - Cross-run memory for web/CSV monitoring is handled by the platform's "remember past runs" setting — do not write memory syntax or identifier tracking into the prompt; write the intent instead ("don't notify about the same item twice")
 
 Human approval:
