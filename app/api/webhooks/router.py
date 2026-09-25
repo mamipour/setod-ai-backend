@@ -347,7 +347,10 @@ async def receive_instagram(
                     continue
                 mid = msg.get("mid", "")
                 sender_id = str(val.get("sender", {}).get("id", ""))
-                await _record(db, connector, mid or sender_id or "test", text[:MAX_TEXT], sender_id, val)
+                # Meta test events always use "random_mid" — use a unique id so each test click runs the agent
+                import uuid as _uuid
+                effective_mid = _uuid.uuid4().hex if mid == "random_mid" else (mid or sender_id or "test")
+                await _record(db, connector, effective_mid, text[:MAX_TEXT], sender_id, val)
 
             elif field == "comments":
                 comment_id = val.get("id", "")
