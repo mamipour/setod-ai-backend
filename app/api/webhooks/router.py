@@ -260,13 +260,14 @@ async def receive_instagram(
     body = await request.body()
 
     # ── Verify HMAC signature ─────────────────────────────────────────────────
-    app_secret = settings.instagram_app_secret
-    if not app_secret:
+    # Meta signs webhook payloads with the Facebook App Secret (not the Instagram App Secret)
+    hmac_secret = settings.instagram_facebook_app_secret or settings.instagram_app_secret
+    if not hmac_secret:
         raise HTTPException(status_code=503, detail="Instagram is not configured")
 
     import hashlib as _hashlib
     expected_sig = "sha256=" + hmac.new(
-        app_secret.encode(), body, _hashlib.sha256
+        hmac_secret.encode(), body, _hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(x_hub_signature_256 or "", expected_sig):
         log.warning("rejected unsigned Instagram delivery")

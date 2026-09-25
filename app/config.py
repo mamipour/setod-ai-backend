@@ -35,8 +35,9 @@ class Settings(BaseSettings):
     telegram_api_hash: str = ""
 
     # Instagram (Meta developer app)
-    instagram_app_id: str = ""
-    instagram_app_secret: str = ""
+    instagram_app_id: str = ""          # Instagram App ID (for OAuth)
+    instagram_app_secret: str = ""      # Instagram App Secret (for token exchange + webhook verify token)
+    instagram_facebook_app_secret: str = ""  # Facebook App Secret (for HMAC webhook signature verification)
 
     # Webhooks
     webhook_secret: str = ""
