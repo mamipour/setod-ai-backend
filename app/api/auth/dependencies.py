@@ -4,10 +4,11 @@ from uuid import UUID
 
 from fastapi import Cookie, Depends, HTTPException, status
 from jose import JWTError, jwt
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import settings
-from app.db.models import User
+from app.db.models import MemberRole, OrganizationMember, User
 from app.db.session import get_session
 
 
@@ -39,3 +40,31 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     return user
+
+
+async def require_owner(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> User:
+    """Dependency that enforces the current user is an *owner* of the workspace.
+
+    Returns the user on success. Raises 403 for members and 401 for unauthenticated
+    callers (via get_current_user).  Agents, connectors, and workspace settings all
+    require owner role; plain members get read-only access to the copilot.
+    """
+    membership = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == current_user.id,
+        )
+    )
+    member = membership.first()
+    if member is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this workspace")
+    if member.role != MemberRole.owner:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only workspace owners can perform this action",
+        )
+    return current_user

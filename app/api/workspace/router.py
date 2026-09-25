@@ -7,15 +7,17 @@ from typing import Annotated
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.auth.dependencies import get_current_user
+from app.api.auth.dependencies import get_current_user, require_owner
 from app.core import notify as _notify
 from app.core.workspace import load_web_settings, load_notify_settings, save_web_settings, save_notify_settings
-from app.db.models import Connector, ConnectorType, Organization, OrganizationMember, User
+from app.db.models import Connector, ConnectorType, Invitation, MemberRole, Organization, OrganizationMember, User
 from app.db.session import get_session
 from app.integrations.websearch import TAVILY_SEARCH_URL
 
@@ -217,3 +219,176 @@ async def test_notify(
         return TestResult(ok=False, detail="; ".join(errors))
     channels = " and ".join(sent_via) if sent_via else "no channels"
     return TestResult(ok=True, detail=f"Test sent via {channels}.")
+
+
+# ── Members ───────────────────────────────────────────────────────────────────
+# All write operations require owner role; listing is open to all members.
+
+class MemberOut(BaseModel):
+    user_id: UUID
+    email: str
+    name: str
+    role: str
+
+
+class InviteBody(BaseModel):
+    email: str
+    role: str = "member"  # "owner" | "member"
+
+
+class RoleBody(BaseModel):
+    role: str  # "owner" | "member"
+
+
+@router.get("/{org_id}/members", response_model=list[MemberOut])
+async def list_members(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> list[MemberOut]:
+    """List all members of the workspace (any member may call this)."""
+    # Verify caller is a member
+    membership = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == current_user.id,
+        )
+    )
+    if membership.first() is None:
+        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+
+    rows = await session.exec(
+        select(OrganizationMember, User)
+        .join(User, User.id == OrganizationMember.user_id)
+        .where(OrganizationMember.organization_id == org_id)
+        .order_by(OrganizationMember.created_at)
+    )
+    return [
+        MemberOut(
+            user_id=m.user_id,
+            email=u.email,
+            name=u.name,
+            role=m.role.value,
+        )
+        for m, u in rows.all()
+    ]
+
+
+@router.post("/{org_id}/members/invite", status_code=201)
+async def invite_member(
+    org_id: UUID,
+    body: InviteBody,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict:
+    """Send an invitation email. If the address is already a member, returns 409."""
+    # Check not already a member
+    existing_user = await session.exec(select(User).where(User.email == body.email))
+    target_user = existing_user.first()
+    if target_user:
+        already = await session.exec(
+            select(OrganizationMember).where(
+                OrganizationMember.organization_id == org_id,
+                OrganizationMember.user_id == target_user.id,
+            )
+        )
+        if already.first():
+            raise HTTPException(status_code=409, detail="This address is already a member")
+
+    # Check no pending invitation
+    pending = await session.exec(
+        select(Invitation).where(
+            Invitation.organization_id == org_id,
+            Invitation.email == body.email,
+            Invitation.accepted_at.is_(None),  # type: ignore[attr-defined]
+        )
+    )
+    if pending.first():
+        raise HTTPException(status_code=409, detail="An invitation is already pending for this address")
+
+    role = MemberRole.owner if body.role == "owner" else MemberRole.member
+    invite = Invitation(
+        organization_id=org_id,
+        email=body.email,
+        role=role,
+        invited_by_id=current_user.id,
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+    session.add(invite)
+    await session.commit()
+
+    # Send the invitation email
+    try:
+        org = await session.get(type(await session.get(OrganizationMember, (current_user.id, org_id)).__class__, org_id), org_id)  # type: ignore[arg-type]
+    except Exception:
+        org = None
+
+    org_name = org.name if org and hasattr(org, "name") else "your workspace"
+    await _notify._send_resend(
+        body.email,
+        f"{current_user.name} invited you to {org_name} on Setod",
+        (
+            f"Hi,\n\n{current_user.name} ({current_user.email}) has invited you to join "
+            f"{org_name} on Setod as a {role.value}.\n\n"
+            "Sign up or log in at https://setod.com to accept automatically.\n\n"
+            "This invitation expires in 7 days."
+        ),
+    )
+
+    return {"ok": True, "detail": f"Invitation sent to {body.email}"}
+
+
+@router.patch("/{org_id}/members/{user_id}/role")
+async def change_member_role(
+    org_id: UUID,
+    user_id: UUID,
+    body: RoleBody,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> MemberOut:
+    """Change a member's role. An owner cannot demote themselves."""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=422, detail="You cannot change your own role")
+
+    membership = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == user_id,
+        )
+    )
+    member = membership.first()
+    if member is None:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    new_role = MemberRole.owner if body.role == "owner" else MemberRole.member
+    member.role = new_role
+    session.add(member)
+    await session.commit()
+
+    user = await session.get(User, user_id)
+    return MemberOut(user_id=user_id, email=user.email, name=user.name, role=new_role.value)
+
+
+@router.delete("/{org_id}/members/{user_id}", status_code=204)
+async def remove_member(
+    org_id: UUID,
+    user_id: UUID,
+    current_user: Annotated[User, Depends(require_owner)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Remove a member from the workspace. An owner cannot remove themselves."""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=422, detail="You cannot remove yourself")
+
+    membership = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == user_id,
+        )
+    )
+    member = membership.first()
+    if member is None:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    await session.delete(member)
+    await session.commit()
