@@ -104,38 +104,13 @@ async def _get_or_create_user(session: AsyncSession, google_user: dict) -> User:
 
 
 async def _accept_pending_invitations(session: AsyncSession, user: User) -> None:
-    """Auto-accept pending invitations matching the user's email on sign-in."""
-    result = await session.exec(
-        select(Invitation).where(
-            Invitation.email == user.email,
-            Invitation.accepted_at.is_(None),  # type: ignore[attr-defined]
-        )
-    )
-    invitations = result.all()
+    """Intentionally a no-op.
 
-    for inv in invitations:
-        if inv.is_expired:
-            continue
-
-        already_member = await session.exec(
-            select(OrganizationMember).where(
-                OrganizationMember.organization_id == inv.organization_id,
-                OrganizationMember.user_id == user.id,
-            )
-        )
-        if already_member.first():
-            continue
-
-        session.add(OrganizationMember(
-            organization_id=inv.organization_id,
-            user_id=user.id,
-            role=inv.role,
-            invited_by_id=inv.invited_by_id,
-        ))
-        inv.accepted_at = datetime.now(UTC)
-        session.add(inv)
-
-    await session.commit()
+    Invitations must be accepted explicitly via the token link
+    (POST /auth/invitations/accept). Auto-accepting on login would add users to
+    workspaces without their knowledge or consent.
+    """
+    pass
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
