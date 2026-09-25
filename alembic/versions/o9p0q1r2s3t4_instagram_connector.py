@@ -14,7 +14,7 @@ depends_on = None
 
 def upgrade() -> None:
     # Postgres lets you add a value to an existing enum without rebuilding the table.
-    op.execute("ALTER TYPE connectorytype ADD VALUE IF NOT EXISTS 'instagram'")
+    op.execute("ALTER TYPE connectortype ADD VALUE IF NOT EXISTS 'instagram'")
 
 
 def downgrade() -> None:
