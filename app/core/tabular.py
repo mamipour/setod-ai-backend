@@ -37,7 +37,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import duckdb
 from sqlmodel import select
@@ -381,7 +381,9 @@ def _write_cache(table_id: UUID, parquet: bytes) -> str:
     """Parquet on local disk, keyed by table id; written once, read by every run."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = _cache_file(table_id)
-    tmp = f"{path}.{os.getpid()}.tmp"
+    # Unique tmp per writer: two runs of the same agent may miss the cache at once and both
+    # write; each finishes its own file and the last os.replace wins with identical bytes.
+    tmp = f"{path}.{uuid4().hex}.tmp"
     with open(tmp, "wb") as fh:
         fh.write(parquet)
     os.replace(tmp, path)  # atomic: a concurrent run never sees a half-written file
@@ -508,7 +510,8 @@ async def _ensure_cached(db: AsyncSession, table: TableMeta) -> str:
     parquet = row.first()
     if parquet is None:
         raise RuntimeError(f"table {table.id} vanished")
-    return _write_cache(table.id, parquet)
+    # Off the event loop: up to 20 MB of disk write on a cold cache.
+    return await asyncio.to_thread(_write_cache, table.id, parquet)
 
 
 async def build_tool(db: AsyncSession, agent_id: UUID):
