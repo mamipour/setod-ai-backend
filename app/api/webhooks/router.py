@@ -274,13 +274,16 @@ async def receive_instagram(
         log.warning("rejected unsigned Instagram delivery")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
+    log.warning("IG_DBG raw body len=%d preview=%s", len(body), body[:300])
+
     import json as _json
     try:
         payload = _json.loads(body)
-    except Exception:
+    except Exception as e:
+        log.warning("IG_DBG JSON parse failed: %s body=%s", e, body[:200])
         return  # malformed JSON — acknowledge so Meta stops retrying
 
-    log.warning("IG_DBG payload object=%s entries=%d body=%s", payload.get("object"), len(payload.get("entry", [])), str(body[:300]))
+    log.warning("IG_DBG payload object=%s entries=%d", payload.get("object"), len(payload.get("entry", [])))
 
     if payload.get("object") != "instagram":
         log.warning("IG_DBG unexpected object type %s", payload.get("object"))
