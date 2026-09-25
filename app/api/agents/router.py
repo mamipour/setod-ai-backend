@@ -63,7 +63,10 @@ from app.core.agents import templates
 from app.core.agents.base import AgentRunError, RegisteredTool, run_agent, snapshot_config
 from app.core.agents.templates import TEMPLATES
 from app.core import knowledge
-from app.core.crypto import decrypt_json
+import secrets
+
+from app.config import settings
+from app.core.crypto import decrypt_json, encrypt_json
 from app.core.llm.client import (
     DEFAULT_MODELS,
     ToolSpec,
@@ -108,11 +111,7 @@ from app.db.session import get_session
 router = APIRouter(prefix="/agents", tags=["agents"])
 log = logging.getLogger("setod.assist")
 
-# Channel triggers are switched off by product decision (2026-08-26): they require a public
-# webhook URL, which in development means babysitting a tunnel, and cron scheduling covers
-# every current template. The webhook receivers, inbound event queue, and worker path all
-# stay intact — flip this to True to bring the feature back.
-CHANNEL_TRIGGERS_ENABLED = False
+CHANNEL_TRIGGERS_ENABLED = True
 
 LLM_PROVIDERS = {ConnectorType.openai, ConnectorType.anthropic}
 
@@ -1033,7 +1032,7 @@ Slack, Notion, GitHub, Linear, Atlassian and Zapier are reachable only through M
 
 ## When the goal is genuinely not possible
 
-Things setod cannot do at all: WhatsApp, running code, a file system, and event-based triggers that fire the instant something happens (schedules are the only trigger). For these, respond:
+Things setod cannot do at all: WhatsApp, running code, a file system. For these, respond:
 "That's not something setod supports yet. If it's important for your workflow, send a feature request to support — the team reviews them and prioritises based on demand. In the meantime, here's the closest thing you can do with what's available: [suggest an alternative if one exists]"
 
 ## Your job
@@ -1772,6 +1771,41 @@ async def list_agent_triggers(
     return [await _trigger_out(session, t) for t in rows.all()]
 
 
+async def _auto_register_telegram_webhook(session: AsyncSession, connector: Connector) -> None:
+    """Register (or re-register) a Telegram bot webhook if PUBLIC_BASE_URL is configured.
+
+    Safe to call multiple times — Telegram simply updates the registered URL. Failures are
+    logged and swallowed so a network hiccup never blocks the trigger from being saved.
+    """
+    if not settings.public_base_url:
+        log.info("PUBLIC_BASE_URL not set — skipping Telegram webhook registration for %s", connector.id)
+        return
+    try:
+        config = decrypt_json(connector.config)
+        webhook_secret = config.get("webhook_secret") or secrets.token_urlsafe(32)
+        url = f"{settings.public_base_url.rstrip('/')}/webhooks/telegram/{connector.id}"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{config['bot_token']}/setWebhook",
+                json={
+                    "url": url,
+                    "secret_token": webhook_secret,
+                    "allowed_updates": ["message"],
+                    "drop_pending_updates": True,
+                },
+            )
+        data = resp.json()
+        if data.get("ok"):
+            log.info("Telegram webhook registered for connector %s → %s", connector.id, url)
+            config["webhook_secret"] = webhook_secret
+            connector.config = encrypt_json(config)
+            session.add(connector)
+        else:
+            log.warning("Telegram webhook registration failed for %s: %s", connector.id, data)
+    except Exception:
+        log.exception("Unexpected error registering Telegram webhook for connector %s", connector.id)
+
+
 @router.post("/{agent_id}/triggers", response_model=TriggerOut, status_code=201)
 async def create_agent_trigger(
     agent_id: UUID,
@@ -1788,6 +1822,13 @@ async def create_agent_trigger(
     )
     if body.type == TriggerType.schedule and body.enabled:
         trigger.next_run_at = schedule.next_run_after(config)
+
+    # For channel triggers on a Telegram bot connector, ensure the webhook is registered so
+    # Telegram knows where to deliver messages. This is idempotent — safe to call every time.
+    if body.type == TriggerType.channel:
+        connector = await session.get(Connector, UUID(str(config["connector_id"])))
+        if connector and connector.type == ConnectorType.telegram_bot:
+            await _auto_register_telegram_webhook(session, connector)
 
     session.add(trigger)
     agent.updated_at = datetime.now(UTC)
