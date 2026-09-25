@@ -299,3 +299,55 @@ async def build_tool(db: AsyncSession, agent_id):
         ),
         handler=handler,
     )
+
+
+# ── URL ingestion ──────────────────────────────────────────────────────────────
+
+MAX_URL_BYTES = 5 * 1024 * 1024  # 5 MB — web pages are rarely bigger
+
+
+async def fetch_url_text(url: str) -> tuple[str, str]:
+    """Fetch a URL and return (title_or_url, plain_text).
+
+    Uses html2text to strip markup; falls back to raw response body for
+    plain-text content types (txt, md, csv).
+
+    Raises KnowledgeError with a user-readable message on failure.
+    """
+    import html2text
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(url, headers={"User-Agent": "setod-knowledge/1.0"})
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise KnowledgeError(
+            f"The server returned {exc.response.status_code} for that URL."
+        ) from exc
+    except httpx.RequestError as exc:
+        raise KnowledgeError(f"Could not reach that URL: {exc}") from exc
+
+    raw = resp.content
+    if len(raw) > MAX_URL_BYTES:
+        raise KnowledgeError(
+            f"Page is too large ({len(raw) // 1024} KB). Limit is {MAX_URL_BYTES // 1024} KB."
+        )
+
+    content_type = resp.headers.get("content-type", "")
+    if "html" in content_type:
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.body_width = 0
+        text = h.handle(raw.decode("utf-8", errors="replace"))
+    else:
+        text = raw.decode("utf-8", errors="replace")
+
+    text = text.strip()
+    if not text:
+        raise KnowledgeError("The page contained no extractable text.")
+
+    # Use the final URL (after redirects) as the display name.
+    display = str(resp.url)
+    return display, text

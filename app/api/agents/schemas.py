@@ -136,6 +136,7 @@ class SessionOut(BaseModel):
     trigger_type: TriggerType
     status: SessionStatus
     name: str
+    model_slug: str = ""
     dry_run: bool
     prompt_tokens: int
     completion_tokens: int
@@ -182,6 +183,7 @@ class KnowledgeFileOut(BaseModel):
     status: KnowledgeFileStatus
     error: str | None
     chunk_count: int
+    source_url: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

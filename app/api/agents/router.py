@@ -1577,6 +1577,141 @@ async def delete_knowledge_file(
     await session.commit()
 
 
+class KnowledgeUrlBody(BaseModel):
+    url: str
+
+
+@router.post("/{agent_id}/knowledge/url", response_model=KnowledgeFileOut, status_code=201)
+async def add_knowledge_url(
+    agent_id: UUID,
+    body: KnowledgeUrlBody,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Fetch a URL and add its text to the agent's knowledge base.
+
+    Works identically to a file upload: the text is extracted here, then the worker
+    chunks and embeds it asynchronously.
+    """
+    agent = await _get_owned_agent(session, current_user, agent_id)
+
+    try:
+        await knowledge.openai_key_for_org(session, agent.org_id)
+    except knowledge.KnowledgeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    url = body.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="Please enter a full URL starting with https://")
+
+    try:
+        display, text = await knowledge.fetch_url_text(url)
+    except knowledge.KnowledgeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if len(text) > knowledge.MAX_TEXT_CHARS:
+        text = text[: knowledge.MAX_TEXT_CHARS]
+
+    row = AgentKnowledgeFile(
+        agent_id=agent.id,
+        org_id=agent.org_id,
+        filename=display,
+        size_bytes=len(text.encode()),
+        text=text,
+        source_url=url,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+# ── Session explain ────────────────────────────────────────────────────────────
+
+class ExplainOut(BaseModel):
+    session_id: UUID
+    summary: str
+
+
+@router.post("/{agent_id}/sessions/{session_id}/explain", response_model=ExplainOut)
+async def explain_session(
+    agent_id: UUID,
+    session_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Generate a plain-English summary of what the agent did in this run.
+
+    Calls the agent's own AI model (or the workspace's first active model) with
+    a lightweight summarisation prompt over the session messages.
+    """
+    agent = await _get_owned_agent(session, current_user, agent_id)
+    run = await session.get(AgentSession, session_id)
+    if run is None or run.agent_id != agent.id:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    msgs_result = await session.exec(
+        select(AgentSessionMessage)
+        .where(AgentSessionMessage.session_id == run.id)
+        .order_by(AgentSessionMessage.sequence)
+    )
+    messages = msgs_result.all()
+    if not messages:
+        return ExplainOut(session_id=run.id, summary="This run produced no messages to summarise.")
+
+    # Build a compact transcript — skip raw tool result blobs, keep assistant + tool names.
+    lines: list[str] = []
+    for m in messages:
+        if m.role == MessageRole.user:
+            lines.append(f"Trigger: {m.content[:400]}")
+        elif m.role == MessageRole.assistant:
+            if m.tool_name:
+                args_preview = json.dumps(m.tool_args or {})[:200] if m.tool_args else ""
+                lines.append(f"Called tool: {m.tool_name}({args_preview})")
+            elif m.content:
+                lines.append(f"Agent: {m.content[:400]}")
+        elif m.role == MessageRole.tool and m.content:
+            lines.append(f"Tool result: {m.content[:300]}")
+
+    transcript = "\n".join(lines)
+
+    prompt = (
+        "You are summarising an AI agent run for its owner — a non-technical small business person.\n"
+        "Write 2–4 plain English sentences explaining what the agent did and what outcome it achieved. "
+        "Focus on what happened in the real world (emails sent, rows read, messages posted), not on "
+        "technical steps. If something went wrong, say so clearly. Do not use jargon.\n\n"
+        f"TRANSCRIPT:\n{transcript}\n\nSUMMARY:"
+    )
+
+    # Use the agent's own model connector; fall back to first active OpenAI/Anthropic in the org.
+    from app.core.agents.base import _resolve_config, _build_client_for
+    config = _resolve_config(agent, use_published=False)
+    if not config.get("model_connector_id"):
+        # Find any active model connector in the org.
+        mc_result = await session.exec(
+            select(Connector).where(
+                Connector.org_id == agent.org_id,
+                Connector.type.in_([ConnectorType.openai, ConnectorType.anthropic]),
+                Connector.status == ConnectorStatus.active,
+            ).limit(1)
+        )
+        mc = mc_result.first()
+        if mc is None:
+            return ExplainOut(session_id=run.id, summary="No AI model connector available to generate a summary.")
+        config["model_connector_id"] = str(mc.id)
+        config["model"] = config.get("model") or ""
+
+    try:
+        client = await _build_client_for(session, agent, config)
+        from app.core.llm.client import user_message as _user_msg
+        response = await client.chat([_user_msg(prompt)], max_tokens=256)
+        summary = response.content.strip()
+    except Exception as exc:  # noqa: BLE001
+        summary = f"Could not generate summary: {exc}"
+
+    return ExplainOut(session_id=run.id, summary=summary)
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 def _agent_tool_out(

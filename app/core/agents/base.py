@@ -177,6 +177,7 @@ async def run_agent(
         status=SessionStatus.running,
         dry_run=dry_run,
         triggered_by_session_id=triggered_by_session_id,
+        model_slug=config.get("model", "") or "",
     )
     db.add(session)
     await db.commit()

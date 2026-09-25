@@ -273,6 +273,9 @@ class AgentSession(SQLModel, table=True):
     status: SessionStatus = Field(default=SessionStatus.running)
     # Generated from the first turn once the agent has done something worth naming.
     name: str = Field(default="")
+    # Model identifier used for this run, e.g. "gpt-4o" or "claude-sonnet-4-5".
+    # Stored so the cost breakdown can use the correct price per token.
+    model_slug: str = Field(default="")
     # Simulated run: write tools return a preview instead of performing the action.
     dry_run: bool = Field(default=False)
     prompt_tokens: int = Field(default=0)
@@ -466,6 +469,8 @@ class AgentKnowledgeFile(SQLModel, table=True):
     error: str | None = Field(default=None)
     chunk_count: int = Field(default=0)
     text: str = Field(default="")
+    # Set when the document came from a URL rather than a file upload.
+    source_url: str | None = Field(default=None)
     created_at: datetime = _ts()
 
 
