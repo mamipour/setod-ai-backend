@@ -1603,7 +1603,9 @@ async def _tables_by_file(session: AsyncSession, agent_id: UUID) -> dict[UUID, l
 
 
 def _knowledge_out(file: AgentKnowledgeFile, tables: list[dict]) -> KnowledgeFileOut:
-    out = KnowledgeFileOut.model_validate(file)
+    # from_attributes: `file` is an ORM row, not a dict. Without it pydantic 2.13 rejects
+    # the object outright (older releases were lenient, which is how this got past local).
+    out = KnowledgeFileOut.model_validate(file, from_attributes=True)
     out.tables = [DataTableOut(**t) for t in tables]
     return out
 
