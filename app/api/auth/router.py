@@ -223,3 +223,101 @@ async def me(
             for member, org in memberships
         ],
     }
+
+
+# ── Token-based invitation accept ─────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class AcceptInviteBody(BaseModel):
+    token: str
+
+
+@router.post("/invitations/accept")
+async def accept_invitation_by_token(
+    body: AcceptInviteBody,
+    access_token: Annotated[str | None, Cookie()] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Accept a workspace invitation by its token.
+
+    Called from the /accept-invite page after the user is signed in.
+    Returns the organisation id so the frontend can switch to it.
+    """
+    if not access_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    user_id: UUID = decode_access_token(access_token)
+    current_user = await session.get(User, user_id)
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    result = await session.exec(
+        select(Invitation).where(Invitation.token == body.token)
+    )
+    inv = result.first()
+
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Invitation not found or already used")
+    if inv.accepted_at is not None:
+        raise HTTPException(status_code=409, detail="This invitation has already been accepted")
+    if inv.is_expired:
+        raise HTTPException(status_code=410, detail="This invitation has expired")
+
+    # Email must match — prevents token-stealing via a different Google account.
+    if inv.email.lower() != current_user.email.lower():
+        raise HTTPException(
+            status_code=403,
+            detail=f"This invitation was sent to {inv.email}. Please sign in with that address.",
+        )
+
+    # Idempotent — if already a member just mark accepted and return.
+    existing = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == inv.organization_id,
+            OrganizationMember.user_id == current_user.id,
+        )
+    )
+    if not existing.first():
+        session.add(OrganizationMember(
+            organization_id=inv.organization_id,
+            user_id=current_user.id,
+            role=inv.role,
+            invited_by_id=inv.invited_by_id,
+        ))
+
+    inv.accepted_at = datetime.now(UTC)
+    session.add(inv)
+    await session.commit()
+
+    return {"ok": True, "org_id": str(inv.organization_id)}
+
+
+@router.get("/invitations/preview")
+async def preview_invitation(
+    token: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Return public info about an invitation (no auth required).
+
+    Used by the /accept-invite page to show the inviter and workspace name
+    before the user signs in.
+    """
+    from app.db.models import Invitation as _Inv, Organization as _Org
+
+    result = await session.exec(select(_Inv).where(_Inv.token == token))
+    inv = result.first()
+
+    if inv is None or inv.accepted_at is not None:
+        raise HTTPException(status_code=404, detail="Invitation not found or already used")
+    if inv.is_expired:
+        raise HTTPException(status_code=410, detail="This invitation has expired")
+
+    org = await session.get(_Org, inv.organization_id)
+    inviter = await session.get(User, inv.invited_by_id)
+
+    return {
+        "org_name": org.name if org else "a workspace",
+        "role": inv.role.value,
+        "invited_by": inviter.name if inviter else "someone",
+        "email": inv.email,
+    }
