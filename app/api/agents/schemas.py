@@ -57,6 +57,12 @@ class AgentOut(BaseModel):
     health_score: float | None = None
     # Timestamp of the most recent non-dry run. None = never run.
     last_run_at: datetime | None = None
+    # Primary trigger type for this agent (first enabled trigger, if any).
+    # None = no triggers configured yet (still a manual/draft agent).
+    primary_trigger_type: TriggerType | None = None
+    # Connector types wired to this agent, excluding LLM-provider connectors.
+    # Populated by the list/get endpoints for fast card rendering.
+    connector_types: list[str] = []
 
     model_config = {"from_attributes": True}
 

@@ -163,10 +163,11 @@ def _to_out(agent: Agent) -> AgentOut:
 
 
 async def _with_health(session: AsyncSession, out: AgentOut) -> AgentOut:
-    """Attach a health_score (0.0–1.0) based on the last 20 non-dry real runs.
+    """Attach run health, primary trigger type, and connected connector types.
 
     Returns the same object mutated in place for convenience.
-    Best-effort — a DB error leaves health_score as None rather than failing the request.
+    Best-effort — a DB error leaves the extra fields at their defaults rather than
+    failing the request.
     """
     try:
         rows = await session.exec(
@@ -186,6 +187,36 @@ async def _with_health(session: AsyncSession, out: AgentOut) -> AgentOut:
             out.last_run_at = records[0][1]  # most recent started_at
     except Exception:  # noqa: BLE001
         pass
+
+    try:
+        # Primary trigger: first enabled trigger by creation order.
+        trig_rows = await session.exec(
+            select(AgentTrigger.type)
+            .where(AgentTrigger.agent_id == out.id, AgentTrigger.enabled.is_(True))
+            .order_by(AgentTrigger.created_at.asc())
+            .limit(1)
+        )
+        trig = trig_rows.first()
+        if trig:
+            out.primary_trigger_type = trig
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        # Connector types attached as tools, excluding LLM-provider connectors (those are
+        # the AI brain, not integration services, and are already shown via agent.model).
+        ct_rows = await session.exec(
+            select(Connector.type)
+            .join(AgentTool, AgentTool.connector_id == Connector.id)
+            .where(
+                AgentTool.agent_id == out.id,
+                Connector.type.notin_(LLM_PROVIDERS),
+            )
+        )
+        out.connector_types = [ct.value for ct in ct_rows.all()]
+    except Exception:  # noqa: BLE001
+        pass
+
     return out
 
 
