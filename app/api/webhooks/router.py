@@ -305,43 +305,57 @@ async def receive_instagram(
                 Connector.status == "active",
             )
         )
+        all_ig_connectors = ig_rows.all()
         connector = None
-        for c in ig_rows.all():
+        for c in all_ig_connectors:
             try:
                 stored_id = _dj(c.config).get("ig_user_id")
-                log.warning("IG_DBG connector %s stored=%s payload=%s match=%s", c.id, stored_id, ig_user_id, stored_id == ig_user_id)
                 if stored_id == ig_user_id:
                     connector = c
                     break
             except Exception:
                 continue
+        # Fallback for Meta test events which use ig_user_id="0"
+        if connector is None and ig_user_id == "0" and all_ig_connectors:
+            connector = all_ig_connectors[0]
+            log.warning("IG_DBG using first connector for test event (ig_user_id=0)")
 
         if connector is None:
             log.warning("IG_DBG no connector found for ig_user_id=%s", ig_user_id)
             continue
 
-        # ── DMs ───────────────────────────────────────────────────────────────
+        # ── DMs (real format: entry.messaging[]) ──────────────────────────────
         for msg_event in entry.get("messaging", []):
             msg = msg_event.get("message", {})
             text = msg.get("text", "")
-            log.warning("IG_DBG DM text=%r sender=%s", text[:50] if text else "", msg_event.get("sender", {}).get("id"))
             if not text:
                 continue
             mid = msg.get("mid", "")
             sender_id = str(msg_event.get("sender", {}).get("id", ""))
             await _record(db, connector, mid or sender_id, text[:MAX_TEXT], sender_id, msg_event)
 
-        # ── Comments ──────────────────────────────────────────────────────────
+        # ── Changes (messages + comments) ─────────────────────────────────────
         for change in entry.get("changes", []):
-            if change.get("field") != "comments":
-                continue
+            field = change.get("field", "")
             val = change.get("value", {})
-            comment_id = val.get("id", "")
-            text = val.get("text", "")
-            if not (comment_id and text):
-                continue
-            sender = val.get("from", {}).get("username", val.get("from", {}).get("id", ""))
-            await _record(
-                db, connector, comment_id, text[:MAX_TEXT], sender,
-                {**val, "media_id": val.get("media", {}).get("id", "")},
-            )
+
+            if field == "messages":
+                # Test webhook format + some live DM formats use changes[field=messages]
+                msg = val.get("message", {})
+                text = msg.get("text", "")
+                if not text:
+                    continue
+                mid = msg.get("mid", "")
+                sender_id = str(val.get("sender", {}).get("id", ""))
+                await _record(db, connector, mid or sender_id or "test", text[:MAX_TEXT], sender_id, val)
+
+            elif field == "comments":
+                comment_id = val.get("id", "")
+                text = val.get("text", "")
+                if not (comment_id and text):
+                    continue
+                sender = val.get("from", {}).get("username", val.get("from", {}).get("id", ""))
+                await _record(
+                    db, connector, comment_id, text[:MAX_TEXT], sender,
+                    {**val, "media_id": val.get("media", {}).get("id", "")},
+                )
