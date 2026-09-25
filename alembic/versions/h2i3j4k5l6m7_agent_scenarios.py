@@ -22,7 +22,7 @@ def upgrade() -> None:
         sa.Column("agent_id", UUID(as_uuid=True), sa.ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True),
         sa.Column("name", sa.Text(), nullable=False),
         sa.Column("input_text", sa.Text(), nullable=False),
-        sa.Column("expected_tools", JSONB(), nullable=False, server_default="'[]'"),
+        sa.Column("expected_tools", JSONB(), nullable=False, server_default=sa.text("'[]'::jsonb")),
         sa.Column("last_session_id", UUID(as_uuid=True), nullable=True),
         sa.Column("last_ran_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
