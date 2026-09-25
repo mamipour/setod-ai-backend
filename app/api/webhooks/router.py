@@ -219,3 +219,114 @@ async def receive_twilio(
         )
 
     return Response(content="<Response></Response>", media_type="application/xml")
+
+
+# ── Instagram ──────────────────────────────────────────────────────────────────
+# App-level webhook: one URL receives events for ALL connected Instagram accounts.
+# Meta routes by ig_user_id in the payload; we look up the matching connector.
+#
+# Verification flow:
+#   1. Register this URL in Meta → App Dashboard → Webhooks (object: instagram).
+#   2. Use INSTAGRAM_APP_SECRET as the verify_token in the Meta dashboard.
+#   3. Meta calls GET /webhooks/instagram?hub.mode=subscribe&hub.challenge=…&hub.verify_token=…
+#   4. We echo hub.challenge back.
+#
+# Signature verification (POST):
+#   Meta signs the raw body with HMAC-SHA256(app_secret) and sends it in
+#   X-Hub-Signature-256. We verify before touching the payload.
+
+@router.get("/instagram")
+async def verify_instagram_webhook(request: Request):
+    """Hub challenge verification — Meta calls this once when you register the webhook URL."""
+    mode      = request.query_params.get("hub.mode")
+    challenge = request.query_params.get("hub.challenge", "")
+    token     = request.query_params.get("hub.verify_token", "")
+
+    expected = settings.instagram_app_secret
+    if not expected:
+        raise HTTPException(status_code=503, detail="Instagram is not configured")
+    if mode == "subscribe" and hmac.compare_digest(token, expected):
+        return Response(content=challenge, media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@router.post("/instagram", status_code=status.HTTP_204_NO_CONTENT)
+async def receive_instagram(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_session)],
+    x_hub_signature_256: Annotated[str | None, Header()] = None,
+):
+    """Receive Instagram webhook events (comments and DMs)."""
+    body = await request.body()
+
+    # ── Verify HMAC signature ─────────────────────────────────────────────────
+    app_secret = settings.instagram_app_secret
+    if not app_secret:
+        raise HTTPException(status_code=503, detail="Instagram is not configured")
+
+    import hashlib as _hashlib
+    expected_sig = "sha256=" + hmac.new(
+        app_secret.encode(), body, _hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(x_hub_signature_256 or "", expected_sig):
+        log.warning("rejected unsigned Instagram delivery")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    import json as _json
+    try:
+        payload = _json.loads(body)
+    except Exception:
+        return  # malformed JSON — acknowledge so Meta stops retrying
+
+    if payload.get("object") != "instagram":
+        return
+
+    for entry in payload.get("entry", []):
+        ig_user_id = str(entry.get("id", ""))
+        if not ig_user_id:
+            continue
+
+        # Look up the connector for this Instagram account by ig_user_id in config
+        from app.core.crypto import decrypt_json as _dj
+        ig_rows = await db.exec(
+            select(Connector).where(
+                Connector.type == ConnectorType.instagram,
+                Connector.status == "active",
+            )
+        )
+        connector = None
+        for c in ig_rows.all():
+            try:
+                if _dj(c.config).get("ig_user_id") == ig_user_id:
+                    connector = c
+                    break
+            except Exception:
+                continue
+
+        if connector is None:
+            continue
+
+        # ── DMs ───────────────────────────────────────────────────────────────
+        for msg_event in entry.get("messaging", []):
+            msg = msg_event.get("message", {})
+            text = msg.get("text", "")
+            if not text:
+                continue
+            mid = msg.get("mid", "")
+            sender_id = str(msg_event.get("sender", {}).get("id", ""))
+            await _record(db, connector, mid or sender_id, text[:MAX_TEXT], sender_id, msg_event)
+
+        # ── Comments ──────────────────────────────────────────────────────────
+        for change in entry.get("changes", []):
+            if change.get("field") != "comments":
+                continue
+            val = change.get("value", {})
+            comment_id = val.get("id", "")
+            text = val.get("text", "")
+            if not (comment_id and text):
+                continue
+            sender = val.get("from", {}).get("username", val.get("from", {}).get("id", ""))
+            await _record(
+                db, connector, comment_id, text[:MAX_TEXT], sender,
+                {**val, "media_id": val.get("media", {}).get("id", "")},
+            )

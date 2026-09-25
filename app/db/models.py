@@ -30,6 +30,7 @@ class ConnectorType(str, Enum):
     slack_webhook = "slack_webhook"
     google_sheets = "google_sheets"
     whatsapp = "whatsapp"
+    instagram = "instagram"
     openai = "openai"
     anthropic = "anthropic"
     mcp = "mcp"

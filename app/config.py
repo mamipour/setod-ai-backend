@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     telegram_api_id: str = ""
     telegram_api_hash: str = ""
 
+    # Instagram (Meta developer app)
+    instagram_app_id: str = ""
+    instagram_app_secret: str = ""
+
     # Webhooks
     webhook_secret: str = ""
     # Public origin of this API (no trailing slash). Telegram/Twilio webhooks and every
@@ -101,6 +105,10 @@ class Settings(BaseSettings):
     @property
     def connector_mcp_redirect_uri(self) -> str:
         return f"{self.api_public_origin}/connectors/oauth/mcp/callback"
+
+    @property
+    def instagram_redirect_uri(self) -> str:
+        return f"{self.api_public_origin}/connectors/oauth/instagram/callback"
 
     @property
     def frontend_origin(self) -> str:

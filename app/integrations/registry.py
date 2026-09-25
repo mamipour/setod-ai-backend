@@ -26,7 +26,7 @@ from app.db.models import (
     ProcessedItemStatus,
     SessionStatus,
 )
-from app.integrations import gmail, mcp, sheets, slack, telegram, twilio, whatsapp
+from app.integrations import gmail, instagram, mcp, sheets, slack, telegram, twilio, whatsapp
 from app.integrations.base import RegisteredTool, ToolContext, slug
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ BUILDERS = {
     ConnectorType.slack_webhook: slack.build_tools,
     ConnectorType.google_sheets: sheets.build_tools,
     ConnectorType.whatsapp: whatsapp.build_tools,
+    ConnectorType.instagram: instagram.build_tools,
 }
 
 
@@ -50,8 +51,9 @@ INBOUND_TYPES = {
     ConnectorType.telegram_bot,
     ConnectorType.telegram_client,
     ConnectorType.twilio,
-    ConnectorType.webhook,   # generic inbound webhook
-    ConnectorType.whatsapp,  # Meta Cloud API inbound
+    ConnectorType.webhook,    # generic inbound webhook
+    ConnectorType.whatsapp,   # Meta Cloud API inbound
+    ConnectorType.instagram,  # Meta Instagram inbound (comments + DMs)
 }
 
 

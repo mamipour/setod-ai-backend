@@ -53,7 +53,7 @@ from app.db.session import get_session
 import json
 import secrets
 
-from app.integrations import gmail, mcp, sheets, slack, telegram, twilio, whatsapp
+from app.integrations import gmail, instagram, mcp, sheets, slack, telegram, twilio, whatsapp
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -239,6 +239,22 @@ async def test_connector(
                 await session.commit()
             tools = await mcp.list_remote_tools(config["url"], token=config.get("access_token"))
             return TestResult(ok=True, detail=f"Reachable — {len(tools)} tool(s) advertised")
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.instagram:
+        try:
+            config = decrypt_json(connector.config)
+            token = config["access_token"]
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://graph.instagram.com/v20.0/me",
+                    params={"fields": "id,username", "access_token": token},
+                )
+            data = resp.json()
+            if "error" in data:
+                return TestResult(ok=False, detail=data["error"].get("message", "Instagram API error"))
+            return TestResult(ok=True, detail=f"Connected as @{data.get('username', data.get('id', '?'))}")
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
 
@@ -1432,3 +1448,80 @@ async def create_whatsapp_connector(
     await session.commit()
     await session.refresh(connector)
     return connector
+
+
+# ── Instagram OAuth ────────────────────────────────────────────────────────────
+
+@router.get("/oauth/instagram/start")
+async def instagram_oauth_start(
+    org_id: Annotated[UUID, Query()],
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Redirect the browser to Instagram's OAuth consent screen."""
+    await assert_org_owner(session, current_user, org_id)
+    if not settings.instagram_app_id:
+        raise HTTPException(status_code=503, detail="Instagram is not configured on this server.")
+
+    from urllib.parse import urlencode
+    params = urlencode({
+        "client_id": settings.instagram_app_id,
+        "redirect_uri": settings.instagram_redirect_uri,
+        "scope": "instagram_business_basic,instagram_business_manage_comments,instagram_business_manage_messages",
+        "response_type": "code",
+        "state": str(org_id),
+    })
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(f"https://www.instagram.com/oauth/authorize?{params}")
+
+
+@router.get("/oauth/instagram/callback")
+async def instagram_oauth_callback(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Receive the auth code, exchange for a long-lived token, create the connector."""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")  # org_id
+    error = request.query_params.get("error")
+
+    frontend = settings.frontend_origin
+
+    if error or not code or not state:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?error=instagram_denied")
+
+    try:
+        org_id = UUID(state)
+    except ValueError:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?error=instagram_state")
+
+    try:
+        config = await instagram.exchange_code(
+            settings.instagram_app_id,
+            settings.instagram_app_secret,
+            settings.instagram_redirect_uri,
+            code,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?error=instagram_token")
+
+    username = config.get("username", "")
+    connector = Connector(
+        org_id=org_id,
+        name=f"Instagram · @{username}" if username else "Instagram",
+        type=ConnectorType.instagram,
+        status=ConnectorStatus.active,
+        config=encrypt_json(config),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+
+    # Best-effort: subscribe this account to comment + message webhook events.
+    await instagram.subscribe_account(config["ig_user_id"], config["access_token"])
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(f"{frontend}/connectors?connected=Instagram")
