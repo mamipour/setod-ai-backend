@@ -318,22 +318,23 @@ async def invite_member(
     await session.commit()
 
     # Send the invitation email
-    try:
-        org = await session.get(type(await session.get(OrganizationMember, (current_user.id, org_id)).__class__, org_id), org_id)  # type: ignore[arg-type]
-    except Exception:
-        org = None
+    org = await session.get(Organization, org_id)
+    org_name = org.name if org else "your workspace"
 
-    org_name = org.name if org and hasattr(org, "name") else "your workspace"
-    await _notify._send_resend(
-        body.email,
-        f"{current_user.name} invited you to {org_name} on Setod",
-        (
-            f"Hi,\n\n{current_user.name} ({current_user.email}) has invited you to join "
-            f"{org_name} on Setod as a {role.value}.\n\n"
-            "Sign up or log in at https://setod.com to accept automatically.\n\n"
-            "This invitation expires in 7 days."
-        ),
-    )
+    try:
+        await _notify._send_resend(
+            body.email,
+            f"{current_user.name} invited you to {org_name} on Setod",
+            (
+                f"Hi,\n\n{current_user.name} ({current_user.email}) has invited you to join "
+                f"{org_name} on Setod as a {role.value}.\n\n"
+                "Sign up or log in at https://setod.com to accept.\n\n"
+                "This invitation expires in 7 days."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — email failure must not block the invite record
+        import logging
+        logging.getLogger(__name__).warning("Invitation email failed: %s", exc)
 
     return {"ok": True, "detail": f"Invitation sent to {body.email}"}
 

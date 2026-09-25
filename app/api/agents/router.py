@@ -156,6 +156,31 @@ def _to_out(agent: Agent) -> AgentOut:
     return out
 
 
+async def _with_health(session: AsyncSession, out: AgentOut) -> AgentOut:
+    """Attach a health_score (0.0–1.0) based on the last 20 non-dry real runs.
+
+    Returns the same object mutated in place for convenience.
+    Best-effort — a DB error leaves health_score as None rather than failing the request.
+    """
+    try:
+        rows = await session.exec(
+            select(AgentSession.status)
+            .where(
+                AgentSession.agent_id == out.id,
+                AgentSession.dry_run.is_(False),
+            )
+            .order_by(AgentSession.started_at.desc())
+            .limit(20)
+        )
+        statuses = rows.all()
+        if statuses:
+            succeeded = sum(1 for s in statuses if s == SessionStatus.succeeded)
+            out.health_score = round(succeeded / len(statuses), 3)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 async def _assert_model_connector(
     session: AsyncSession, org_id: UUID, connector_id: UUID | None
 ) -> None:
@@ -465,7 +490,8 @@ async def list_agents(
     result = await session.exec(
         select(Agent).where(Agent.org_id == org_id).order_by(Agent.created_at.desc())
     )
-    return [_to_out(a) for a in result.all()]
+    agents = [_to_out(a) for a in result.all()]
+    return [await _with_health(session, a) for a in agents]
 
 
 @router.get("/{agent_id}", response_model=AgentOut)
@@ -474,7 +500,7 @@ async def get_agent(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    return _to_out(await _get_owned_agent(session, current_user, agent_id))
+    return await _with_health(session, _to_out(await _get_owned_agent(session, current_user, agent_id)))
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)

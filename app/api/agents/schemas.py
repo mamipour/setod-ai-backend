@@ -52,6 +52,9 @@ class AgentOut(BaseModel):
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # Health: fraction of the last 20 non-dry-run sessions that succeeded.
+    # None = no runs yet. Computed by the list/get endpoints, not stored.
+    health_score: float | None = None
 
     model_config = {"from_attributes": True}
 
