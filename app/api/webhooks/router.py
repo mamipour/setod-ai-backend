@@ -274,6 +274,8 @@ async def receive_instagram(
         log.warning("rejected unsigned Instagram delivery")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
+    import sys as _sys
+    print(f"IG_DBG raw body len={len(body)} preview={body[:300]}", file=_sys.stderr, flush=True)
     log.warning("IG_DBG raw body len=%d preview=%s", len(body), body[:300])
 
     import json as _json
