@@ -501,6 +501,35 @@ class AgentKnowledgeChunk(SQLModel, table=True):
     embedding: Any = Field(sa_column=Column(Vector(EMBEDDING_DIMENSIONS)))
 
 
+# ── Episodic memory ────────────────────────────────────────────────────────────
+
+class AgentMemoryEntry(SQLModel, table=True):
+    """One embedded memory note written by an agent at the end of a successful run.
+
+    The agent extracts the ``MEMORY:`` line from its closing message; that text is
+    embedded and stored here.  ``_recall`` searches this table by cosine similarity to
+    the current trigger message, which lets the agent surface relevant past observations
+    even after many intervening runs.
+    """
+
+    __tablename__ = "agent_memory_entries"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    agent_id: UUID = Field(foreign_key="agents.id", index=True)
+    session_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("agent_sessions.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+            unique=True,  # one entry per session — ON CONFLICT DO NOTHING keeps upsert safe
+        )
+    )
+    note: str                    # the MEMORY: line text (or closing message excerpt)
+    embedding: Any = Field(sa_column=Column(Vector(EMBEDDING_DIMENSIONS)))
+    created_at: datetime = _ts()
+
+
 # ── Approvals ──────────────────────────────────────────────────────────────────
 
 class ApprovalStatus(str, Enum):
