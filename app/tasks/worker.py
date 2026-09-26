@@ -84,6 +84,23 @@ async def _run_inbound(
             )
         except Exception:
             log.exception("conv %s bundle failed", conversation_id)
+            # If the DB transaction was left in an aborted state (PendingRollbackError),
+            # any running AgentSession for this conversation will be stuck in 'running'
+            # status, blocking all future events.  Open a fresh connection and clean up.
+            try:
+                from app.db.models import AgentSession, SessionStatus
+                from sqlalchemy import text as _text
+                async with AsyncSessionLocal() as db2:
+                    await db2.exec(
+                        _text(
+                            "UPDATE agent_sessions SET status='error', finished_at=now(), "
+                            "error='PendingRollbackError — worker cleaned up' "
+                            "WHERE conversation_id = :cid AND status = 'running'"
+                        ).bindparams(cid=conversation_id)
+                    )
+                    await db2.commit()
+            except Exception:
+                log.exception("conv %s cleanup also failed", conversation_id)
 
 
 async def _expire_approvals() -> int:

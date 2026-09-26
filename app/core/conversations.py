@@ -617,14 +617,12 @@ async def record_outbound(
     )
     result = await db.exec(stmt)
 
-    # Update conversation last_outbound_at
+    # Update conversation last_outbound_at — use a plain UPDATE so we never
+    # risk inserting a partial row (which would violate NOT NULL constraints).
     await db.exec(
-        pg_insert(Conversation)
-        .values(id=conversation_id, last_outbound_at=now)
-        .on_conflict_do_update(
-            index_elements=["id"],
-            set_={"last_outbound_at": now},
-        )
+        sa_text(
+            "UPDATE conversations SET last_outbound_at = :ts WHERE id = :cid"
+        ).bindparams(ts=now, cid=conversation_id)
     )
     await db.commit()
 
