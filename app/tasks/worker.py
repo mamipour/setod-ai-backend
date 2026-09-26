@@ -26,6 +26,7 @@ from app.integrations.registry import release_abandoned_reservations
 from app.core.triggers.dispatch import (
     claim_due,
     claim_inbound,
+    prune_conversations,
     prune_sessions,
     reap_stale_sessions,
     run_inbound,
@@ -253,8 +254,17 @@ async def main() -> None:
                             counts = await prune_sessions(db)
                         if counts["deleted"] or counts["scrubbed"]:
                             log.info(
-                                "retention: deleted=%d scrubbed=%d",
+                                "retention: sessions deleted=%d scrubbed=%d",
                                 counts["deleted"], counts["scrubbed"],
+                            )
+                        async with AsyncSessionLocal() as db:
+                            conv_counts = await prune_conversations(db)
+                        if any(conv_counts.values()):
+                            log.info(
+                                "retention: conv messages=%d conversations=%d media=%d",
+                                conv_counts["messages_deleted"],
+                                conv_counts["conversations_deleted"],
+                                conv_counts["media_files_deleted"],
                             )
                     except Exception:
                         log.exception("retention prune failed")

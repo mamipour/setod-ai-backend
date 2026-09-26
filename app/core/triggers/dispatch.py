@@ -26,6 +26,7 @@ from app.core.triggers import schedule
 from app.db.models import (
     Agent,
     AgentSession,
+    AgentSessionMessage,
     AgentStatus,
     AgentTrigger,
     Conversation,
@@ -33,6 +34,7 @@ from app.db.models import (
     ConversationStatus,
     InboundEvent,
     InboundEventStatus,
+    Organization,
     SessionStatus,
     TriggerType,
 )
@@ -382,6 +384,77 @@ def _build_opening(events: list[InboundEvent], conversation_id: UUID | None) -> 
 
 
 # ── Data retention pruning ─────────────────────────────────────────────────────
+
+async def prune_conversations(db: AsyncSession) -> dict[str, int]:
+    """Delete conversation messages and conversations past each org's retention policy.
+
+    Called by `prune_sessions` — no need to call separately.
+
+    Returns {"messages_deleted": N, "conversations_deleted": N, "media_files_deleted": N}.
+    """
+    from datetime import timedelta
+    from sqlmodel import delete as sql_delete
+
+    from app.core import media_store
+    from app.db.models import ConversationMessage, Organization
+
+    log.info("retention: starting conversation prune")
+    orgs_result = await db.exec(
+        select(Organization).where(Organization.data_retention_days.is_not(None))
+    )
+    orgs = orgs_result.all()
+
+    messages_deleted = 0
+    conversations_deleted = 0
+    media_files = 0
+    now = datetime.now(UTC)
+
+    for org in orgs:
+        cutoff = now - timedelta(days=org.data_retention_days)
+
+        # Delete messages past the cutoff first (so we can collect paths for media deletion)
+        old_msg_rows = await db.exec(
+            select(ConversationMessage).where(
+                ConversationMessage.org_id == org.id,
+                ConversationMessage.created_at < cutoff,
+            )
+        )
+        old_messages = old_msg_rows.all()
+        for msg in old_messages:
+            for att in msg.attachments or []:
+                stored_path = att.get("stored_path", "")
+                if stored_path:
+                    if media_store.delete(stored_path):
+                        media_files += 1
+            await db.delete(msg)
+        messages_deleted += len(old_messages)
+
+        # Delete conversations with no recent messages (last_inbound_at < cutoff)
+        old_conv_rows = await db.exec(
+            select(Conversation).where(
+                Conversation.org_id == org.id,
+                Conversation.last_inbound_at < cutoff,
+            )
+        )
+        old_convs = old_conv_rows.all()
+        for conv in old_convs:
+            # Delete any remaining media files for this conversation
+            count = media_store.delete_conversation(org.id, conv.id)
+            media_files += count
+            await db.delete(conv)
+        conversations_deleted += len(old_convs)
+
+    await db.commit()
+    log.info(
+        "retention: conversations — messages_deleted=%d conversations_deleted=%d media=%d",
+        messages_deleted, conversations_deleted, media_files,
+    )
+    return {
+        "messages_deleted": messages_deleted,
+        "conversations_deleted": conversations_deleted,
+        "media_files_deleted": media_files,
+    }
+
 
 async def prune_sessions(db: AsyncSession) -> dict[str, int]:
     """Delete or scrub sessions older than each org's retention policy.
