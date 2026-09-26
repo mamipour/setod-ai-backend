@@ -195,15 +195,20 @@ async def receive_telegram(
         return
 
     peer = resolve_peer(connector.type, update)
-    if not peer.peer_id:
-        peer_id = chat_id
-    else:
-        peer_id = peer.peer_id
+
+    # Key on chat:message_id, not update_id.  message_id is unique per chat, so webhook
+    # retries still dedupe, and it is what `reply_to_message` points at — using the same
+    # key for both is what lets a reply find its parent in the transcript.  The account
+    # reader (integrations/telegram.py) uses the identical convention.
+    message_id = message.get("message_id")
+    external_id = f"{chat_id}:{message_id}" if message_id else str(update["update_id"])
+    if peer.reply_to_external_id:
+        peer.reply_to_external_id = f"{chat_id}:{peer.reply_to_external_id}"
 
     await record_inbound(
         db,
         connector,
-        external_id=str(update["update_id"]),
+        external_id=external_id,
         text=text,
         sender=sender,
         payload=update,

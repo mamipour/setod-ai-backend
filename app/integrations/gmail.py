@@ -34,6 +34,18 @@ SMTP_PORT = 465
 # Keeps listing fast; full body is available when the agent needs it.
 _BODY_PREVIEW_BYTES = 30_000
 
+# Cursor scope for the per-agent read position (see ToolContext.get_cursor).
+_INBOX_SCOPE = "INBOX"
+
+
+def _uids_after(uids: list[str], cursor: str | None) -> list[str]:
+    """Drop UIDs at or below the cursor.  `UID n:*` is inclusive of the highest UID even
+    when n is past it, so the server can hand back one already-seen message."""
+    if cursor is None:
+        return uids
+    floor = int(cursor)
+    return [u for u in uids if int(u) > floor]
+
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 
@@ -168,7 +180,9 @@ def _get_message_sync(email_addr: str, app_password: str, uid: str) -> dict[str,
     imap = _imap_connect(email_addr, app_password)
     try:
         imap.select("INBOX")
-        status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+        # PEEK: reading the full body must not set \Seen — that flag is shared with the
+        # owner's mail client and with any other agent on this account.
+        status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
         if status != "OK" or not msg_data or not msg_data[0]:
             raise IntegrationError(f"Message {uid} not found in INBOX.")
         return _parse_message(uid, msg_data[0][1])
@@ -292,33 +306,49 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
     async def read_unread(args: dict[str, Any], dry_run: bool) -> str:
         limit = min(int(args.get("limit", 10)), 25)
 
-        # Monitoring starts when the agent is created, not when the mailbox was:
-        # mail that predates the agent is out of scope, so a mailbox with years of
-        # unread backlog never gets excavated. SINCE is day-granular; the tracker
-        # dedupes the sub-day overlap. Month names are hardcoded (locale-safe).
-        agent = await ctx.db.get(Agent, ctx.agent_id)
-        created = agent.created_at
-        since = f"{created.day:02d}-{_MONTHS[created.month - 1]}-{created.year}"
+        # Discovery is by UID position, not by the UNSEEN flag.  The flag is shared: the
+        # owner reading mail on their phone, or a second agent on this inbox, would flip
+        # it and hide messages from this agent.  Each agent keeps its own UID cursor.
+        cursor = await ctx.get_cursor(_INBOX_SCOPE)
+        if cursor is not None:
+            criteria = f"UID {int(cursor) + 1}:*"
+        else:
+            # First run: monitoring starts when the agent is created, not when the mailbox
+            # was, so years of backlog never get excavated.  SINCE is day-granular; the
+            # tracker dedupes the sub-day overlap.  Month names hardcoded (locale-safe).
+            agent = await ctx.db.get(Agent, ctx.agent_id)
+            created = agent.created_at
+            criteria = f"SINCE {created.day:02d}-{_MONTHS[created.month - 1]}-{created.year}"
 
-        # Phase 1: get all unread UIDs in scope (cheap — no body fetch).
-        all_uids = await list_uids(connector, f"UNSEEN SINCE {since}")
+        # Phase 1: all candidate UIDs, newest first (cheap — no body fetch).
+        all_uids = await list_uids(connector, criteria)
+        # `UID n:*` returns the highest-UID message even when n exceeds it.
+        all_uids = _uids_after(all_uids, cursor)
 
         # Phase 2: filter against the tracker before applying the limit, so
-        # already-handled-but-still-unread emails never consume window slots.
+        # already-handled emails never consume window slots.
         fresh_uids_set = await ctx.unprocessed(all_uids)
         fresh_uids = [uid for uid in all_uids if uid in fresh_uids_set]
         already_handled = len(all_uids) - len(fresh_uids)
 
-        # Phase 3: take the newest `limit` from what is genuinely new, then
-        # fetch their bodies.
-        to_fetch = fresh_uids[:limit]
+        # Phase 3: take the *oldest* `limit` fresh messages, in chronological order.  A
+        # cursor is a lower bound, so the window has to be consumed oldest-first — taking
+        # the newest would leave older mail below the cursor, never to be seen again.
+        to_fetch = list(reversed(fresh_uids))[:limit]
         if not to_fetch:
-            return f"No new unread email. ({already_handled} already handled in an earlier run.)"
+            if all_uids:
+                # Everything in the window is handled: advance past it.
+                ctx.set_cursor(_INBOX_SCOPE, max(all_uids, key=int))
+            return f"No new email. ({already_handled} already handled in an earlier run.)"
 
         msgs = await fetch_messages(connector, to_fetch)
 
         for m in msgs:
             ctx.note_seen(m["id"])
+        # Advance only through what was surfaced.  Newer mail beyond the window stays
+        # ahead of the cursor for the next call.
+        ctx.set_cursor(_INBOX_SCOPE, max((m["id"] for m in msgs), key=int))
+        remaining = len(fresh_uids) - len(to_fetch)
 
         lines = [
             f"{i + 1}. id={m['id']} from={m['from']} subject={m['subject']!r}\n"
@@ -326,7 +356,9 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             for i, m in enumerate(msgs)
         ]
         suffix = f"\n({already_handled} already handled, omitted.)" if already_handled else ""
-        return f"{len(msgs)} unread email(s):\n" + "\n".join(lines) + suffix
+        if remaining:
+            suffix += f"\n({remaining} more new email(s) not shown — call again to continue.)"
+        return f"{len(msgs)} new email(s):\n" + "\n".join(lines) + suffix
 
     async def search(args: dict[str, Any], dry_run: bool) -> str:
         query = str(args.get("query", "")).strip()
@@ -402,8 +434,10 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             ToolSpec(
                 ctx.tool_name("read_unread_emails"),
                 ctx.describe(
-                    "List unread inbox emails with body preview. Excludes messages this "
-                    "agent already handled on a previous run."
+                    "List inbox emails that arrived since this agent's last run, oldest "
+                    "first, with body preview. Independent of the read/unread flag, so "
+                    "mail the owner already opened is still included. Excludes messages "
+                    "this agent already handled."
                 ),
                 {"type": "object", "properties": limit_prop},
             ),

@@ -1,6 +1,6 @@
-name: Lead finder – SaaS keywords
+name: Lead finder – reads groups, alerts via bot
 template: telegram_lead_finder
 input: "Run now"
 expected_tools:
-  - web_search
+  - read_telegram_messages
   - send_telegram_message

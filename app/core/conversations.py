@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy import func, text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -43,11 +44,38 @@ MAX_TEXT = 4_096
 
 @dataclass
 class Peer:
-    """Provider-native identification of the external person."""
+    """Provider-native identification of the external party, plus who spoke this message.
+
+    For 1:1 threads the peer *is* the speaker and the speaker fields stay empty.  For
+    Telegram groups the peer is the group (chat id + title, `is_group=True`) and the
+    speaker fields carry the individual member who wrote the message.
+    """
 
     peer_id: str          # stable channel-level id (wa_id, chat_id, IG user id, phone)
     peer_name: str = ""   # human-readable label when available
     thread_key: str = ""  # discriminator for Instagram comments (media_id), else ""
+    is_group: bool = False
+    speaker_id: str = ""
+    speaker_name: str = ""
+    # Telegram reply threading — provider id of the parent and a short excerpt of it
+    reply_to_external_id: str = ""
+    reply_to_text: str = ""
+
+
+# Excerpt length kept for reply parents (enough to recognise the message, not re-read it)
+REPLY_EXCERPT_CHARS = 200
+
+
+def display_name(first: str | None, last: str | None, username: str | None, uid: Any) -> str:
+    """Best human label for a Telegram user: 'First Last (@user)' → '@user' → 'ID:123'."""
+    name = " ".join(p for p in (first, last) if p)
+    if name and username:
+        return f"{name} (@{username})"
+    if name:
+        return name
+    if username:
+        return f"@{username}"
+    return f"ID:{uid}" if uid else ""
 
 
 # ── Attachment ────────────────────────────────────────────────────────────────
@@ -91,12 +119,30 @@ def resolve_peer(connector_type: ConnectorType, payload: dict[str, Any]) -> Peer
     match connector_type:
         case ConnectorType.telegram_bot:
             # payload is the full Telegram Update object
-            chat = (
-                payload.get("message", {}).get("chat")
-                or payload.get("callback_query", {}).get("message", {}).get("chat")
+            msg = (
+                payload.get("message")
+                or payload.get("callback_query", {}).get("message")
                 or {}
             )
+            chat = msg.get("chat") or {}
             peer_id = str(chat.get("id", ""))
+            is_group = chat.get("type") in ("group", "supergroup", "channel")
+            if is_group:
+                # The conversation is the group; the member who wrote it is the speaker.
+                sender = msg.get("from") or {}
+                parent = msg.get("reply_to_message") or {}
+                return Peer(
+                    peer_id=peer_id,
+                    peer_name=chat.get("title") or chat.get("username") or peer_id,
+                    is_group=True,
+                    speaker_id=str(sender.get("id", "")),
+                    speaker_name=display_name(
+                        sender.get("first_name"), sender.get("last_name"),
+                        sender.get("username"), sender.get("id"),
+                    ),
+                    reply_to_external_id=str(parent.get("message_id", "")) if parent else "",
+                    reply_to_text=(parent.get("text") or parent.get("caption") or "")[:REPLY_EXCERPT_CHARS],
+                )
             peer_name = (
                 chat.get("username")
                 or chat.get("first_name", "")
@@ -106,8 +152,16 @@ def resolve_peer(connector_type: ConnectorType, payload: dict[str, Any]) -> Peer
         case ConnectorType.telegram_client:
             # payload recorded by the account poller (app/integrations/telegram.py)
             peer_id = str(payload.get("peer_id", payload.get("sender_id", "")))
-            peer_name = payload.get("sender_name", payload.get("peer_name", ""))
-            return Peer(peer_id=peer_id, peer_name=peer_name)
+            peer_name = payload.get("peer_name") or payload.get("sender_name", "")
+            return Peer(
+                peer_id=peer_id,
+                peer_name=peer_name,
+                is_group=bool(payload.get("is_group", False)),
+                speaker_id=str(payload.get("speaker_id", "") or ""),
+                speaker_name=payload.get("speaker_name", "") or "",
+                reply_to_external_id=str(payload.get("reply_to_external_id", "") or ""),
+                reply_to_text=(payload.get("reply_to_text") or "")[:REPLY_EXCERPT_CHARS],
+            )
 
         case ConnectorType.twilio:
             # Twilio SMS/MMS form params flattened to dict
@@ -396,6 +450,7 @@ async def record_inbound(
     payload: dict[str, Any],
     peer: Peer | None = None,
     attachments: list[Attachment] | None = None,
+    created_at: datetime | None = None,
 ) -> tuple[bool, UUID | None, UUID | None]:
     """Record an inbound event and link it to a Conversation + ConversationMessage.
 
@@ -403,6 +458,8 @@ async def record_inbound(
     `is_new` is False when the external_id was already recorded (duplicate delivery).
 
     `peer` and `attachments` are derived here from the payload if not supplied by the caller.
+    `created_at` lets pollers keep the provider's own timestamp so a batch of group
+    messages fetched at once still renders in the order it was written.
     """
     if peer is None:
         peer = resolve_peer(connector.type, payload)
@@ -418,6 +475,12 @@ async def record_inbound(
     else:
         kind = MessageKind.text
 
+    now = datetime.now(UTC)
+    message_at = created_at or now
+    # last_inbound_at only moves forward: a poller recording an older message must not
+    # rewind it and confuse the inbox ordering.
+    last_inbound_expr = func.greatest(Conversation.last_inbound_at, message_at)
+
     # ── Upsert Conversation ────────────────────────────────────────────────────
     conv_stmt = (
         pg_insert(Conversation)
@@ -429,18 +492,19 @@ async def record_inbound(
             peer_id=peer.peer_id,
             peer_name=peer.peer_name,
             thread_key=peer.thread_key,
+            is_group=peer.is_group,
             status=ConversationStatus.open,
             summary="",
-            last_inbound_at=datetime.now(UTC),
-            created_at=datetime.now(UTC),
+            last_inbound_at=message_at,
+            created_at=now,
         )
         .on_conflict_do_update(
             constraint="uq_conversation",
             set_={
-                "last_inbound_at": datetime.now(UTC),
+                "last_inbound_at": last_inbound_expr,
                 # Update peer_name if we now have a better one
-                "peer_name": pg_insert(Conversation)
-                .excluded.peer_name,
+                "peer_name": pg_insert(Conversation).excluded.peer_name,
+                "is_group": pg_insert(Conversation).excluded.is_group,
             },
         )
         .returning(Conversation.id)
@@ -462,13 +526,26 @@ async def record_inbound(
             text=text[:MAX_TEXT],
             attachments=[a.to_dict() for a in attachments],
             external_id=external_id,
-            created_at=datetime.now(UTC),
+            speaker_id=peer.speaker_id,
+            speaker_name=peer.speaker_name,
+            reply_to_external_id=peer.reply_to_external_id,
+            reply_to_text=peer.reply_to_text,
+            created_at=message_at,
         )
-        .on_conflict_do_nothing()
+        .on_conflict_do_nothing(
+            index_elements=["conversation_id", "external_id"],
+            index_where=sa_text("external_id <> ''"),
+        )
         .returning(ConversationMessage.id)
     )
     cm_result = await db.exec(cm_stmt)
     conversation_message_id: UUID | None = cm_result.scalar_one_or_none()
+
+    if conversation_message_id is None and external_id:
+        # Same provider message already in this thread (webhook retry, overlapping poll).
+        await db.commit()
+        log.debug("record_inbound: duplicate external_id=%s — skipped", external_id)
+        return False, None, None
 
     # ── Record InboundEvent ────────────────────────────────────────────────────
     ev_stmt = (
@@ -569,6 +646,84 @@ SUMMARY_MAX_CHARS = 800
 SUMMARY_FOLD_AFTER_TURNS = 30
 
 
+def message_body(msg: ConversationMessage) -> str:
+    """Text plus media markers for one message, as the agent should read it."""
+    body_parts: list[str] = []
+    if msg.text:
+        body_parts.append(msg.text)
+    for att in msg.attachments or []:
+        att_text = att.get("text", "")
+        if att_text:
+            body_parts.append(att_text)
+        elif att.get("status") == "pending":
+            body_parts.append(f"[{att.get('kind', 'media')} — processing…]")
+        else:
+            body_parts.append(f"[{att.get('kind', 'media')}]")
+    return " ".join(body_parts) if body_parts else "[no content]"
+
+
+def format_turn(
+    msg: ConversationMessage,
+    conversation: Conversation,
+    *,
+    parents: dict[str, ConversationMessage] | None = None,
+    with_time: bool = True,
+) -> str:
+    """One transcript line.
+
+    1:1 thread::   ``Reza [2026-09-26 14:02]: text``
+    Group thread:: ``[09-26 14:02] Reza (@reza): text``
+                   ``[09-26 14:04] Ali: ↳ re Reza: "Anyone know…" — Yeah I can``
+
+    Group lines carry the speaker on every message and inline the parent of a reply
+    (from the stored excerpt, or from the parent row when it is in `parents`).
+    """
+    outbound = msg.direction.value == "outbound"
+    if conversation.is_group:
+        speaker = "You" if outbound else (msg.speaker_name or msg.speaker_id or "Member")
+        ts = f"[{msg.created_at.strftime('%m-%d %H:%M')}] " if with_time else ""
+        reply = ""
+        if msg.reply_to_external_id:
+            parent = (parents or {}).get(msg.reply_to_external_id)
+            if parent is not None:
+                p_name = "You" if parent.direction.value == "outbound" else (
+                    parent.speaker_name or parent.speaker_id or "Member"
+                )
+                excerpt = (parent.text or message_body(parent))[:REPLY_EXCERPT_CHARS]
+            else:
+                p_name = "earlier message"
+                excerpt = msg.reply_to_text
+            reply = f'↳ re {p_name}: "{excerpt}" — ' if excerpt else f"↳ re {p_name} — "
+        return f"{ts}{speaker}: {reply}{message_body(msg)}"
+
+    peer_label = conversation.peer_name or conversation.peer_id or "Customer"
+    label = "You" if outbound else peer_label
+    ts = f" [{msg.created_at.strftime('%Y-%m-%d %H:%M')}]" if with_time else ""
+    return f"{label}{ts}: {message_body(msg)}"
+
+
+async def _reply_parents(
+    db: AsyncSession, conversation_id: UUID, messages: list[ConversationMessage]
+) -> dict[str, ConversationMessage]:
+    """Parent rows for any replies in `messages` whose parent is not already among them."""
+    have = {m.external_id: m for m in messages if m.external_id}
+    wanted = {
+        m.reply_to_external_id
+        for m in messages
+        if m.reply_to_external_id and m.reply_to_external_id not in have
+    }
+    if wanted:
+        rows = await db.exec(
+            select(ConversationMessage).where(
+                ConversationMessage.conversation_id == conversation_id,
+                ConversationMessage.external_id.in_(wanted),
+            )
+        )
+        for row in rows.all():
+            have[row.external_id] = row
+    return have
+
+
 async def render_transcript(
     db: AsyncSession,
     conversation: Conversation,
@@ -578,15 +733,16 @@ async def render_transcript(
 
     Layout::
 
-        [Conversation history — {n} earlier turns]
+        [Earlier conversation summary]
         {rolling_summary}          ← if present
         ---
-        {peer_name} [{timestamp}]: {text_or_media_marker}
-        You [{timestamp}]: {text}
+        [Last {n} turns]
+        {format_turn(...)}
         ...
 
-    The most recent TRANSCRIPT_RECENT_TURNS turns are included verbatim.
-    Older turns are represented by the rolling summary when available.
+    The most recent TRANSCRIPT_RECENT_TURNS turns are included verbatim; for group threads
+    each line names its speaker and replies quote their parent.  Older turns are
+    represented by the rolling summary when available.
     """
     exclude = set(exclude_message_ids or [])
 
@@ -604,29 +760,8 @@ async def render_transcript(
     if not recent and not conversation.summary:
         return ""
 
-    peer_label = conversation.peer_name or conversation.peer_id or "Customer"
-
-    lines: list[str] = []
-    for msg in recent:
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-        label = "You" if msg.direction.value == "outbound" else peer_label
-
-        # Build message text
-        body_parts: list[str] = []
-        if msg.text:
-            body_parts.append(msg.text)
-        for att in msg.attachments or []:
-            att_text = att.get("text", "")
-            if att_text:
-                body_parts.append(att_text)
-            elif att.get("status") == "pending":
-                body_parts.append(f"[{att.get('kind', 'media')} — processing…]")
-            else:
-                body_parts.append(f"[{att.get('kind', 'media')}]")
-
-        body = " ".join(body_parts) if body_parts else "[no content]"
-        lines.append(f"{label} [{ts}]: {body}")
-
+    parents = await _reply_parents(db, conversation.id, recent) if conversation.is_group else {}
+    lines = [format_turn(msg, conversation, parents=parents) for msg in recent]
     history_block = "\n".join(lines)
 
     parts: list[str] = []
@@ -634,7 +769,8 @@ async def render_transcript(
         parts.append(f"[Earlier conversation summary]\n{conversation.summary}\n---")
     if lines:
         turn_word = "turn" if len(recent) == 1 else "turns"
-        parts.append(f"[Last {len(recent)} {turn_word}]\n{history_block}")
+        scope = f" in group {conversation.peer_name!r}" if conversation.is_group else ""
+        parts.append(f"[Last {len(recent)} {turn_word}{scope}]\n{history_block}")
 
     result = "\n\n".join(parts)
     # Hard cap to avoid prompt overflows
@@ -670,23 +806,25 @@ async def fold_to_summary(
     if not old_msgs:
         return
 
-    # Build a condensed transcript of the old turns
-    peer_label = conversation.peer_name or conversation.peer_id or "Customer"
-    old_lines: list[str] = []
-    for msg in old_msgs:
-        label = "Agent" if msg.direction.value == "outbound" else peer_label
-        body = msg.text or "[media]"
-        old_lines.append(f"{label}: {body}")
+    # Build a condensed transcript of the old turns (no timestamps — the summary is about
+    # content, and the characters are better spent on it).
+    old_lines = [format_turn(msg, conversation, with_time=False) for msg in old_msgs]
 
     existing_summary = conversation.summary or ""
     prompt_parts = []
     if existing_summary:
         prompt_parts.append(f"Previous summary:\n{existing_summary}\n")
     prompt_parts.append("New turns to fold in:\n" + "\n".join(old_lines))
+    if conversation.is_group:
+        focus = (
+            "This is a group chat with many speakers. Focus on: recurring topics and "
+            "requests, who asked for what (keep names), and anything still unresolved."
+        )
+    else:
+        focus = "Focus on: what the customer wants, key facts shared, and current status."
     prompt_parts.append(
         f"\nWrite an updated summary of the conversation so far in at most "
-        f"{SUMMARY_MAX_CHARS} characters. Focus on: what the customer wants, "
-        "key facts shared, and current status. Use past tense."
+        f"{SUMMARY_MAX_CHARS} characters. {focus} Use past tense."
     )
 
     try:

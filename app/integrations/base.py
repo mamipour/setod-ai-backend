@@ -24,6 +24,12 @@ gets written back depends on whether the action can be undone:
 - `mark_processed` commits immediately, and is what irreversible actions use. Once a reply has
   actually been sent, that fact has to survive a crash three steps later, or the next run
   sends it a second time.
+
+**Cursors.** Read tools that poll a stream (Telegram chats, IMAP folders) discover new items
+by position, via `get_cursor`/`set_cursor`, never by the provider's unread flag. The unread
+flag is shared with the owner and with every other agent on the account, so relying on it
+means one reader hides items from the rest. Cursors are per (agent, connector, scope) and,
+like `note_seen`, are flushed only when the run succeeds.
 """
 
 from dataclasses import dataclass, field
@@ -35,7 +41,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.agents.base import RegisteredTool
-from app.db.models import AgentProcessedItem, Connector, ProcessedItemStatus
+from app.db.models import AgentCursor, AgentProcessedItem, Connector, ProcessedItemStatus
 
 
 class IntegrationError(RuntimeError):
@@ -55,6 +61,8 @@ class ToolContext:
     # Set for channel-triggered runs so outbound tools can record replies
     session_id: Optional[UUID] = None
     conversation_id: Optional[UUID] = None
+    # Read positions advanced this run: scope -> cursor.  Flushed with `seen` on success.
+    cursors: dict[str, str] = field(default_factory=dict)
 
     def tool_name(self, base: str) -> str:
         return f"{base}_{slug(self.alias)}" if self.alias else base
@@ -66,6 +74,27 @@ class ToolContext:
     def note_seen(self, external_id: str) -> None:
         """Record an item as surfaced. Persisted only if the run succeeds."""
         self.seen.append((self.connector.id, external_id))
+
+    async def get_cursor(self, scope: str) -> str | None:
+        """This agent's stored read position for `scope` on this connector, or None.
+
+        A cursor set earlier in the same run (not yet flushed) takes precedence, so a tool
+        called twice in one run continues from where its first call stopped.
+        """
+        if scope in self.cursors:
+            return self.cursors[scope]
+        row = await self.db.exec(
+            select(AgentCursor.cursor).where(
+                AgentCursor.agent_id == self.agent_id,
+                AgentCursor.connector_id == self.connector.id,
+                AgentCursor.scope == scope,
+            )
+        )
+        return row.first()
+
+    def set_cursor(self, scope: str, cursor: str) -> None:
+        """Advance the read position. Persisted only if the run succeeds."""
+        self.cursors[scope] = cursor
 
     async def mark_processed(self, external_id: str) -> None:
         """Persist an item as permanently handled right now.

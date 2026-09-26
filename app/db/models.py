@@ -416,6 +416,43 @@ class AgentProcessedItem(SQLModel, table=True):
     processed_at: datetime = _ts()
 
 
+class AgentCursor(SQLModel, table=True):
+    """Per-agent read position on a provider stream.
+
+    Read tools discover new items by *position* (Telegram message id per chat, IMAP UID per
+    folder), never by the provider's unread flag.  The unread flag is shared state: the
+    owner reading a group on their phone, or a second agent on the same account, would
+    otherwise hide messages from this agent.  With a cursor each agent has its own view.
+
+    The cursor is advisory (a fetch lower bound).  `AgentProcessedItem` remains the
+    correctness ledger — it is what stops an item from being surfaced twice.  The cursor is
+    advanced only when the run succeeds, so a failed run re-reads the same window and the
+    ledger de-duplicates whatever was already confirmed.
+    """
+
+    __tablename__ = "agent_cursors"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "connector_id", "scope", name="uq_agent_cursor"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    agent_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), index=True
+        )
+    )
+    connector_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True), ForeignKey("connectors.id", ondelete="CASCADE"), index=True
+        )
+    )
+    # Telegram: chat id.  Gmail: folder name ("INBOX").
+    scope: str
+    # Opaque string: Telegram message id, IMAP UID.  Compared numerically by the tool.
+    cursor: str
+    updated_at: datetime = _ts()
+
+
 # ── InboundEvent ───────────────────────────────────────────────────────────────
 
 # ── Conversation enums ────────────────────────────────────────────────────────
@@ -459,7 +496,8 @@ class Conversation(SQLModel, table=True):
     - Instagram comment: peer_id = commenter IG user id, thread_key = media_id (one thread
       per commenter per post so replies don't bleed across posts)
     - WhatsApp / Twilio: peer_id = E.164 phone number
-    - Telegram: peer_id = chat.id (numeric string)
+    - Telegram: peer_id = chat.id (numeric string) — for groups this is the group id and
+      `is_group` is set; the individual speaker lives on each ConversationMessage
     """
 
     __tablename__ = "conversations"
@@ -486,6 +524,8 @@ class Conversation(SQLModel, table=True):
     peer_name: str = Field(default="")
     # Discriminator for Instagram comments (media id); empty for all other channels
     thread_key: str = Field(default="")
+    # True for Telegram groups/supergroups/channels: many speakers, peer_name = group title
+    is_group: bool = Field(default=False)
     status: ConversationStatus = Field(default=ConversationStatus.open)
     # Rolling LLM-compressed summary of older turns (updated after each run)
     summary: str = Field(default="")
@@ -524,6 +564,14 @@ class ConversationMessage(SQLModel, table=True):
     attachments: list[dict[str, Any]] = Field(default_factory=list, sa_type=JSONB)
     # Provider message id (for dedup / linking back to InboundEvent)
     external_id: str = Field(default="")
+    # Who wrote it, for group conversations (empty in 1:1 threads where the peer is implied)
+    speaker_id: str = Field(default="")
+    speaker_name: str = Field(default="")
+    # Telegram reply threading: the parent's provider id and a short excerpt of its text.
+    # The excerpt is stored because the parent may predate the bot joining / the agent's
+    # cursor, so it cannot always be looked up in this table.
+    reply_to_external_id: str = Field(default="")
+    reply_to_text: str = Field(default="")
     # The AgentSession that produced or consumed this message (SET NULL on session delete)
     session_id: UUID | None = Field(
         default=None,

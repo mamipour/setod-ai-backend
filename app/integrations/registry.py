@@ -9,6 +9,7 @@ connectors of the same type, and how to flush the run's idempotency ledger.
 """
 
 import logging
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import delete as sa_delete, update as sa_update
@@ -17,6 +18,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.db.models import (
+    AgentCursor,
     AgentProcessedItem,
     AgentSession,
     AgentTool,
@@ -176,7 +178,13 @@ async def flush_seen(
         Rows are reserved for this session.  Other concurrent or subsequent runs see the
         row and skip the item.  On conflict, the existing row is left untouched — a
         `permanent` record from a previous run must never be downgraded.
+
+    Read cursors (`ToolContext.cursors`) are flushed alongside, but only in `permanent`
+    mode: a paused run has not finished with its window yet.
     """
+    if status == ProcessedItemStatus.permanent:
+        await _flush_cursors(db, agent_id, contexts)
+
     rows = [
         {
             "agent_id": agent_id,
@@ -203,6 +211,31 @@ async def flush_seen(
             constraint="uq_agent_processed_item",
         )
 
+    await db.exec(stmt)
+    await db.commit()
+    return len(rows)
+
+
+async def _flush_cursors(db: AsyncSession, agent_id: UUID, contexts: list[ToolContext]) -> int:
+    """Upsert every cursor a read tool advanced this run."""
+    now = datetime.now(UTC)
+    rows = [
+        {
+            "agent_id": agent_id,
+            "connector_id": ctx.connector.id,
+            "scope": scope,
+            "cursor": cursor,
+            "updated_at": now,
+        }
+        for ctx in contexts
+        for scope, cursor in ctx.cursors.items()
+    ]
+    if not rows:
+        return 0
+    stmt = insert(AgentCursor).values(rows).on_conflict_do_update(
+        constraint="uq_agent_cursor",
+        set_={"cursor": insert(AgentCursor).excluded.cursor, "updated_at": now},
+    )
     await db.exec(stmt)
     await db.commit()
     return len(rows)
