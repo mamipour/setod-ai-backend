@@ -196,7 +196,18 @@ async def run_inbound(db: AsyncSession, event_id: UUID) -> list[AgentSession]:
     if event is None:
         return []
 
-    opening = f"Message from {event.sender}: {event.text}" if event.sender else event.text
+    # Build an opening message that includes enough context for the agent to pick the right
+    # reply tool.  Instagram comment events carry a media_id in their payload; DMs do not.
+    _payload = event.payload or {}
+    if "media_id" in _payload:
+        # Instagram comment — the agent must use reply_to_instagram_comment, not the DM tool.
+        _media_id = _payload.get("media_id", "")
+        opening = (
+            f"Instagram comment from @{event.sender} on post {_media_id}: {event.text}\n"
+            f"[comment_id={event.external_id}]"
+        )
+    else:
+        opening = f"Message from {event.sender}: {event.text}" if event.sender else event.text
     try:
         sessions = await fire_channel_triggers(db, event.connector_id, opening)
     except Exception as exc:
