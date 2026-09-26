@@ -55,6 +55,7 @@ import secrets
 
 from app.integrations import (
     airtable,
+    calendly,
     gmail,
     google_business_profile,
     hubspot,
@@ -329,6 +330,16 @@ async def test_connector(
             detail = await google_business_profile.test_connection(config["access_token"])
             return TestResult(ok=True, detail=detail)
         except google_business_profile.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.calendly:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await calendly.test_connection(config["api_token"])
+            return TestResult(ok=True, detail=detail)
+        except calendly.IntegrationError as exc:
             return TestResult(ok=False, detail=str(exc))
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
@@ -1951,3 +1962,48 @@ async def gbp_oauth_callback(
 
     from fastapi.responses import RedirectResponse
     return RedirectResponse(f"{frontend}/connectors?connected=Google+Business+Profile")
+
+
+# ── Calendly ──────────────────────────────────────────────────────────────────
+
+class CalendlyCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    api_token: str
+
+
+@router.post("/calendly/validate", response_model=TestResult)
+async def validate_calendly(body: CalendlyCreate):
+    try:
+        detail = await calendly.test_connection(body.api_token.strip())
+        return TestResult(ok=True, detail=detail)
+    except calendly.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+    except Exception as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/calendly", response_model=ConnectorOut, status_code=201)
+async def create_calendly_connector(
+    body: CalendlyCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await assert_org_owner(session, current_user, body.org_id)
+    try:
+        detail = await calendly.test_connection(body.api_token.strip())
+    except calendly.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or detail.replace("Connected as ", "Calendly · "),
+        type=ConnectorType.calendly,
+        status=ConnectorStatus.active,
+        config=encrypt_json({"api_token": body.api_token.strip()}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector

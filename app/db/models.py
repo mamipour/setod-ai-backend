@@ -37,6 +37,7 @@ class ConnectorType(str, Enum):
     airtable = "airtable"
     shopify = "shopify"
     google_business_profile = "google_business_profile"
+    calendly = "calendly"
     openai = "openai"
     anthropic = "anthropic"
     mcp = "mcp"

@@ -28,6 +28,7 @@ from app.db.models import (
 )
 from app.integrations import (
     airtable,
+    calendly,
     gmail,
     google_business_profile,
     hubspot,
@@ -62,6 +63,7 @@ BUILDERS = {
     ConnectorType.airtable: airtable.build_tools,
     ConnectorType.shopify: shopify.build_tools,
     ConnectorType.google_business_profile: google_business_profile.build_tools,
+    ConnectorType.calendly: calendly.build_tools,
 }
 
 
