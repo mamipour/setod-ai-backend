@@ -9,6 +9,7 @@ Routes
 GET    /connectors/                              list connectors for an org
 DELETE /connectors/{id}                          remove a connector
 POST   /connectors/{id}/test                     test a connector's credentials
+PATCH  /connectors/{id}/credentials             update credentials in place (all types)
 POST   /connectors/telegram-bot                  create Telegram Bot connector
 POST   /connectors/llm                           create OpenAI / Anthropic connector
 PATCH  /connectors/llm/{id}                      update an LLM connector's API key
@@ -544,6 +545,215 @@ async def update_llm_key(
         raise HTTPException(status_code=422, detail=check.detail)
 
     connector.config = encrypt_json({"api_key": body.api_key, "provider": connector.type})
+    connector.status = ConnectorStatus.active
+    connector.updated_at = datetime.now(UTC)
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── Generic credential update ─────────────────────────────────────────────────
+
+class CredentialPatch(BaseModel):
+    org_id: UUID
+    # Gmail
+    email: str | None = None
+    app_password: str | None = None
+    # Telegram Bot
+    bot_token: str | None = None
+    admin_chat_id: int | None = None
+    admin_username: str | None = None
+    admin_first_name: str | None = None
+    # Twilio
+    account_sid: str | None = None
+    auth_token: str | None = None
+    phone_number: str | None = None
+    # Google Sheets
+    sa_json: str | None = None
+    default_spreadsheet_id: str | None = None
+    # WhatsApp
+    phone_number_id: str | None = None
+    access_token: str | None = None
+    verify_token: str | None = None
+    # Shopify
+    shop_domain: str | None = None
+    # HubSpot / Pipedrive / Notion / Airtable / Calendly
+    api_token: str | None = None
+    # Slack outgoing webhook
+    webhook_url: str | None = None
+
+
+@router.patch("/{connector_id}/credentials", response_model=ConnectorOut)
+async def update_connector_credentials(
+    connector_id: UUID,
+    body: CredentialPatch,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Update a connector's credentials in place without deleting it.
+
+    Agent ↔ connector links and conversation history are fully preserved.
+    OAuth connectors (Instagram, GBP) use their dedicated reconnect flow instead.
+    """
+    await assert_org_owner(session, current_user, body.org_id)
+
+    connector = await session.get(Connector, connector_id)
+    if not connector or connector.org_id != body.org_id:
+        raise HTTPException(status_code=404, detail="Connector not found")
+
+    ct = connector.type
+    old_cfg: dict = decrypt_json(connector.config) if connector.config else {}
+
+    # ── Gmail ─────────────────────────────────────────────────────────────────
+    if ct == ConnectorType.gmail:
+        email = (body.email or "").strip() or old_cfg.get("email", "")
+        app_pw = (body.app_password or "").strip() or old_cfg.get("app_password", "")
+        if not email or not app_pw:
+            raise HTTPException(status_code=422, detail="email and app_password are required")
+        from app.integrations.gmail import _test_connection_sync
+        from app.integrations.base import IntegrationError as _IntegrationError
+        try:
+            await asyncio.to_thread(_test_connection_sync, email, app_pw)
+        except _IntegrationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not connect: {exc}") from exc
+        connector.config = encrypt_json({"email": email, "app_password": app_pw})
+        connector.name = f"Gmail · {email}"
+
+    # ── Telegram Bot ─────────────────────────────────────────────────────────
+    elif ct == ConnectorType.telegram_bot:
+        bot_token = (body.bot_token or "").strip()
+        if not bot_token:
+            raise HTTPException(status_code=422, detail="bot_token is required")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://api.telegram.org/bot{bot_token}/getMe")
+        data = resp.json()
+        if not data.get("ok"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid bot token: {data.get('description', 'Telegram rejected the token')}",
+            )
+        bot = data["result"]
+        new_cfg = {
+            **old_cfg,
+            "bot_token": bot_token,
+            "bot_id": bot["id"],
+            "bot_username": bot["username"],
+            "bot_first_name": bot["first_name"],
+        }
+        if body.admin_chat_id is not None:
+            new_cfg["admin_chat_id"] = body.admin_chat_id
+        if body.admin_username is not None:
+            new_cfg["admin_username"] = body.admin_username
+        if body.admin_first_name is not None:
+            new_cfg["admin_first_name"] = body.admin_first_name
+        connector.config = encrypt_json(new_cfg)
+        connector.name = f"Telegram · @{bot['username']}"
+
+    # ── Twilio ────────────────────────────────────────────────────────────────
+    elif ct == ConnectorType.twilio:
+        sid = (body.account_sid or "").strip() or old_cfg.get("account_sid", "")
+        tok = (body.auth_token or "").strip() or old_cfg.get("auth_token", "")
+        num = (body.phone_number or "").strip() or old_cfg.get("phone_number", "")
+        if not sid or not tok or not num:
+            raise HTTPException(status_code=422, detail="account_sid, auth_token, and phone_number are required")
+        result = await _twilio_validate(sid, tok, num)
+        if not result.ok:
+            raise HTTPException(status_code=422, detail=result.detail)
+        connector.config = encrypt_json({
+            "account_sid": sid, "auth_token": tok,
+            "phone_number": num, "friendly_name": result.friendly_name,
+        })
+
+    # ── Google Sheets ─────────────────────────────────────────────────────────
+    elif ct == ConnectorType.google_sheets:
+        sa_json_str = (body.sa_json or "").strip()
+        if not sa_json_str:
+            raise HTTPException(status_code=422, detail="sa_json is required")
+        try:
+            sa_dict = json.loads(sa_json_str)
+            svc_email = await sheets.validate(sa_json_str)
+        except sheets.IntegrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+        connector.config = encrypt_json({
+            "sa_json": sa_dict,
+            "service_account_email": svc_email,
+            "default_spreadsheet_id": (body.default_spreadsheet_id or "").strip()
+                                       or old_cfg.get("default_spreadsheet_id", ""),
+        })
+        connector.name = f"Sheets · {svc_email}"
+
+    # ── WhatsApp ──────────────────────────────────────────────────────────────
+    elif ct == ConnectorType.whatsapp:
+        pid = (body.phone_number_id or "").strip() or old_cfg.get("phone_number_id", "")
+        at  = (body.access_token or "").strip()  or old_cfg.get("access_token", "")
+        vt  = (body.verify_token or "").strip()  or old_cfg.get("verify_token", "")
+        if not pid or not at:
+            raise HTTPException(status_code=422, detail="phone_number_id and access_token are required")
+        try:
+            display = await whatsapp.validate(pid, at)
+        except whatsapp.IntegrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        connector.config = encrypt_json({"phone_number_id": pid, "access_token": at, "verify_token": vt})
+        connector.name = f"WhatsApp · {display}"
+
+    # ── Shopify ───────────────────────────────────────────────────────────────
+    elif ct == ConnectorType.shopify:
+        domain = (body.shop_domain or "").strip() or old_cfg.get("shop_domain", "")
+        at     = (body.access_token or "").strip() or old_cfg.get("access_token", "")
+        if not domain or not at:
+            raise HTTPException(status_code=422, detail="shop_domain and access_token are required")
+        try:
+            await shopify.test_connection(domain, at)
+        except shopify.IntegrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        connector.config = encrypt_json({"shop_domain": domain, "access_token": at})
+
+    # ── Single-token connectors ───────────────────────────────────────────────
+    elif ct in (
+        ConnectorType.hubspot, ConnectorType.pipedrive, ConnectorType.notion,
+        ConnectorType.airtable, ConnectorType.calendly,
+    ):
+        api_token = (body.api_token or "").strip()
+        if not api_token:
+            raise HTTPException(status_code=422, detail="api_token is required")
+        try:
+            if ct == ConnectorType.hubspot:
+                await hubspot.test_connection(api_token)
+            elif ct == ConnectorType.pipedrive:
+                await pipedrive.test_connection(api_token)
+            elif ct == ConnectorType.notion:
+                await notion.test_connection(api_token)
+            elif ct == ConnectorType.airtable:
+                await airtable.test_connection(api_token)
+            elif ct == ConnectorType.calendly:
+                await calendly.test_connection(api_token)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        connector.config = encrypt_json({"api_token": api_token})
+
+    # ── Slack outgoing webhook ────────────────────────────────────────────────
+    elif ct == ConnectorType.slack_webhook:
+        webhook_url = (body.webhook_url or "").strip()
+        if not webhook_url:
+            raise HTTPException(status_code=422, detail="webhook_url is required")
+        try:
+            await slack.validate(webhook_url)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        connector.config = encrypt_json({"webhook_url": webhook_url})
+
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail=f"In-place credential update is not supported for {ct.value}. "
+                   "Use the dedicated reconnect flow instead.",
+        )
+
     connector.status = ConnectorStatus.active
     connector.updated_at = datetime.now(UTC)
     session.add(connector)
