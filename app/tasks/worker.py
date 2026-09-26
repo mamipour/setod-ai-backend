@@ -21,6 +21,7 @@ from uuid import UUID
 
 from app.core.agents.base import resume_agent
 from app.core.knowledge import claim_pending_files, index_file
+from app.core.media_ingest import process_pending_media
 from app.integrations.registry import release_abandoned_reservations
 from app.core.triggers.dispatch import (
     claim_due,
@@ -163,6 +164,15 @@ async def poll_once(limiter: asyncio.Semaphore, *, tick: int = 0) -> int:
     `tick` is the monotonic poll counter. Slow tasks (schedules, files, approvals) run only
     every _SLOW_TASK_DIVISOR ticks to keep the 5s inbound loop cheap.
     """
+    # ── Media processing (every tick, before inbound so new events may already have media) ──
+    try:
+        async with AsyncSessionLocal() as db:
+            media_processed = await process_pending_media(db)
+        if media_processed:
+            log.info("processed %d pending media attachment(s)", media_processed)
+    except Exception:
+        log.exception("process_pending_media failed")
+
     # ── Inbound (every tick) ──────────────────────────────────────────────────
     async with AsyncSessionLocal() as db:
         bundles = await claim_inbound(db, limit=BATCH)

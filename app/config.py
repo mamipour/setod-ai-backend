@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # Connector credential encryption (Fernet key)
     encryption_key: str
 
+    # Local disk path where conversation media (audio, images, documents) is stored.
+    # Override in production with a volume-backed path, e.g. /mnt/data/setod/media.
+    media_dir: str = "/var/lib/setod/media"
+
     # Resend — platform-owned transactional email for owner notifications.
     # When blank, email notifications raise an error (visible in the UI test).
     resend_api_key: str = ""
