@@ -8,6 +8,7 @@ from app.core.agents.templates.invoice_chaser import TEMPLATE as invoice_chaser
 from app.core.agents.templates.listing_monitor import TEMPLATE as listing_monitor
 from app.core.agents.templates.order_confirmation import TEMPLATE as order_confirmation
 from app.core.agents.templates.review_request import TEMPLATE as review_request
+from app.core.agents.templates.review_responder import TEMPLATE as review_responder
 from app.core.agents.templates.lead_logger import TEMPLATE as lead_logger
 
 TEMPLATES: tuple[Template, ...] = (
@@ -19,6 +20,7 @@ TEMPLATES: tuple[Template, ...] = (
     listing_monitor,
     order_confirmation,
     review_request,
+    review_responder,
 )
 
 BY_KEY: dict[str, Template] = {t.key: t for t in TEMPLATES}
