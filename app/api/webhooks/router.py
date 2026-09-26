@@ -395,7 +395,18 @@ async def receive_instagram(
                 text = val.get("text", "")
                 if not (comment_id and text):
                     continue
-                sender = val.get("from", {}).get("username", val.get("from", {}).get("id", ""))
+                from_info = val.get("from", {})
+                sender = from_info.get("username", from_info.get("id", ""))
+                # Skip comments posted by the business account itself (agent's own replies)
+                # to avoid an infinite loop where the agent replies to its own comments.
+                try:
+                    _cfg = _dj(connector.config)
+                    _own_username = _cfg.get("username", "")
+                    _own_id = _cfg.get("ig_user_id", "")
+                    if (sender and sender == _own_username) or from_info.get("id") in (_own_id, ig_user_id):
+                        continue
+                except Exception:
+                    pass
                 await _record(
                     db, connector, comment_id, text[:MAX_TEXT], sender,
                     {**val, "media_id": val.get("media", {}).get("id", "")},
