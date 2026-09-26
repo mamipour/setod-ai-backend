@@ -224,6 +224,10 @@ async def run_agent(
                 tools = tools + call_tools
 
     client = await _build_client_for(db, agent, config)
+    if not session.model_slug:
+        session.model_slug = client.model
+        db.add(session)
+        await db.commit()
 
     opening = user_input or SCHEDULED_KICKOFF
     messages: list[dict[str, Any]] = []
@@ -856,6 +860,10 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
             tools = tools + call_tools
 
     client = await _build_client_for(db, agent, config)
+    if not session.model_slug:
+        session.model_slug = client.model
+        db.add(session)
+        await db.commit()
 
     # Restore message context from the snapshot saved at pause time.
     messages: list[dict[str, Any]] = list(req.messages_snapshot)
@@ -985,6 +993,7 @@ async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, An
 
     api_key = decrypt_json(connector.config)["api_key"]
     try:
-        return build_client(connector.type.value, api_key, config.get("model", ""))
+        client = build_client(connector.type.value, api_key, config.get("model", ""))
+        return client
     except LLMError as exc:
         raise AgentRunError(str(exc)) from exc
