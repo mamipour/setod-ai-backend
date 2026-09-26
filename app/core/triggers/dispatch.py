@@ -28,11 +28,19 @@ from app.db.models import (
     AgentSession,
     AgentStatus,
     AgentTrigger,
+    Conversation,
+    ConversationMessage,
+    ConversationStatus,
     InboundEvent,
     InboundEventStatus,
     SessionStatus,
     TriggerType,
 )
+
+# How long to wait after the last inbound before firing.
+DEBOUNCE_SECONDS = 10
+# Hard cap: fire even if messages keep arriving within the debounce window.
+DEBOUNCE_MAX_SECONDS = 30
 
 log = logging.getLogger(__name__)
 
@@ -114,7 +122,13 @@ async def is_running(db: AsyncSession, agent_id: UUID) -> bool:
     return rows.first() is not None
 
 
-async def run_trigger(db: AsyncSession, trigger_id: UUID, *, user_input: str | None = None) -> AgentSession | None:
+async def run_trigger(
+    db: AsyncSession,
+    trigger_id: UUID,
+    *,
+    user_input: str | None = None,
+    conversation_id: UUID | None = None,
+) -> AgentSession | None:
     """Execute the agent behind a trigger. Returns None when the run was skipped.
 
     Skips are normal operation, not errors: an unpublished or archived agent should not run,
@@ -143,11 +157,15 @@ async def run_trigger(db: AsyncSession, trigger_id: UUID, *, user_input: str | N
         user_input=user_input,
         dry_run=False,
         use_published=True,
+        conversation_id=conversation_id,
     )
 
 
 async def fire_channel_triggers(
-    db: AsyncSession, connector_id: UUID, user_input: str
+    db: AsyncSession,
+    connector_id: UUID,
+    user_input: str,
+    conversation_id: UUID | None = None,
 ) -> list[AgentSession]:
     """Run every agent listening to this connector, for one inbound message."""
     rows = await db.exec(
@@ -160,7 +178,9 @@ async def fire_channel_triggers(
 
     sessions = []
     for trigger in rows.all():
-        session = await run_trigger(db, trigger.id, user_input=user_input)
+        session = await run_trigger(
+            db, trigger.id, user_input=user_input, conversation_id=conversation_id
+        )
         if session is not None:
             trigger.last_run_at = datetime.now(UTC)
             db.add(trigger)
@@ -169,59 +189,180 @@ async def fire_channel_triggers(
     return sessions
 
 
-async def claim_inbound(db: AsyncSession, *, limit: int = 10) -> list[UUID]:
-    """Take ownership of queued webhook events, same locking rules as schedules."""
-    rows = await db.exec(
+async def claim_inbound(
+    db: AsyncSession,
+    *,
+    limit: int = 10,
+    now: datetime | None = None,
+) -> list[tuple[UUID, list[UUID]]]:
+    """Claim conversation bundles whose debounce window has closed.
+
+    Returns a list of (conversation_id, [event_id, ...]) tuples.
+
+    Strategy:
+    - Only conversations that have pending events are considered.
+    - A conversation is ready when BOTH:
+        (a) its oldest pending event is at least DEBOUNCE_MAX_SECONDS old, OR
+            its newest pending event is at least DEBOUNCE_SECONDS old (quiet window),
+        (b) no AgentSession for this conversation is currently running.
+    - Events are marked processed immediately (before the run) to prevent replay.
+    """
+    _now = now or datetime.now(UTC)
+    debounce_cutoff = _now - timedelta(seconds=DEBOUNCE_SECONDS)
+    hard_cutoff = _now - timedelta(seconds=DEBOUNCE_MAX_SECONDS)
+
+    # Find conversations that have pending events
+    pending_rows = await db.exec(
         select(InboundEvent)
         .where(InboundEvent.status == InboundEventStatus.pending)
+        .where(InboundEvent.conversation_id.is_not(None))
         .order_by(InboundEvent.received_at)
-        .limit(limit)
         .with_for_update(skip_locked=True)
     )
-    claimed = []
-    for event in rows.all():
-        # Marked before the run for the same reason schedules are: a crash mid-run must not
-        # replay someone's message to the agent a second time.
-        event.status = InboundEventStatus.processed
-        event.processed_at = datetime.now(UTC)
-        db.add(event)
-        claimed.append(event.id)
+    pending_events = pending_rows.all()
+
+    # Group by conversation
+    by_conversation: dict[UUID, list[InboundEvent]] = {}
+    for ev in pending_events:
+        cid = ev.conversation_id
+        if cid not in by_conversation:
+            by_conversation[cid] = []
+        by_conversation[cid].append(ev)
+
+    # Also handle events with no conversation_id (legacy / race condition)
+    orphan_events = [ev for ev in pending_events if ev.conversation_id is None]
+
+    ready_bundles: list[tuple[UUID | None, list[UUID]]] = []
+
+    for conversation_id, events in by_conversation.items():
+        if len(by_conversation) >= limit:
+            break  # claimed enough
+
+        oldest = min(ev.received_at for ev in events)
+        newest = max(ev.received_at for ev in events)
+
+        # Debounce: quiet for 10s, or oldest event is 30s old
+        if newest > debounce_cutoff and oldest > hard_cutoff:
+            continue  # still within debounce window
+
+        # Skip if a run for this conversation is already in progress
+        running = await db.exec(
+            select(AgentSession.id)
+            .where(
+                AgentSession.conversation_id == conversation_id,
+                AgentSession.status == SessionStatus.running,
+                AgentSession.started_at > _now - STALE_RUN_AFTER,
+            )
+            .limit(1)
+        )
+        if running.first() is not None:
+            continue  # overlap guard — another run is live
+
+        # Check conversation status (skip if human takeover)
+        conversation = await db.get(Conversation, conversation_id)
+        if conversation and conversation.status == ConversationStatus.human:
+            continue
+
+        # Claim these events
+        event_ids = []
+        for ev in events:
+            ev.status = InboundEventStatus.processed
+            ev.processed_at = _now
+            db.add(ev)
+            event_ids.append(ev.id)
+
+        ready_bundles.append((conversation_id, event_ids))
+
+    # Handle orphan events (no conversation_id) — one-at-a-time old behaviour
+    for ev in orphan_events[:max(0, limit - len(ready_bundles))]:
+        ev.status = InboundEventStatus.processed
+        ev.processed_at = _now
+        db.add(ev)
+        ready_bundles.append((None, [ev.id]))
+
     await db.commit()
-    return claimed
+    return ready_bundles
 
 
-async def run_inbound(db: AsyncSession, event_id: UUID) -> list[AgentSession]:
-    """Wake every agent listening to the connector this event arrived on."""
-    event = await db.get(InboundEvent, event_id)
-    if event is None:
+async def run_inbound(
+    db: AsyncSession,
+    conversation_id: UUID | None,
+    event_ids: list[UUID],
+) -> list[AgentSession]:
+    """Fire agents for a bundle of events from the same conversation.
+
+    When `conversation_id` is set, events are bundled into a single opening message
+    and the run is linked to the conversation.  When None (legacy path), behaves as
+    before with a single event.
+    """
+    if not event_ids:
         return []
 
-    # Build an opening message that includes enough context for the agent to pick the right
-    # reply tool.  Instagram comment events carry a media_id in their payload; DMs do not.
-    _payload = event.payload or {}
-    if "media_id" in _payload:
-        # Instagram comment — the agent must use reply_to_instagram_comment, not the DM tool.
-        _media_id = _payload.get("media_id", "")
-        opening = (
-            f"Instagram comment from @{event.sender} on post {_media_id}: {event.text}\n"
-            f"[comment_id={event.external_id}]"
-        )
-    else:
-        opening = f"Message from {event.sender}: {event.text}" if event.sender else event.text
+    events = []
+    for eid in event_ids:
+        ev = await db.get(InboundEvent, eid)
+        if ev is not None:
+            events.append(ev)
+
+    if not events:
+        return []
+
+    # The connector is the same for all events in a conversation bundle.
+    connector_id = events[0].connector_id
+
+    # ── Build the opening message ──────────────────────────────────────────────
+    opening = _build_opening(events, conversation_id)
+
+    # ── Fire agents ────────────────────────────────────────────────────────────
     try:
-        sessions = await fire_channel_triggers(db, event.connector_id, opening)
+        sessions = await fire_channel_triggers(
+            db, connector_id, opening, conversation_id=conversation_id
+        )
     except Exception as exc:
-        event.status = InboundEventStatus.failed
-        event.error = f"{type(exc).__name__}: {exc}"
-        db.add(event)
+        now = datetime.now(UTC)
+        for ev in events:
+            ev.status = InboundEventStatus.failed
+            ev.error = f"{type(exc).__name__}: {exc}"
+            db.add(ev)
         await db.commit()
         raise
 
     if not sessions:
-        event.status = InboundEventStatus.ignored
-        db.add(event)
+        for ev in events:
+            ev.status = InboundEventStatus.ignored
+            db.add(ev)
         await db.commit()
+
     return sessions
+
+
+def _build_opening(events: list[InboundEvent], conversation_id: UUID | None) -> str:
+    """Compose a single opening message from one or more inbound events in a bundle."""
+    if len(events) == 1:
+        ev = events[0]
+        payload = ev.payload or {}
+        if "media_id" in payload:
+            media_id = payload.get("media_id", "")
+            return (
+                f"Instagram comment from @{ev.sender} on post {media_id}: {ev.text}\n"
+                f"[comment_id={ev.external_id}]"
+            )
+        lines = []
+        if ev.sender:
+            lines.append(f"Message from {ev.sender}:")
+        lines.append(ev.text or "[media — no text body]")
+        # Attach media markers (Phase 1: attachments not yet processed)
+        conv_msg = None  # will enrich in Phase 2
+        return "\n".join(lines)
+
+    # Multiple messages — bundle them
+    sender = events[0].sender or "customer"
+    header = f"You have {len(events)} new messages from {sender}:\n"
+    parts = []
+    for i, ev in enumerate(events, 1):
+        body = ev.text or "[media — no text body]"
+        parts.append(f"  {i}. {body}")
+    return header + "\n".join(parts)
 
 
 # ── Data retention pruning ─────────────────────────────────────────────────────

@@ -35,7 +35,8 @@ from app.db.session import AsyncSessionLocal, engine
 
 log = logging.getLogger("worker")
 
-POLL_SECONDS = 20
+# Inbound events are polled frequently so the 10s debounce window resolves quickly.
+POLL_SECONDS = 5
 # Ceiling on how many due triggers one poll takes on. Keeps a backlog from turning into a
 # hundred concurrent LLM calls the moment the worker comes back up.
 BATCH = 10
@@ -43,6 +44,8 @@ BATCH = 10
 MAX_CONCURRENT_RUNS = 4
 REAP_EVERY = timedelta(minutes=10)
 PRUNE_EVERY = timedelta(hours=24)
+# Slower tasks (schedules, files, approvals) run every 4th inbound tick (~20s).
+_SLOW_TASK_DIVISOR = 4
 
 
 async def _run_scheduled(trigger_id: UUID, limiter: asyncio.Semaphore) -> None:
@@ -64,14 +67,21 @@ async def _run_scheduled(trigger_id: UUID, limiter: asyncio.Semaphore) -> None:
             log.exception("schedule %s failed", trigger_id)
 
 
-async def _run_inbound(event_id: UUID, limiter: asyncio.Semaphore) -> None:
+async def _run_inbound(
+    conversation_id: UUID | None,
+    event_ids: list[UUID],
+    limiter: asyncio.Semaphore,
+) -> None:
     async with limiter:
         try:
             async with AsyncSessionLocal() as db:
-                sessions = await run_inbound(db, event_id)
-            log.info("event %s woke %d agent(s)", event_id, len(sessions))
+                sessions = await run_inbound(db, conversation_id, event_ids)
+            log.info(
+                "conv %s bundle(%d events) → %d agent run(s)",
+                conversation_id, len(event_ids), len(sessions),
+            )
         except Exception:
-            log.exception("event %s failed", event_id)
+            log.exception("conv %s bundle failed", conversation_id)
 
 
 async def _expire_approvals() -> int:
@@ -143,15 +153,32 @@ async def _index_knowledge(file_id: UUID, limiter: asyncio.Semaphore) -> None:
             log.exception("knowledge file %s failed", file_id)
 
 
-async def poll_once(limiter: asyncio.Semaphore) -> int:
+async def poll_once(limiter: asyncio.Semaphore, *, tick: int = 0) -> int:
     """One tick: drain inbound webhook events, then run whatever schedules are due, then
     index any freshly uploaded knowledge files.
 
     Inbound goes first because someone is waiting on the other end of it, while a schedule
     slipping by one tick is invisible.
+
+    `tick` is the monotonic poll counter. Slow tasks (schedules, files, approvals) run only
+    every _SLOW_TASK_DIVISOR ticks to keep the 5s inbound loop cheap.
     """
+    # ── Inbound (every tick) ──────────────────────────────────────────────────
     async with AsyncSessionLocal() as db:
-        events = await claim_inbound(db, limit=BATCH)
+        bundles = await claim_inbound(db, limit=BATCH)
+
+    if bundles:
+        log.info("claimed %d conversation bundle(s)", len(bundles))
+        await asyncio.gather(*(
+            _run_inbound(conv_id, eids, limiter)
+            for conv_id, eids in bundles
+        ))
+
+    # ── Slow tasks (every 4th tick ≈ 20s) ─────────────────────────────────────
+    if tick % _SLOW_TASK_DIVISOR != 0:
+        return len(bundles)
+
+    async with AsyncSessionLocal() as db:
         triggers = await claim_due(db, limit=BATCH)
         files = await claim_pending_files(db, limit=BATCH)
 
@@ -168,9 +195,6 @@ async def poll_once(limiter: asyncio.Semaphore) -> int:
         log.info("expired %d approval request(s)", expired)
     resumable = await _claim_resolved_approvals()
 
-    if events:
-        log.info("claimed %d inbound event(s)", len(events))
-        await asyncio.gather(*(_run_inbound(e, limiter) for e in events))
     if triggers:
         log.info("claimed %d due schedule(s)", len(triggers))
         await asyncio.gather(*(_run_scheduled(t, limiter) for t in triggers))
@@ -180,7 +204,7 @@ async def poll_once(limiter: asyncio.Semaphore) -> int:
     if resumable:
         log.info("resuming %d approved session(s)", len(resumable))
         await asyncio.gather(*(_resume_approved(s, limiter) for s in resumable))
-    return len(events) + len(triggers) + len(files) + len(resumable)
+    return len(bundles) + len(triggers) + len(files) + len(resumable)
 
 
 async def main() -> None:
@@ -199,7 +223,9 @@ async def main() -> None:
     limiter = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
     next_reap = datetime.now(UTC)
     next_prune = datetime.now(UTC)
-    log.info("scheduler started — polling every %ds", POLL_SECONDS)
+    tick = 0
+    log.info("scheduler started — polling every %ds (slow tasks every %ds)",
+             POLL_SECONDS, POLL_SECONDS * _SLOW_TASK_DIVISOR)
 
     try:
         while not stopping.is_set():
@@ -224,7 +250,8 @@ async def main() -> None:
                         log.exception("retention prune failed")
                     next_prune = datetime.now(UTC) + PRUNE_EVERY
 
-                await poll_once(limiter)
+                await poll_once(limiter, tick=tick)
+                tick += 1
             except Exception:
                 # The loop itself must survive anything — a transient database blip should
                 # cost one tick, not the scheduler.

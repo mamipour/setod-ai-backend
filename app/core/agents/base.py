@@ -87,7 +87,15 @@ MASTER_PREAMBLE = (
     "they describe, nothing more. If the instructions are empty, unclear, or do not apply "
     "to the data you see, reply with a short status summary and stop. Never invent tasks, "
     "never take actions that are not explicitly requested, and never reply to messages "
-    "unless the instructions tell you to. When in doubt, do nothing."
+    "unless the instructions tell you to. When in doubt, do nothing.\n\n"
+    "MEDIA HANDLING: When an opening message contains a media marker such as "
+    "[voice message — transcription unavailable] or [image — description pending], "
+    "acknowledge the media politely and ask the sender to describe it in text if you need "
+    "its content to complete the task. Never claim the media is lost or broken.\n\n"
+    "CHANNEL REPLIES: When replying to an inbound message, always direct your reply to "
+    "the original sender using the correct tool and the sender's id or chat_id as shown "
+    "in the opening message. Never reply to the admin chat when the task is to respond "
+    "to a customer."
 )
 
 # Without this, a model that receives "[dry run] would send the email" reads it as a failure
