@@ -53,7 +53,7 @@ from app.db.session import get_session
 import json
 import secrets
 
-from app.integrations import gmail, instagram, mcp, sheets, slack, telegram, twilio, whatsapp
+from app.integrations import gmail, hubspot, instagram, mcp, pipedrive, sheets, slack, telegram, twilio, whatsapp
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -255,6 +255,26 @@ async def test_connector(
             if "error" in data:
                 return TestResult(ok=False, detail=data["error"].get("message", "Instagram API error"))
             return TestResult(ok=True, detail=f"Connected as @{data.get('username', data.get('id', '?'))}")
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.hubspot:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await hubspot.test_connection(config["api_token"])
+            return TestResult(ok=True, detail=detail)
+        except hubspot.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.pipedrive:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await pipedrive.test_connection(config["api_token"])
+            return TestResult(ok=True, detail=detail)
+        except pipedrive.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
 
@@ -1533,3 +1553,93 @@ async def instagram_oauth_callback(
 
     from fastapi.responses import RedirectResponse
     return RedirectResponse(f"{frontend}/connectors?connected=Instagram")
+
+
+# ── HubSpot CRM ───────────────────────────────────────────────────────────────
+
+class HubSpotCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    api_token: str
+
+
+@router.post("/hubspot/validate", response_model=TestResult)
+async def validate_hubspot(body: HubSpotCreate):
+    try:
+        detail = await hubspot.test_connection(body.api_token.strip())
+        return TestResult(ok=True, detail=detail)
+    except hubspot.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+    except Exception as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/hubspot", response_model=ConnectorOut, status_code=201)
+async def create_hubspot_connector(
+    body: HubSpotCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await assert_org_owner(session, current_user, body.org_id)
+    try:
+        detail = await hubspot.test_connection(body.api_token.strip())
+    except hubspot.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or "HubSpot",
+        type=ConnectorType.hubspot,
+        status=ConnectorStatus.active,
+        config=encrypt_json({"api_token": body.api_token.strip()}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── Pipedrive CRM ─────────────────────────────────────────────────────────────
+
+class PipedriveCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    api_token: str
+
+
+@router.post("/pipedrive/validate", response_model=TestResult)
+async def validate_pipedrive(body: PipedriveCreate):
+    try:
+        detail = await pipedrive.test_connection(body.api_token.strip())
+        return TestResult(ok=True, detail=detail)
+    except pipedrive.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+    except Exception as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/pipedrive", response_model=ConnectorOut, status_code=201)
+async def create_pipedrive_connector(
+    body: PipedriveCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await assert_org_owner(session, current_user, body.org_id)
+    try:
+        detail = await pipedrive.test_connection(body.api_token.strip())
+    except pipedrive.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or "Pipedrive",
+        type=ConnectorType.pipedrive,
+        status=ConnectorStatus.active,
+        config=encrypt_json({"api_token": body.api_token.strip()}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector

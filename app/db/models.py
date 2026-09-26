@@ -31,6 +31,8 @@ class ConnectorType(str, Enum):
     google_sheets = "google_sheets"
     whatsapp = "whatsapp"
     instagram = "instagram"
+    hubspot = "hubspot"
+    pipedrive = "pipedrive"
     openai = "openai"
     anthropic = "anthropic"
     mcp = "mcp"

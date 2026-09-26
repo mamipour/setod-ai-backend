@@ -8,10 +8,12 @@ from app.core.agents.templates.invoice_chaser import TEMPLATE as invoice_chaser
 from app.core.agents.templates.listing_monitor import TEMPLATE as listing_monitor
 from app.core.agents.templates.order_confirmation import TEMPLATE as order_confirmation
 from app.core.agents.templates.review_request import TEMPLATE as review_request
+from app.core.agents.templates.lead_logger import TEMPLATE as lead_logger
 
 TEMPLATES: tuple[Template, ...] = (
     support_triage,
     telegram_lead_finder,
+    lead_logger,
     inbox_digest,
     invoice_chaser,
     listing_monitor,
