@@ -53,7 +53,22 @@ from app.db.session import get_session
 import json
 import secrets
 
-from app.integrations import gmail, hubspot, instagram, mcp, pipedrive, sheets, slack, telegram, twilio, whatsapp
+from app.integrations import (
+    airtable,
+    gmail,
+    google_business_profile,
+    hubspot,
+    instagram,
+    mcp,
+    notion,
+    pipedrive,
+    sheets,
+    shopify,
+    slack,
+    telegram,
+    twilio,
+    whatsapp,
+)
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -274,6 +289,46 @@ async def test_connector(
             detail = await pipedrive.test_connection(config["api_token"])
             return TestResult(ok=True, detail=detail)
         except pipedrive.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.notion:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await notion.test_connection(config["api_token"])
+            return TestResult(ok=True, detail=detail)
+        except notion.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.airtable:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await airtable.test_connection(config["api_token"])
+            return TestResult(ok=True, detail=detail)
+        except airtable.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.shopify:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await shopify.test_connection(config["shop_domain"], config["access_token"])
+            return TestResult(ok=True, detail=detail)
+        except shopify.IntegrationError as exc:
+            return TestResult(ok=False, detail=str(exc))
+        except Exception as exc:
+            return TestResult(ok=False, detail=str(exc))
+
+    if connector.type == ConnectorType.google_business_profile:
+        try:
+            config = decrypt_json(connector.config)
+            detail = await google_business_profile.test_connection(config["access_token"])
+            return TestResult(ok=True, detail=detail)
+        except google_business_profile.IntegrationError as exc:
             return TestResult(ok=False, detail=str(exc))
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
@@ -1643,3 +1698,256 @@ async def create_pipedrive_connector(
     await session.commit()
     await session.refresh(connector)
     return connector
+
+
+# ── Notion ────────────────────────────────────────────────────────────────────
+
+class NotionCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    api_token: str
+
+
+@router.post("/notion/validate", response_model=TestResult)
+async def validate_notion(body: NotionCreate):
+    try:
+        detail = await notion.test_connection(body.api_token.strip())
+        return TestResult(ok=True, detail=detail)
+    except notion.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+    except Exception as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/notion", response_model=ConnectorOut, status_code=201)
+async def create_notion_connector(
+    body: NotionCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await assert_org_owner(session, current_user, body.org_id)
+    try:
+        await notion.test_connection(body.api_token.strip())
+    except notion.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or "Notion",
+        type=ConnectorType.notion,
+        status=ConnectorStatus.active,
+        config=encrypt_json({"api_token": body.api_token.strip()}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── Airtable ──────────────────────────────────────────────────────────────────
+
+class AirtableCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    api_token: str
+
+
+@router.post("/airtable/validate", response_model=TestResult)
+async def validate_airtable(body: AirtableCreate):
+    try:
+        detail = await airtable.test_connection(body.api_token.strip())
+        return TestResult(ok=True, detail=detail)
+    except airtable.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+    except Exception as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/airtable", response_model=ConnectorOut, status_code=201)
+async def create_airtable_connector(
+    body: AirtableCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await assert_org_owner(session, current_user, body.org_id)
+    try:
+        await airtable.test_connection(body.api_token.strip())
+    except airtable.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or "Airtable",
+        type=ConnectorType.airtable,
+        status=ConnectorStatus.active,
+        config=encrypt_json({"api_token": body.api_token.strip()}),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── Shopify ───────────────────────────────────────────────────────────────────
+
+class ShopifyCreate(BaseModel):
+    org_id: UUID
+    name: str = ""
+    shop_domain: str
+    access_token: str
+
+
+@router.post("/shopify/validate", response_model=TestResult)
+async def validate_shopify(body: ShopifyCreate):
+    try:
+        detail = await shopify.test_connection(body.shop_domain.strip(), body.access_token.strip())
+        return TestResult(ok=True, detail=detail)
+    except shopify.IntegrationError as exc:
+        return TestResult(ok=False, detail=str(exc))
+    except Exception as exc:
+        return TestResult(ok=False, detail=str(exc))
+
+
+@router.post("/shopify", response_model=ConnectorOut, status_code=201)
+async def create_shopify_connector(
+    body: ShopifyCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    await assert_org_owner(session, current_user, body.org_id)
+    try:
+        detail = await shopify.test_connection(body.shop_domain.strip(), body.access_token.strip())
+    except shopify.IntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connector = Connector(
+        org_id=body.org_id,
+        created_by=current_user.id,
+        name=body.name or f"Shopify · {body.shop_domain.strip()}",
+        type=ConnectorType.shopify,
+        status=ConnectorStatus.active,
+        config=encrypt_json({
+            "shop_domain": body.shop_domain.strip(),
+            "access_token": body.access_token.strip(),
+        }),
+    )
+    session.add(connector)
+    await session.commit()
+    await session.refresh(connector)
+    return connector
+
+
+# ── Google Business Profile (OAuth) ───────────────────────────────────────────
+
+_GBP_SCOPE = "https://www.googleapis.com/auth/business.manage"
+
+
+@router.get("/oauth/gbp/start")
+async def gbp_oauth_start(
+    request: Request,
+    org_id: Annotated[UUID, Query()],
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    import base64 as _b64
+    import json as _json
+
+    state_data = _json.dumps({"org_id": str(org_id), "user_id": str(current_user.id)})
+    state = _b64.urlsafe_b64encode(state_data.encode()).rstrip(b"=").decode()
+
+    redirect_uri = (
+        f"{settings.public_base_url}/connectors/oauth/gbp/callback"
+        if settings.public_base_url
+        else f"http://localhost:{settings.app_port}/connectors/oauth/gbp/callback"
+    )
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={settings.google_client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&response_type=code"
+        f"&scope={_GBP_SCOPE}"
+        f"&access_type=offline&prompt=consent"
+        f"&state={state}"
+    )
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(auth_url)
+
+
+@router.get("/oauth/gbp/callback")
+async def gbp_oauth_callback(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    import base64 as _b64
+    import json as _json
+
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    frontend = settings.frontend_origin
+
+    if error or not code or not state:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?error=gbp_denied")
+
+    try:
+        state_data = _json.loads(_b64.urlsafe_b64decode(state + "==").decode())
+        org_id = UUID(state_data["org_id"])
+        user_id = UUID(state_data["user_id"])
+    except Exception:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?error=gbp_state")
+
+    redirect_uri = (
+        f"{settings.public_base_url}/connectors/oauth/gbp/callback"
+        if settings.public_base_url
+        else f"http://localhost:{settings.app_port}/connectors/oauth/gbp/callback"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            token_resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+        if token_resp.status_code != 200:
+            raise ValueError(token_resp.text[:200])
+        token_data = token_resp.json()
+    except Exception:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?error=gbp_token")
+
+    access_token = token_data.get("access_token", "")
+    try:
+        detail = await google_business_profile.test_connection(access_token)
+    except Exception:
+        detail = "Google Business Profile"
+
+    name = (
+        detail.replace("Connected — locations: ", "GBP · ")
+        if "locations:" in detail
+        else "Google Business Profile"
+    )
+    connector = Connector(
+        org_id=org_id,
+        created_by=user_id,
+        name=name,
+        type=ConnectorType.google_business_profile,
+        status=ConnectorStatus.active,
+        config=encrypt_json({
+            "access_token": access_token,
+            "refresh_token": token_data.get("refresh_token", ""),
+        }),
+    )
+    session.add(connector)
+    await session.commit()
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(f"{frontend}/connectors?connected=Google+Business+Profile")

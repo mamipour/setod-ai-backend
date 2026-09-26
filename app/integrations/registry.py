@@ -26,7 +26,22 @@ from app.db.models import (
     ProcessedItemStatus,
     SessionStatus,
 )
-from app.integrations import gmail, hubspot, instagram, mcp, pipedrive, sheets, slack, telegram, twilio, whatsapp
+from app.integrations import (
+    airtable,
+    gmail,
+    google_business_profile,
+    hubspot,
+    instagram,
+    mcp,
+    notion,
+    pipedrive,
+    sheets,
+    shopify,
+    slack,
+    telegram,
+    twilio,
+    whatsapp,
+)
 from app.integrations.base import RegisteredTool, ToolContext, slug
 
 log = logging.getLogger(__name__)
@@ -43,6 +58,10 @@ BUILDERS = {
     ConnectorType.instagram: instagram.build_tools,
     ConnectorType.hubspot: hubspot.build_tools,
     ConnectorType.pipedrive: pipedrive.build_tools,
+    ConnectorType.notion: notion.build_tools,
+    ConnectorType.airtable: airtable.build_tools,
+    ConnectorType.shopify: shopify.build_tools,
+    ConnectorType.google_business_profile: google_business_profile.build_tools,
 }
 
 
