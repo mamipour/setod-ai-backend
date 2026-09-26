@@ -1565,17 +1565,23 @@ async def instagram_oauth_start(
     org_id: Annotated[UUID, Query()],
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    connector_id: Annotated[UUID | None, Query()] = None,
 ):
-    """Redirect the browser to Instagram's OAuth consent screen."""
+    """Redirect the browser to Instagram's OAuth consent screen.
+
+    Pass ``connector_id`` to reconnect (refresh the token of) an existing connector
+    instead of creating a new one.
+    """
     await assert_org_owner(session, current_user, org_id)
     if not settings.instagram_app_id:
         raise HTTPException(status_code=503, detail="Instagram is not configured on this server.")
 
     from urllib.parse import urlencode
     import base64, json as _json
-    state_payload = base64.urlsafe_b64encode(
-        _json.dumps({"org_id": str(org_id), "user_id": str(current_user.id)}).encode()
-    ).decode()
+    state_data: dict = {"org_id": str(org_id), "user_id": str(current_user.id)}
+    if connector_id:
+        state_data["connector_id"] = str(connector_id)
+    state_payload = base64.urlsafe_b64encode(_json.dumps(state_data).encode()).decode()
     params = urlencode({
         "client_id": settings.instagram_app_id,
         "redirect_uri": settings.instagram_redirect_uri,
@@ -1608,6 +1614,7 @@ async def instagram_oauth_callback(
         state_data = _json.loads(base64.urlsafe_b64decode(state + "==").decode())
         org_id = UUID(state_data["org_id"])
         user_id = UUID(state_data["user_id"])
+        reconnect_id: UUID | None = UUID(state_data["connector_id"]) if state_data.get("connector_id") else None
     except Exception:
         from fastapi.responses import RedirectResponse
         return RedirectResponse(f"{frontend}/connectors?error=instagram_state")
@@ -1624,6 +1631,21 @@ async def instagram_oauth_callback(
         return RedirectResponse(f"{frontend}/connectors?error=instagram_token")
 
     username = config.get("username", "")
+
+    if reconnect_id:
+        # Reconnect: update the existing connector's token in place so all
+        # agent ↔ connector links are preserved.
+        existing = await session.get(Connector, reconnect_id)
+        if existing and existing.org_id == org_id:
+            existing.config = encrypt_json(config)
+            existing.status = ConnectorStatus.active
+            existing.name = f"Instagram · @{username}" if username else existing.name
+            await session.commit()
+        # Best-effort: re-subscribe webhook events.
+        await instagram.subscribe_account(config["ig_user_id"], config["access_token"])
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?reconnected=Instagram")
+
     connector = Connector(
         org_id=org_id,
         created_by=user_id,
@@ -1882,11 +1904,15 @@ async def gbp_oauth_start(
     request: Request,
     org_id: Annotated[UUID, Query()],
     current_user: Annotated[User, Depends(get_current_user)],
+    connector_id: Annotated[UUID | None, Query()] = None,
 ):
     import base64 as _b64
     import json as _json
 
-    state_data = _json.dumps({"org_id": str(org_id), "user_id": str(current_user.id)})
+    state_dict: dict = {"org_id": str(org_id), "user_id": str(current_user.id)}
+    if connector_id:
+        state_dict["connector_id"] = str(connector_id)
+    state_data = _json.dumps(state_dict)
     state = _b64.urlsafe_b64encode(state_data.encode()).rstrip(b"=").decode()
 
     redirect_uri = (
@@ -1928,6 +1954,7 @@ async def gbp_oauth_callback(
         state_data = _json.loads(_b64.urlsafe_b64decode(state + "==").decode())
         org_id = UUID(state_data["org_id"])
         user_id = UUID(state_data["user_id"])
+        gbp_reconnect_id: UUID | None = UUID(state_data["connector_id"]) if state_data.get("connector_id") else None
     except Exception:
         from fastapi.responses import RedirectResponse
         return RedirectResponse(f"{frontend}/connectors?error=gbp_state")
@@ -1968,16 +1995,37 @@ async def gbp_oauth_callback(
         if "locations:" in detail
         else "Google Business Profile"
     )
+    new_config = {
+        "access_token": access_token,
+        "refresh_token": token_data.get("refresh_token", ""),
+    }
+
+    if gbp_reconnect_id:
+        # Reconnect: update the existing connector in place.
+        existing = await session.get(Connector, gbp_reconnect_id)
+        if existing and existing.org_id == org_id:
+            # Preserve old refresh_token if Google didn't issue a new one
+            # (Google only sends refresh_token on the first consent grant).
+            if not new_config["refresh_token"] and existing.config:
+                try:
+                    old_cfg = decrypt_json(existing.config)
+                    new_config["refresh_token"] = old_cfg.get("refresh_token", "")
+                except Exception:
+                    pass
+            existing.config = encrypt_json(new_config)
+            existing.status = ConnectorStatus.active
+            existing.name = name
+            await session.commit()
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"{frontend}/connectors?reconnected=Google+Business+Profile")
+
     connector = Connector(
         org_id=org_id,
         created_by=user_id,
         name=name,
         type=ConnectorType.google_business_profile,
         status=ConnectorStatus.active,
-        config=encrypt_json({
-            "access_token": access_token,
-            "refresh_token": token_data.get("refresh_token", ""),
-        }),
+        config=encrypt_json(new_config),
     )
     session.add(connector)
     await session.commit()
