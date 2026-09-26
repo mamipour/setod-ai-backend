@@ -151,6 +151,7 @@ async def run_agent(
     dry_run: bool = False,
     use_published: bool = True,
     triggered_by_session_id: UUID | None = None,
+    conversation_id: UUID | None = None,
 ) -> AgentSession:
     """Run an agent to completion and return its finished session.
 
@@ -181,6 +182,7 @@ async def run_agent(
         status=SessionStatus.running,
         dry_run=dry_run,
         triggered_by_session_id=triggered_by_session_id,
+        conversation_id=conversation_id,
         model_slug=config.get("model", "") or "",
     )
     db.add(session)
@@ -190,7 +192,11 @@ async def run_agent(
     contexts: list[Any] = []
     approval_required: set[str] = set()
     if tools is None:
-        tools, contexts, approval_required = await build_tools_for_agent(db, agent.id)
+        tools, contexts, approval_required = await build_tools_for_agent(
+            db, agent.id,
+            session_id=session.id,
+            conversation_id=conversation_id,
+        )
         # Web tools come from settings, not from a connector, so they are appended here
         # rather than resolved from AgentTool rows.
         if settings["web_search"]:

@@ -28,6 +28,7 @@ gets written back depends on whether the action can be undone:
 
 from dataclasses import dataclass, field
 from uuid import UUID
+from typing import Optional
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlmodel import select
@@ -51,6 +52,9 @@ class ToolContext:
     alias: str = ""
     # External ids surfaced by read tools this run, flushed to AgentProcessedItem on success.
     seen: list[tuple[UUID, str]] = field(default_factory=list)
+    # Set for channel-triggered runs so outbound tools can record replies
+    session_id: Optional[UUID] = None
+    conversation_id: Optional[UUID] = None
 
     def tool_name(self, base: str) -> str:
         return f"{base}_{slug(self.alias)}" if self.alias else base

@@ -85,7 +85,11 @@ def supported_types() -> list[str]:
 
 
 async def build_tools_for_agent(
-    db: AsyncSession, agent_id: UUID
+    db: AsyncSession,
+    agent_id: UUID,
+    *,
+    session_id: UUID | None = None,
+    conversation_id: UUID | None = None,
 ) -> tuple[list[RegisteredTool], list[ToolContext], set[str]]:
     """Every tool this agent can call, plus the contexts holding the run's seen-item list,
     plus the set of tool names that require human approval before execution.
@@ -125,7 +129,14 @@ async def build_tools_for_agent(
         if not alias and type_counts[connector.type] > 1:
             alias = connector.name
 
-        ctx = ToolContext(db=db, agent_id=agent_id, connector=connector, alias=alias)
+        ctx = ToolContext(
+            db=db,
+            agent_id=agent_id,
+            connector=connector,
+            alias=alias,
+            session_id=session_id,
+            conversation_id=conversation_id,
+        )
         built = builder(ctx)
 
         if agent_tool.enabled_tools:

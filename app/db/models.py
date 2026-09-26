@@ -312,6 +312,16 @@ class AgentSession(SQLModel, table=True):
     )
     started_at: datetime = _ts()
     finished_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    # Set for channel-triggered runs; links the session to the conversation thread
+    conversation_id: UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("conversations.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
 
     @property
     def total_tokens(self) -> int:
@@ -397,6 +407,127 @@ class AgentProcessedItem(SQLModel, table=True):
 
 # ── InboundEvent ───────────────────────────────────────────────────────────────
 
+# ── Conversation enums ────────────────────────────────────────────────────────
+
+class ConversationStatus(str, Enum):
+    open = "open"       # agent is handling replies
+    human = "human"     # owner has taken over; agent pauses for this thread
+    closed = "closed"   # thread archived
+
+
+class MessageDirection(str, Enum):
+    inbound = "inbound"
+    outbound = "outbound"
+
+
+class MessageAuthor(str, Enum):
+    peer = "peer"       # the external person
+    agent = "agent"     # the AI agent
+    human = "human"     # the workspace owner replying manually
+
+
+class MessageKind(str, Enum):
+    text = "text"
+    image = "image"
+    audio = "audio"
+    video = "video"
+    document = "document"
+    location = "location"
+    sticker = "sticker"
+    contact = "contact"
+    other = "other"
+
+
+# ── Conversation tables ───────────────────────────────────────────────────────
+
+class Conversation(SQLModel, table=True):
+    """One ongoing thread between the agent and a specific external person on one channel.
+
+    Keyed on (connector_id, peer_id, thread_key):
+    - Instagram DM: peer_id = sender IG user id, thread_key = ""
+    - Instagram comment: peer_id = commenter IG user id, thread_key = media_id (one thread
+      per commenter per post so replies don't bleed across posts)
+    - WhatsApp / Twilio: peer_id = E.164 phone number
+    - Telegram: peer_id = chat.id (numeric string)
+    """
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        UniqueConstraint("connector_id", "peer_id", "thread_key", name="uq_conversation"),
+        Index("ix_conversations_connector_last", "connector_id", "last_inbound_at"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    connector_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("connectors.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
+    # ConnectorType value string ("telegram_bot", "whatsapp", etc.)
+    channel: str = Field(index=True)
+    # Provider-native peer identifier (chat id, wa_id, IG user id, phone number)
+    peer_id: str
+    # Human-readable name if available (username, display name)
+    peer_name: str = Field(default="")
+    # Discriminator for Instagram comments (media id); empty for all other channels
+    thread_key: str = Field(default="")
+    status: ConversationStatus = Field(default=ConversationStatus.open)
+    # Rolling LLM-compressed summary of older turns (updated after each run)
+    summary: str = Field(default="")
+    # Messages up to and including this timestamp are folded into summary
+    summary_through_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    last_inbound_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    last_outbound_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    created_at: datetime = _ts()
+
+
+class ConversationMessage(SQLModel, table=True):
+    """One turn in a conversation — either inbound from the peer or outbound from the agent/human."""
+
+    __tablename__ = "conversation_messages"
+    __table_args__ = (
+        Index("ix_conv_messages_conv_time", "conversation_id", "created_at"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    conversation_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("conversations.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    direction: MessageDirection
+    author: MessageAuthor
+    kind: MessageKind = Field(default=MessageKind.text)
+    # Plain text body, or transcript / description once media has been processed
+    text: str = Field(default="")
+    # JSONB list of {kind, provider_ref, mime, filename, size, duration, caption,
+    # stored_path, status: pending|ready|failed|unavailable, error, cost_usd}
+    attachments: list[dict[str, Any]] = Field(default_factory=list, sa_type=JSONB)
+    # Provider message id (for dedup / linking back to InboundEvent)
+    external_id: str = Field(default="")
+    # The AgentSession that produced or consumed this message (SET NULL on session delete)
+    session_id: UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("agent_sessions.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    created_at: datetime = _ts()
+
+
+# ── InboundEventStatus / InboundEvent ─────────────────────────────────────────
+
 class InboundEventStatus(str, Enum):
     pending = "pending"
     processed = "processed"
@@ -451,6 +582,24 @@ class InboundEvent(SQLModel, table=True):
     error: str | None = None
     received_at: datetime = _ts()
     processed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    # Set when this event has been linked to a Conversation and ConversationMessage
+    conversation_id: UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("conversations.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    conversation_message_id: UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("conversation_messages.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
 
 
 # ── Knowledge ──────────────────────────────────────────────────────────────────
