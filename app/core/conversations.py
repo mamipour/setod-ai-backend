@@ -557,6 +557,159 @@ async def record_outbound(
 # ── get_open_conversation ─────────────────────────────────────────────────────
 
 
+# ── render_transcript ─────────────────────────────────────────────────────────
+
+# Maximum characters injected as history context into the agent opening
+TRANSCRIPT_MAX_CHARS = 6_000
+# Number of recent turns to always include verbatim (newest-first)
+TRANSCRIPT_RECENT_TURNS = 30
+# Character budget for the rolling summary block
+SUMMARY_MAX_CHARS = 800
+# Fold turns older than this many into the rolling summary after a run succeeds
+SUMMARY_FOLD_AFTER_TURNS = 30
+
+
+async def render_transcript(
+    db: AsyncSession,
+    conversation: Conversation,
+    exclude_message_ids: list[UUID] | None = None,
+) -> str:
+    """Build a history block to prepend to the agent opening.
+
+    Layout::
+
+        [Conversation history — {n} earlier turns]
+        {rolling_summary}          ← if present
+        ---
+        {peer_name} [{timestamp}]: {text_or_media_marker}
+        You [{timestamp}]: {text}
+        ...
+
+    The most recent TRANSCRIPT_RECENT_TURNS turns are included verbatim.
+    Older turns are represented by the rolling summary when available.
+    """
+    exclude = set(exclude_message_ids or [])
+
+    rows = await db.exec(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.conversation_id == conversation.id,
+            ConversationMessage.id.not_in(exclude) if exclude else True,
+        )
+        .order_by(ConversationMessage.created_at.desc())
+        .limit(TRANSCRIPT_RECENT_TURNS)
+    )
+    recent = list(reversed(rows.all()))
+
+    if not recent and not conversation.summary:
+        return ""
+
+    peer_label = conversation.peer_name or conversation.peer_id or "Customer"
+
+    lines: list[str] = []
+    for msg in recent:
+        ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
+        label = "You" if msg.direction.value == "outbound" else peer_label
+
+        # Build message text
+        body_parts: list[str] = []
+        if msg.text:
+            body_parts.append(msg.text)
+        for att in msg.attachments or []:
+            att_text = att.get("text", "")
+            if att_text:
+                body_parts.append(att_text)
+            elif att.get("status") == "pending":
+                body_parts.append(f"[{att.get('kind', 'media')} — processing…]")
+            else:
+                body_parts.append(f"[{att.get('kind', 'media')}]")
+
+        body = " ".join(body_parts) if body_parts else "[no content]"
+        lines.append(f"{label} [{ts}]: {body}")
+
+    history_block = "\n".join(lines)
+
+    parts: list[str] = []
+    if conversation.summary:
+        parts.append(f"[Earlier conversation summary]\n{conversation.summary}\n---")
+    if lines:
+        turn_word = "turn" if len(recent) == 1 else "turns"
+        parts.append(f"[Last {len(recent)} {turn_word}]\n{history_block}")
+
+    result = "\n\n".join(parts)
+    # Hard cap to avoid prompt overflows
+    if len(result) > TRANSCRIPT_MAX_CHARS:
+        result = result[-TRANSCRIPT_MAX_CHARS:]
+        result = "[…]\n" + result[result.find("\n") + 1:]
+
+    return result
+
+
+async def fold_to_summary(
+    db: AsyncSession,
+    conversation: Conversation,
+    *,
+    openai_key: str,
+) -> None:
+    """Compress turns older than SUMMARY_FOLD_AFTER_TURNS into a rolling summary.
+
+    Called after a successful agent run.  Uses a cheap GPT-4o-mini completion.
+    No-op when there are fewer turns than the fold threshold.
+    """
+    total_rows = await db.exec(
+        select(ConversationMessage)
+        .where(ConversationMessage.conversation_id == conversation.id)
+        .order_by(ConversationMessage.created_at)
+    )
+    all_msgs = total_rows.all()
+
+    if len(all_msgs) <= SUMMARY_FOLD_AFTER_TURNS:
+        return  # not enough turns yet
+
+    old_msgs = all_msgs[:-SUMMARY_FOLD_AFTER_TURNS]
+    if not old_msgs:
+        return
+
+    # Build a condensed transcript of the old turns
+    peer_label = conversation.peer_name or conversation.peer_id or "Customer"
+    old_lines: list[str] = []
+    for msg in old_msgs:
+        label = "Agent" if msg.direction.value == "outbound" else peer_label
+        body = msg.text or "[media]"
+        old_lines.append(f"{label}: {body}")
+
+    existing_summary = conversation.summary or ""
+    prompt_parts = []
+    if existing_summary:
+        prompt_parts.append(f"Previous summary:\n{existing_summary}\n")
+    prompt_parts.append("New turns to fold in:\n" + "\n".join(old_lines))
+    prompt_parts.append(
+        f"\nWrite an updated summary of the conversation so far in at most "
+        f"{SUMMARY_MAX_CHARS} characters. Focus on: what the customer wants, "
+        "key facts shared, and current status. Use past tense."
+    )
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
+            max_tokens=300,
+        )
+        new_summary = resp.choices[0].message.content or ""
+
+        conversation.summary = new_summary[:SUMMARY_MAX_CHARS]
+        conversation.summary_through_at = old_msgs[-1].created_at
+        db.add(conversation)
+        await db.commit()
+    except Exception as exc:
+        log.warning("fold_to_summary failed for conv %s: %s", conversation.id, exc)
+
+
+# ── get_open_conversation ─────────────────────────────────────────────────────
+
+
 async def get_or_create_conversation(
     db: AsyncSession,
     connector: Connector,

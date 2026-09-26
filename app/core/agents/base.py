@@ -346,6 +346,19 @@ async def run_agent(
                 )
                 await _finish(db, session, final_status)
                 await _name_session(db, session, client, opening, response.content)
+
+                # Phase 2: fold old turns into a rolling summary after a successful run
+                if final_status == SessionStatus.succeeded and conversation_id is not None:
+                    try:
+                        from app.core.conversations import fold_to_summary
+                        from app.db.models import Conversation as _Conv
+                        _conv = await db.get(_Conv, conversation_id)
+                        _fold_key = _openai_key_for_memory or await _oai_key(db, agent.org_id)
+                        if _conv is not None and _fold_key:
+                            await fold_to_summary(db, _conv, openai_key=_fold_key)
+                    except Exception:
+                        pass  # non-fatal — never turn a success into a failure
+
                 return session
 
             # Check whether any tool in this batch requires human approval.

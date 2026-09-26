@@ -98,7 +98,29 @@ async def list_connectors(
     result = await session.exec(
         select(Connector).where(Connector.org_id == org_id).order_by(Connector.created_at)
     )
-    return result.all()
+    connectors = result.all()
+
+    # Check whether the org has an OpenAI connector (needed for audio/image processing)
+    _MEDIA_CHANNELS = {
+        ConnectorType.telegram_bot,
+        ConnectorType.telegram_client,
+        ConnectorType.whatsapp,
+        ConnectorType.instagram,
+        ConnectorType.twilio,
+    }
+    has_openai = any(c.type == ConnectorType.openai and c.status.value == "active" for c in connectors)
+    _MEDIA_HINT = (
+        "Voice and image messages will be stored but not transcribed/described. "
+        "Connect an OpenAI account to enable automatic transcription."
+    )
+
+    out = []
+    for c in connectors:
+        item = ConnectorOut.model_validate(c)
+        if not has_openai and c.type in _MEDIA_CHANNELS:
+            item.media_hint = _MEDIA_HINT
+        out.append(item)
+    return out
 
 
 @router.delete("/{connector_id}", status_code=204)

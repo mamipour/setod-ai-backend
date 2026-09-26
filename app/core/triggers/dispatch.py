@@ -313,6 +313,22 @@ async def run_inbound(
     # ── Build the opening message ──────────────────────────────────────────────
     opening = _build_opening(events, conversation_id)
 
+    # Prepend conversation history transcript when a conversation is set
+    if conversation_id is not None:
+        from app.core.conversations import render_transcript
+        conversation = await db.get(Conversation, conversation_id)
+        if conversation is not None:
+            event_message_ids = [
+                ev.conversation_message_id
+                for ev in events
+                if ev.conversation_message_id is not None
+            ]
+            transcript = await render_transcript(
+                db, conversation, exclude_message_ids=event_message_ids
+            )
+            if transcript:
+                opening = f"{transcript}\n\n---\n\n{opening}"
+
     # ── Fire agents ────────────────────────────────────────────────────────────
     try:
         sessions = await fire_channel_triggers(
