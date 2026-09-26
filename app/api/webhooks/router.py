@@ -274,31 +274,26 @@ async def receive_instagram(
         log.warning("rejected unsigned Instagram delivery")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-    import sys as _sys
-    print(f"IG_DBG raw body len={len(body)} preview={body[:300]}", file=_sys.stderr, flush=True)
-    log.warning("IG_DBG raw body len=%d preview=%s", len(body), body[:300])
-
     import json as _json
     try:
         payload = _json.loads(body)
-    except Exception as e:
-        log.warning("IG_DBG JSON parse failed: %s body=%s", e, body[:200])
+    except Exception:
         return  # malformed JSON — acknowledge so Meta stops retrying
 
-    log.warning("IG_DBG payload object=%s entries=%d", payload.get("object"), len(payload.get("entry", [])))
-
     if payload.get("object") != "instagram":
-        log.warning("IG_DBG unexpected object type %s", payload.get("object"))
         return
 
     for entry in payload.get("entry", []):
         ig_user_id = str(entry.get("id", ""))
-        log.warning("IG_DBG entry ig_user_id=%s messaging=%d changes=%d", ig_user_id, len(entry.get("messaging", [])), len(entry.get("changes", [])))
         if not ig_user_id:
             continue
 
-        # Look up the connector for this Instagram account by ig_user_id in config
-        from app.core.crypto import decrypt_json as _dj
+        # Look up the connector for this Instagram account.
+        # Meta webhooks use the legacy Instagram Business Account ID in entry.id, while the
+        # Instagram Login API returns an app-scoped user ID — they differ for the same account.
+        # We match by ig_user_id first, then ig_webhook_id (stored on first real webhook),
+        # then fall back to the sole active connector for Meta test events (entry.id == "0").
+        from app.core.crypto import decrypt_json as _dj, encrypt_json as _ej
         ig_rows = await db.exec(
             select(Connector).where(
                 Connector.type == ConnectorType.instagram,
@@ -307,22 +302,35 @@ async def receive_instagram(
         )
         all_ig_connectors = ig_rows.all()
         connector = None
+        matched_config = None
         for c in all_ig_connectors:
             try:
-                stored_id = _dj(c.config).get("ig_user_id")
-                if stored_id == ig_user_id:
+                cfg = _dj(c.config)
+                if cfg.get("ig_user_id") == ig_user_id or cfg.get("ig_webhook_id") == ig_user_id:
                     connector = c
+                    matched_config = cfg
                     break
             except Exception:
                 continue
-        # Fallback for Meta test events which use ig_user_id="0"
+
+        # Fallback for Meta test events (ig_user_id="0") or single-connector orgs
         if connector is None and ig_user_id == "0" and all_ig_connectors:
             connector = all_ig_connectors[0]
-            log.warning("IG_DBG using first connector for test event (ig_user_id=0)")
 
         if connector is None:
-            log.warning("IG_DBG no connector found for ig_user_id=%s", ig_user_id)
+            log.warning("instagram webhook: no connector for entry.id=%s", ig_user_id)
             continue
+
+        # Self-heal: store ig_webhook_id the first time we see the legacy entry.id so future
+        # lookups skip the full scan and match directly.
+        if ig_user_id != "0" and matched_config is not None and matched_config.get("ig_webhook_id") != ig_user_id:
+            try:
+                matched_config["ig_webhook_id"] = ig_user_id
+                connector.config = _ej(matched_config)
+                db.add(connector)
+                await db.commit()
+            except Exception:
+                pass
 
         # ── DMs (real format: entry.messaging[]) ──────────────────────────────
         for msg_event in entry.get("messaging", []):
