@@ -145,11 +145,27 @@ def _bot_tools(ctx: ToolContext, config: dict[str, Any]) -> list[RegisteredTool]
 
     async def notify(args: dict[str, Any], dry_run: bool) -> str:
         text = str(args.get("message", "")).strip()
+        # `chat_id` lets the agent reply to the actual inbound sender; defaults to admin chat
+        chat_id = str(args.get("chat_id", "")).strip() or admin_chat_id
         if not text:
             return "Error: 'message' is required."
         if dry_run:
-            return f"Would have sent this Telegram message: {text[:500]}"
-        await bot_send(token, admin_chat_id, text)
+            return f"Would have sent Telegram message to {chat_id}: {text[:500]}"
+        await bot_send(token, chat_id, text)
+        # Record outbound into the conversation thread when context is available
+        if ctx.conversation_id and not dry_run:
+            from app.core.conversations import record_outbound
+            from app.db.models import MessageAuthor
+            await record_outbound(
+                ctx.db,
+                connector=ctx.connector,
+                conversation_id=ctx.conversation_id,
+                peer_id=chat_id,
+                text=text,
+                session_id=ctx.session_id,
+                author=MessageAuthor.agent,
+                dry_run=False,
+            )
         return "Telegram message sent."
 
     return [
@@ -157,13 +173,22 @@ def _bot_tools(ctx: ToolContext, config: dict[str, Any]) -> list[RegisteredTool]
             ToolSpec(
                 ctx.tool_name("send_telegram_message"),
                 ctx.describe(
-                    "Send a Telegram message to the configured chat. Use for alerts and "
-                    "notifications to the account owner."
+                    "Send a Telegram message. When replying to an inbound message always "
+                    "pass the sender's chat_id so the reply reaches them; for admin "
+                    "notifications omit chat_id."
                 ),
                 {
                     "type": "object",
                     "properties": {
-                        "message": {"type": "string", "description": "Plain text. No HTML."}
+                        "message": {"type": "string", "description": "Plain text. No HTML."},
+                        "chat_id": {
+                            "type": "string",
+                            "description": (
+                                "Telegram chat id of the recipient. "
+                                "Required when replying to an inbound message. "
+                                "Omit to send to the configured admin chat."
+                            ),
+                        },
                     },
                     "required": ["message"],
                 },
@@ -182,6 +207,19 @@ def _client_tools(ctx: ToolContext, config: dict[str, Any]) -> list[RegisteredTo
         if dry_run:
             return f"Would have sent {to} this Telegram message: {text[:500]}"
         await client_send(config, to, text)
+        if ctx.conversation_id:
+            from app.core.conversations import record_outbound
+            from app.db.models import MessageAuthor
+            await record_outbound(
+                ctx.db,
+                connector=ctx.connector,
+                conversation_id=ctx.conversation_id,
+                peer_id=to,
+                text=text,
+                session_id=ctx.session_id,
+                author=MessageAuthor.agent,
+                dry_run=False,
+            )
         return f"Telegram message sent to {to}."
 
     async def read_unread(args: dict[str, Any], dry_run: bool) -> str:
@@ -197,6 +235,27 @@ def _client_tools(ctx: ToolContext, config: dict[str, Any]) -> list[RegisteredTo
 
         for chat in fresh:
             ctx.note_seen(chat["last_message_id"])
+            # Record each new message into the conversation thread
+            from app.core.conversations import Peer, record_inbound
+            peer = Peer(
+                peer_id=chat.get("sender_id") or chat.get("chat", ""),
+                peer_name=chat.get("sender_name") or chat.get("sender_username") or "",
+            )
+            payload = {
+                "peer_id": peer.peer_id,
+                "sender_name": peer.peer_name,
+                "text": chat.get("text", ""),
+            }
+            await record_inbound(
+                ctx.db,
+                ctx.connector,
+                external_id=chat["last_message_id"],
+                text=chat.get("text", ""),
+                sender=peer.peer_id,
+                payload=payload,
+                peer=peer,
+                attachments=[],
+            )
 
         lines = []
         for i, c in enumerate(fresh):

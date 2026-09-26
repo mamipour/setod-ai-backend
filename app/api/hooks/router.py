@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy.dialects.postgresql import insert
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.conversations import extract_attachments, record_inbound, resolve_peer
 from app.core.crypto import decrypt_json
 from app.db.models import Connector, ConnectorType, InboundEvent
 from app.db.session import get_session
@@ -176,16 +177,40 @@ async def receive_whatsapp(
     except (IndexError, AttributeError):
         return Response(status_code=200)
 
+    # Also pull contacts list for peer_name enrichment (it's on `value`, not on each msg)
+    contacts_by_wa_id: dict[str, str] = {}
+    for contact in value.get("contacts", []):
+        wa_id = contact.get("wa_id", "")
+        name = contact.get("profile", {}).get("name", "")
+        if wa_id and name:
+            contacts_by_wa_id[wa_id] = name
+
     for msg in messages:
-        if msg.get("type") != "text":
-            continue
-        text = msg.get("text", {}).get("body", "")
-        if not text:
-            continue
+        msg_type = msg.get("type", "text")
         msg_id = msg.get("id", "")
         sender = msg.get("from", "")
-        await _record(db, connector, msg_id, text, sender, msg)
-        log.info("WhatsApp message %s from %s queued", msg_id, sender)
+
+        # Enrich the payload with the contact name so resolve_peer can use it
+        if sender in contacts_by_wa_id:
+            msg = {**msg, "profile": {"name": contacts_by_wa_id[sender]}}
+
+        text, attachments = extract_attachments(connector.type, msg)
+        if not text and not attachments:
+            # No text, no media — skip (e.g. reaction events)
+            continue
+
+        peer = resolve_peer(connector.type, msg)
+        is_new, _, _ = await record_inbound(
+            db, connector,
+            external_id=msg_id,
+            text=text,
+            sender=sender,
+            payload=msg,
+            peer=peer,
+            attachments=attachments,
+        )
+        if is_new:
+            log.info("WhatsApp %s message %s from %s queued", msg_type, msg_id, sender)
 
     # Meta requires a 200 response, not 202
     return Response(status_code=200)

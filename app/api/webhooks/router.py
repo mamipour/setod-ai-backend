@@ -30,6 +30,7 @@ from twilio.request_validator import RequestValidator
 
 from app.api.auth.dependencies import get_current_user
 from app.config import settings
+from app.core.conversations import extract_attachments, record_inbound, resolve_peer
 from app.core.crypto import decrypt_json, encrypt_json
 from app.db.models import (
     Connector,
@@ -176,14 +177,39 @@ async def receive_telegram(
 
     update = await request.json()
     message = update.get("message") or {}
-    text = message.get("text") or message.get("caption") or ""
-    if not text:
-        # Stickers, joins, edits. Acknowledged so Telegram stops retrying, but not queued.
+
+    # Skip non-message updates (joins, edits, polls, etc.)
+    if not message:
         return
 
     chat = message.get("chat") or {}
-    sender = chat.get("username") or str(chat.get("id", ""))
-    await _record(db, connector, str(update["update_id"]), text, sender, update)
+    chat_id = str(chat.get("id", ""))
+    sender = chat.get("username") or chat_id
+    if not chat_id:
+        # No chat means we can't identify the peer — drop silently
+        return
+
+    text, attachments = extract_attachments(connector.type, update)
+    if not text and not attachments:
+        # Voice-less stickers, service messages, join/leave events
+        return
+
+    peer = resolve_peer(connector.type, update)
+    if not peer.peer_id:
+        peer_id = chat_id
+    else:
+        peer_id = peer.peer_id
+
+    await record_inbound(
+        db,
+        connector,
+        external_id=str(update["update_id"]),
+        text=text,
+        sender=sender,
+        payload=update,
+        peer=peer,
+        attachments=attachments,
+    )
 
 
 # ── Twilio ─────────────────────────────────────────────────────────────────────
@@ -212,11 +238,23 @@ async def receive_twilio(
         log.warning("rejected unsigned Twilio delivery for connector %s", connector_id)
         raise HTTPException(status_code=404, detail="Unknown webhook")
 
-    text = params.get("Body", "")
-    if text:
-        await _record(
-            db, connector, params["MessageSid"], text, params.get("From", ""), params
-        )
+    text, attachments = extract_attachments(connector.type, params)
+    num_media = int(params.get("NumMedia", "0") or "0")
+    if not text and num_media == 0:
+        # No body and no media — acknowledge but don't queue
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    peer = resolve_peer(connector.type, params)
+    await record_inbound(
+        db,
+        connector,
+        external_id=params["MessageSid"],
+        text=text,
+        sender=params.get("From", ""),
+        payload=params,
+        peer=peer,
+        attachments=attachments,
+    )
 
     return Response(content="<Response></Response>", media_type="application/xml")
 
@@ -363,12 +401,21 @@ async def receive_instagram(
             if msg.get("is_echo"):
                 # Echo events are copies of messages the business sent — not inbound.
                 continue
-            text = msg.get("text", "")
-            if not text:
-                continue
             mid = msg.get("mid", "")
             sender_id = str(msg_event.get("sender", {}).get("id", ""))
-            await _record(db, connector, mid or sender_id, text[:MAX_TEXT], sender_id, msg_event)
+            text, attachments = extract_attachments(connector.type, msg_event)
+            if not text and not attachments:
+                continue
+            peer = resolve_peer(connector.type, msg_event)
+            await record_inbound(
+                db, connector,
+                external_id=mid or sender_id,
+                text=text[:MAX_TEXT],
+                sender=sender_id,
+                payload=msg_event,
+                peer=peer,
+                attachments=attachments,
+            )
 
         # ── Changes (messages + comments) ─────────────────────────────────────
         for change in entry.get("changes", []):
@@ -380,20 +427,29 @@ async def receive_instagram(
                 msg = val.get("message", {})
                 if msg.get("is_echo"):
                     continue
-                text = msg.get("text", "")
-                if not text:
-                    continue
                 mid = msg.get("mid", "")
                 sender_id = str(val.get("sender", {}).get("id", ""))
                 # Meta test events always use "random_mid" — use a unique id so each test click runs the agent
                 import uuid as _uuid
                 effective_mid = _uuid.uuid4().hex if mid == "random_mid" else (mid or sender_id or "test")
-                await _record(db, connector, effective_mid, text[:MAX_TEXT], sender_id, val)
+                text, attachments = extract_attachments(connector.type, val)
+                if not text and not attachments:
+                    continue
+                peer = resolve_peer(connector.type, val)
+                await record_inbound(
+                    db, connector,
+                    external_id=effective_mid,
+                    text=text[:MAX_TEXT],
+                    sender=sender_id,
+                    payload=val,
+                    peer=peer,
+                    attachments=attachments,
+                )
 
             elif field == "comments":
                 comment_id = val.get("id", "")
                 text = val.get("text", "")
-                if not (comment_id and text):
+                if not comment_id:
                     continue
                 from_info = val.get("from", {})
                 sender = from_info.get("username", from_info.get("id", ""))
@@ -407,7 +463,14 @@ async def receive_instagram(
                         continue
                 except Exception:
                     pass
-                await _record(
-                    db, connector, comment_id, text[:MAX_TEXT], sender,
-                    {**val, "media_id": val.get("media", {}).get("id", "")},
+                comment_payload = {**val, "media_id": val.get("media", {}).get("id", "")}
+                peer = resolve_peer(connector.type, comment_payload)
+                await record_inbound(
+                    db, connector,
+                    external_id=comment_id,
+                    text=text[:MAX_TEXT],
+                    sender=sender,
+                    payload=comment_payload,
+                    peer=peer,
+                    attachments=[],
                 )
