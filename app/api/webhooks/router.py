@@ -313,16 +313,41 @@ async def receive_instagram(
             except Exception:
                 continue
 
-        # Fallback for Meta test events (ig_user_id="0") or single-connector orgs
+        # Fallback for Meta test events (ig_user_id="0")
         if connector is None and ig_user_id == "0" and all_ig_connectors:
             connector = all_ig_connectors[0]
+
+        # Resolution fallback: Meta webhooks use the legacy Instagram Business Account ID in
+        # entry.id, while the Instagram Login API returns an app-scoped user ID.  When no
+        # connector matched directly, query the Instagram API with each connector's token —
+        # the API will translate the legacy ID back to the scoped ID, letting us find the
+        # right connector.  This only runs until ig_webhook_id is stored (i.e., once per
+        # connector, on their very first real webhook).
+        if connector is None and ig_user_id != "0":
+            for c in all_ig_connectors:
+                try:
+                    cfg = _dj(c.config)
+                    token = cfg.get("access_token", "")
+                    if not token:
+                        continue
+                    async with httpx.AsyncClient(timeout=5) as _client:
+                        _r = await _client.get(
+                            f"https://graph.instagram.com/v20.0/{ig_user_id}",
+                            params={"fields": "id", "access_token": token},
+                        )
+                    resolved_id = _r.json().get("id", "")
+                    if resolved_id and resolved_id == cfg.get("ig_user_id"):
+                        connector = c
+                        matched_config = cfg
+                        break
+                except Exception:
+                    continue
 
         if connector is None:
             log.warning("instagram webhook: no connector for entry.id=%s", ig_user_id)
             continue
 
-        # Self-heal: store ig_webhook_id the first time we see the legacy entry.id so future
-        # lookups skip the full scan and match directly.
+        # Self-heal: store ig_webhook_id so future lookups skip the resolution scan entirely.
         if ig_user_id != "0" and matched_config is not None and matched_config.get("ig_webhook_id") != ig_user_id:
             try:
                 matched_config["ig_webhook_id"] = ig_user_id
