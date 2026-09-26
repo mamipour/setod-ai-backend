@@ -93,6 +93,20 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             return f"[simulated] Would send WhatsApp to +{to}: {message[:200]}"
         try:
             await send_text(phone_id, token, to, message)
+            # Record outbound into the conversation thread
+            if ctx.conversation_id:
+                from app.core.conversations import record_outbound
+                from app.db.models import MessageAuthor
+                await record_outbound(
+                    ctx.db,
+                    connector=ctx.connector,
+                    conversation_id=ctx.conversation_id,
+                    peer_id=to,
+                    text=message,
+                    session_id=ctx.session_id,
+                    author=MessageAuthor.agent,
+                    dry_run=False,
+                )
             return f"WhatsApp message sent to +{to}."
         except IntegrationError as exc:
             return f"Error: {exc}"
@@ -105,7 +119,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         rows = await db.exec(
             select(InboundEvent)
             .where(InboundEvent.connector_id == ctx.connector.id)
-            .order_by(InboundEvent.created_at.desc())
+            .order_by(InboundEvent.received_at.desc())
             .limit(limit)
         )
         events = rows.all()
@@ -114,7 +128,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         lines = []
         for e in reversed(events):
             ctx.mark_seen(str(ctx.connector.id), e.external_id)
-            lines.append(f"[{e.created_at.strftime('%Y-%m-%d %H:%M')}] {e.sender}: {e.text}")
+            lines.append(f"[{e.received_at.strftime('%Y-%m-%d %H:%M')}] {e.sender}: {e.text}")
         return "\n".join(lines)
 
     def n(base: str) -> str:

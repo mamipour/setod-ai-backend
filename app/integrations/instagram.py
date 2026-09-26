@@ -240,6 +240,19 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             return f"[simulated] Would reply to comment {comment_id}: {message[:100]}"
         try:
             await _post(token, f"{comment_id}/replies", {"message": message})
+            if ctx.conversation_id:
+                from app.core.conversations import record_outbound
+                from app.db.models import MessageAuthor
+                await record_outbound(
+                    ctx.db,
+                    connector=ctx.connector,
+                    conversation_id=ctx.conversation_id,
+                    peer_id=comment_id,
+                    text=message,
+                    session_id=ctx.session_id,
+                    author=MessageAuthor.agent,
+                    dry_run=False,
+                )
             return f"Reply posted on comment {comment_id}."
         except IntegrationError as exc:
             return f"Error: {exc}"
@@ -283,7 +296,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         rows = await db.exec(
             select(InboundEvent)
             .where(InboundEvent.connector_id == ctx.connector.id)
-            .order_by(InboundEvent.created_at.desc())
+            .order_by(InboundEvent.received_at.desc())
             .limit(limit)
         )
         events = rows.all()
@@ -293,7 +306,7 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         for e in reversed(events):
             ctx.note_seen(e.external_id)
             lines.append(
-                f"[{e.created_at.strftime('%Y-%m-%d %H:%M')}] sender_id={e.sender}: {e.text}"
+                f"[{e.received_at.strftime('%Y-%m-%d %H:%M')}] sender_id={e.sender}: {e.text}"
             )
         return "\n".join(lines)
 
@@ -312,6 +325,19 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
                 f"{ig_user_id}/messages",
                 {"recipient": {"id": sender_id}, "message": {"text": message}},
             )
+            if ctx.conversation_id:
+                from app.core.conversations import record_outbound
+                from app.db.models import MessageAuthor
+                await record_outbound(
+                    ctx.db,
+                    connector=ctx.connector,
+                    conversation_id=ctx.conversation_id,
+                    peer_id=sender_id,
+                    text=message,
+                    session_id=ctx.session_id,
+                    author=MessageAuthor.agent,
+                    dry_run=False,
+                )
             return f"Message sent to {sender_id}."
         except IntegrationError as exc:
             return f"Error: {exc}"

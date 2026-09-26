@@ -61,6 +61,19 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         if dry_run:
             return f"Would have texted {to}: {body[:320]}"
         result = await send_sms(sid, token, from_number, to, body)
+        if ctx.conversation_id:
+            from app.core.conversations import record_outbound
+            from app.db.models import MessageAuthor
+            await record_outbound(
+                ctx.db,
+                connector=ctx.connector,
+                conversation_id=ctx.conversation_id,
+                peer_id=to,
+                text=body,
+                session_id=ctx.session_id,
+                author=MessageAuthor.agent,
+                dry_run=False,
+            )
         return f"SMS sent to {to} (sid {result.get('sid')})."
 
     return [
