@@ -335,6 +335,9 @@ async def receive_instagram(
         # ── DMs (real format: entry.messaging[]) ──────────────────────────────
         for msg_event in entry.get("messaging", []):
             msg = msg_event.get("message", {})
+            if msg.get("is_echo"):
+                # Echo events are copies of messages the business sent — not inbound.
+                continue
             text = msg.get("text", "")
             if not text:
                 continue
@@ -350,6 +353,8 @@ async def receive_instagram(
             if field == "messages":
                 # Test webhook format + some live DM formats use changes[field=messages]
                 msg = val.get("message", {})
+                if msg.get("is_echo"):
+                    continue
                 text = msg.get("text", "")
                 if not text:
                     continue
