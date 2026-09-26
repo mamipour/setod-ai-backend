@@ -337,15 +337,85 @@ def _failure_marker(kind: MessageKind) -> str:
     return f"[{labels.get(kind, kind.value)} — please describe in text]"
 
 
+# ── policy helpers ─────────────────────────────────────────────────────────────
+
+_DEFAULT_MEDIA_POLICY = {
+    "audio": "skip",
+    "image": "skip",
+    "video": "skip",
+    "document": "auto",
+}
+
+
+async def _effective_media_policy(db: AsyncSession, connector_id: UUID) -> dict[str, str]:
+    """Return the merged media policy across all agents listening to this connector.
+
+    Rule: if ANY listening agent has ``"auto"`` for a kind, that kind is processed.
+    Rationale: it is safer to process than to silently drop when at least one agent
+    needs the content.  Agents that want ``"skip"`` simply will not receive media-only
+    messages (the transcript marker is there instead of processed text).
+    """
+    from app.db.models import Agent, AgentTrigger, DEFAULT_AGENT_SETTINGS, TriggerType
+
+    trigger_rows = await db.exec(
+        select(AgentTrigger)
+        .where(
+            AgentTrigger.type == TriggerType.channel,
+            AgentTrigger.enabled.is_(True),
+            AgentTrigger.config["connector_id"].astext == str(connector_id),
+        )
+    )
+    triggers = trigger_rows.all()
+
+    # Start with all-skip; promote a kind to "auto" if any agent requests it.
+    merged: dict[str, str] = dict(_DEFAULT_MEDIA_POLICY)
+
+    for trigger in triggers:
+        agent = await db.get(Agent, trigger.agent_id)
+        if agent is None:
+            continue
+        agent_settings = {**DEFAULT_AGENT_SETTINGS, **(agent.settings or {})}
+        agent_policy: dict[str, str] = agent_settings.get("media_policy", _DEFAULT_MEDIA_POLICY)
+        for kind, value in agent_policy.items():
+            if value == "auto":
+                merged[kind] = "auto"
+
+    return merged
+
+
+def _skip_marker(att: dict) -> dict:
+    """Mark an attachment as skipped (policy=skip). Shows a neutral marker in transcript."""
+    kind = att.get("kind", "other")
+    labels = {
+        "audio": "🎙 voice note — audio processing disabled for this agent",
+        "image": "🖼 image — image processing disabled for this agent",
+        "video": "🎬 video — video processing disabled for this agent",
+        "document": "📄 document — document processing disabled for this agent",
+    }
+    result = dict(att)
+    result["text"] = f"[{labels.get(kind, kind)} — enable in agent Settings → Media]"
+    result["status"] = "unavailable"
+    return result
+
+
 # ── process_pending_media ──────────────────────────────────────────────────────
 
 async def process_pending_media(db: AsyncSession, *, batch: int = PROCESS_BATCH) -> int:
     """Process pending attachments from ConversationMessage rows.
 
-    Returns the number of attachments processed.
+    Returns the number of attachments processed (or skipped via policy).
     Called once per worker tick before claim_inbound.
     Hard-capped at PROCESS_TIMEOUT seconds total.
+
+    Policy (per-agent setting ``media_policy``):
+    - ``"auto"``  → fetch + transcribe/describe/extract
+    - ``"skip"``  → mark unavailable with a neutral marker; no API call, no cost
+
+    The default for all kinds except ``document`` is ``"skip"``.
     """
+    from app.core.crypto import decrypt_json
+    from app.db.models import Conversation
+
     # Find messages with at least one pending attachment
     rows = await db.exec(
         select(ConversationMessage)
@@ -364,10 +434,6 @@ async def process_pending_media(db: AsyncSession, *, batch: int = PROCESS_BATCH)
             log.warning("process_pending_media: time cap reached, deferring remaining")
             break
 
-        # Load the connector for this conversation's channel
-        from app.db.models import Conversation
-        from app.core.crypto import decrypt_json
-
         conv = await db.get(Conversation, msg.conversation_id)
         if conv is None:
             continue
@@ -376,17 +442,17 @@ async def process_pending_media(db: AsyncSession, *, batch: int = PROCESS_BATCH)
         if connector is None:
             continue
 
-        # Look up org's OpenAI key
+        # Determine effective policy from all agents listening to this connector
+        policy = await _effective_media_policy(db, conv.connector_id)
+
+        # Look up org's OpenAI key (only needed for auto-kinds)
         org = await db.get(Organization, msg.org_id)
         openai_key: str | None = None
-        if org is not None:
-            # Try to find an openai connector for this org
-            from sqlmodel import select as _select
-            from app.db.models import Connector as _Conn, ConnectorType as _CT
+        if org is not None and any(v == "auto" for v in policy.values()):
             openai_rows = await db.exec(
-                _select(_Conn).where(
-                    _Conn.org_id == org.id,
-                    _Conn.type == _CT.openai,
+                select(Connector).where(
+                    Connector.org_id == org.id,
+                    Connector.type == ConnectorType.openai,
                 )
             )
             oc = openai_rows.first()
@@ -408,6 +474,16 @@ async def process_pending_media(db: AsyncSession, *, batch: int = PROCESS_BATCH)
             if att.get("status") != "pending":
                 updated_attachments.append(att)
                 continue
+
+            kind_str = att.get("kind", "other")
+            kind_policy = policy.get(kind_str, "skip")
+
+            if kind_policy == "skip":
+                # Mark immediately — no fetch, no API call, no cost
+                updated_attachments.append(_skip_marker(att))
+                processed += 1
+                continue
+
             try:
                 updated = await process_attachment(
                     att,
@@ -425,9 +501,7 @@ async def process_pending_media(db: AsyncSession, *, batch: int = PROCESS_BATCH)
                 att_copy = dict(att)
                 att_copy["status"] = "failed"
                 att_copy["error"] = str(exc)
-                att_copy["text"] = _failure_marker(
-                    MessageKind(att.get("kind", "other"))
-                )
+                att_copy["text"] = _failure_marker(MessageKind(kind_str))
                 updated_attachments.append(att_copy)
                 processed += 1
 

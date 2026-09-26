@@ -196,6 +196,17 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     # processed" is the core need of nearly every scheduled agent.
     "kv_memory": True,
     "daily_token_budget": 500_000,
+    # Media processing policy for inbound channel messages.
+    # "auto"  = process before the agent runs (Whisper / vision / extract)
+    # "skip"  = store the file, show a marker in the transcript, never call the API
+    # Default is skip for all kinds — cost is zero until explicitly opted in.
+    # Documents use knowledge.extract_text (no API call), so they default to auto.
+    "media_policy": {
+        "audio": "skip",
+        "image": "skip",
+        "video": "skip",
+        "document": "auto",
+    },
 }
 
 
