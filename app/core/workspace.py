@@ -43,3 +43,16 @@ def get_tavily_key(org: Organization | None) -> str | None:
     if org is None:
         return None
     return load_web_settings(org).get("tavily_api_key") or None
+
+
+DEFAULT_TIMEZONE = "UTC"
+
+
+def get_org_timezone(org: Organization | None) -> str:
+    """Return the org's preferred IANA timezone string (e.g. 'America/Toronto').
+
+    Falls back to UTC when unset so existing behaviour is unchanged.
+    """
+    if org is None:
+        return DEFAULT_TIMEZONE
+    return load_web_settings(org).get("timezone") or DEFAULT_TIMEZONE

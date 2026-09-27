@@ -16,7 +16,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.api.auth.dependencies import get_current_user, require_owner
 from app.core import notify as _notify
-from app.core.workspace import load_web_settings, load_notify_settings, save_web_settings, save_notify_settings
+from app.core.workspace import load_web_settings, load_notify_settings, save_web_settings, save_notify_settings, DEFAULT_TIMEZONE
 from app.db.models import Connector, ConnectorType, Invitation, MemberRole, Organization, OrganizationMember, User
 from app.db.session import get_session
 from app.integrations.websearch import TAVILY_SEARCH_URL
@@ -45,6 +45,50 @@ async def _get_org_as_member(
     if not org:
         raise HTTPException(status_code=404, detail="Organisation not found")
     return org
+
+
+# ── Timezone settings ─────────────────────────────────────────────────────────
+
+class TimezoneSettings(BaseModel):
+    timezone: str   # IANA timezone string, e.g. "America/Toronto"
+
+
+class TimezoneUpdate(BaseModel):
+    timezone: str
+
+
+@router.get("/{org_id}/timezone", response_model=TimezoneSettings)
+async def get_timezone(
+    org_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    org = await _get_org_as_member(session, current_user, org_id)
+    settings = load_web_settings(org)
+    return TimezoneSettings(timezone=settings.get("timezone") or DEFAULT_TIMEZONE)
+
+
+@router.patch("/{org_id}/timezone", response_model=TimezoneSettings)
+async def update_timezone(
+    org_id: str,
+    body: TimezoneUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    # Validate it's a real IANA timezone
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        ZoneInfo(body.timezone)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {body.timezone!r}")
+
+    org = await _get_org_as_member(session, current_user, org_id)
+    settings = load_web_settings(org)
+    settings["timezone"] = body.timezone
+    save_web_settings(org, settings)
+    session.add(org)
+    await session.commit()
+    return TimezoneSettings(timezone=body.timezone)
 
 
 # ── Web search settings ────────────────────────────────────────────────────────

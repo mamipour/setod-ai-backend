@@ -29,6 +29,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.crypto import decrypt_json
 from app.core import notify as _notify
+from app.core.workspace import get_org_timezone
 from app.core.llm.client import (
     LLMError,
     ToolCall,
@@ -246,10 +247,24 @@ async def run_agent(
     opening = user_input or SCHEDULED_KICKOFF
     messages: list[dict[str, Any]] = []
     messages.append(system_message(MASTER_PREAMBLE))
-    _now = datetime.now(UTC)
+    _now_utc = datetime.now(UTC)
+    from app.db.models import Organization as _Org
+    _org_for_tz = await db.get(_Org, agent.org_id)
+    _org_tz_name = get_org_timezone(_org_for_tz)
+    try:
+        from zoneinfo import ZoneInfo
+        _org_tz = ZoneInfo(_org_tz_name)
+        _now_local = _now_utc.astimezone(_org_tz)
+        _tz_label = _now_local.strftime("%Z")  # e.g. "EDT", "EST"
+        _date_str = _now_local.strftime(f"%A, %B %d, %Y at %I:%M %p {_tz_label} ({_org_tz_name})")
+    except Exception:
+        _now_local = _now_utc
+        _org_tz_name = "UTC"
+        _date_str = _now_utc.strftime("%A, %B %d, %Y at %H:%M UTC")
     messages.append(system_message(
-        f"Current date and time: {_now.strftime('%A, %B %d, %Y at %H:%M UTC')}. "
-        "Use this as 'today' whenever the instructions refer to dates, time windows, or deadlines."
+        f"Current date and time: {_date_str}. "
+        "Use this as 'today' whenever the instructions refer to dates, time windows, or deadlines. "
+        f"Always express times in your responses using {_org_tz_name} unless the user explicitly asks for a different timezone."
     ))
     if config.get("instructions"):
         messages.append(system_message(f"INSTRUCTIONS:\n{config['instructions']}"))
