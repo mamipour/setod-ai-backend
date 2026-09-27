@@ -255,8 +255,10 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
         if hours is not None:
             window_start = now
             window_end = now + timedelta(hours=hours)
-            date_from = window_start.strftime("%Y-%m-%dT%H:%M")
-            date_to = window_end.strftime("%Y-%m-%dT%H:%M")
+            # Include explicit UTC offset so _to_datetime does not re-interpret
+            # these as local (America/Toronto) time — that would shift by 4 h.
+            date_from = window_start.strftime("%Y-%m-%dT%H:%M+00:00")
+            date_to = window_end.strftime("%Y-%m-%dT%H:%M+00:00")
         else:
             today = now.date().isoformat()
             date_from = str(args.get("date_from") or today).strip()
