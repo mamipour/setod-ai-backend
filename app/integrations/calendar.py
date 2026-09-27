@@ -243,9 +243,24 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
     connector = ctx.connector
 
     async def list_upcoming(args: dict[str, Any], dry_run: bool) -> str:
-        today = datetime.now(UTC).date().isoformat()
-        date_from = str(args.get("date_from") or today).strip()
-        date_to = str(args.get("date_to") or date_from).strip()
+        now = datetime.now(UTC)
+        # Support hours_from_now for precise time-window queries (e.g. "next 2 hours").
+        # When provided, date_from/date_to are derived automatically.
+        hours = args.get("hours_from_now")
+        if hours is not None:
+            try:
+                hours = float(hours)
+            except (TypeError, ValueError):
+                hours = None
+        if hours is not None:
+            window_start = now
+            window_end = now + timedelta(hours=hours)
+            date_from = window_start.strftime("%Y-%m-%dT%H:%M")
+            date_to = window_end.strftime("%Y-%m-%dT%H:%M")
+        else:
+            today = now.date().isoformat()
+            date_from = str(args.get("date_from") or today).strip()
+            date_to = str(args.get("date_to") or date_from).strip()
         tz = str(args.get("timezone") or "").strip() or None
         limit = min(int(args.get("limit", 20)), 50)
         events = await list_events(connector, date_from, date_to, limit, tz)
@@ -287,15 +302,18 @@ def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
             ToolSpec(
                 ctx.tool_name("list_calendar_events"),
                 ctx.describe(
-                    "List events on the primary Google Calendar between two dates (YYYY-MM-DD). "
+                    "List events on the primary Google Calendar. "
+                    "Use hours_from_now for time-window queries (e.g. 2 for 'next 2 hours'). "
+                    "Or use date_from/date_to (YYYY-MM-DD or YYYY-MM-DDTHH:MM) for explicit ranges. "
                     "Defaults to today. Times use the calendar's timezone unless timezone is set "
                     "(e.g. America/Toronto, America/Vancouver)."
                 ),
                 {
                     "type": "object",
                     "properties": {
-                        "date_from": {"type": "string", "description": "Start date YYYY-MM-DD. Default today."},
-                        "date_to": {"type": "string", "description": "End date YYYY-MM-DD. Default date_from."},
+                        "hours_from_now": {"type": "number", "description": "Return only events starting within this many hours from now. Use instead of date_from/date_to for time-window queries."},
+                        "date_from": {"type": "string", "description": "Start date YYYY-MM-DD or YYYY-MM-DDTHH:MM. Default today."},
+                        "date_to": {"type": "string", "description": "End date YYYY-MM-DD or YYYY-MM-DDTHH:MM. Default date_from."},
                         "timezone": {"type": "string"},
                         "limit": {"type": "integer", "description": "Max events, default 20, cap 50."},
                     },
