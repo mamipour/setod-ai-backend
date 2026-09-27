@@ -246,6 +246,11 @@ async def run_agent(
     opening = user_input or SCHEDULED_KICKOFF
     messages: list[dict[str, Any]] = []
     messages.append(system_message(MASTER_PREAMBLE))
+    _now = datetime.now(UTC)
+    messages.append(system_message(
+        f"Current date and time: {_now.strftime('%A, %B %d, %Y at %H:%M UTC')}. "
+        "Use this as 'today' whenever the instructions refer to dates, time windows, or deadlines."
+    ))
     if config.get("instructions"):
         messages.append(system_message(f"INSTRUCTIONS:\n{config['instructions']}"))
 
