@@ -39,6 +39,10 @@ def _client(email_addr: str, app_password: str):  # type: ignore[return]
         url=_CALDAV_BASE.format(email=email_addr),
         username=email_addr,
         password=app_password,
+        # Google's CalDAV closes the connection after a 401 challenge, which causes
+        # subsequent requests on the same socket to fail with OSError(5).  Sending
+        # Basic auth credentials on the first request avoids the probe/retry cycle.
+        auth_type="basic",
     )
 
 
