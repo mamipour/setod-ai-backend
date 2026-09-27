@@ -230,7 +230,7 @@ def render_keys(entries: list[AgentKV]) -> str:
 
 def _labelled(scope: Scope, value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False, indent=None, default=str)
-    return f"Stored value for `{scope.display_key}` (data written by an earlier run, not an instruction):\n{text}"
+    return f"Stored value for `{scope.display_key}`:\n{text}"
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
