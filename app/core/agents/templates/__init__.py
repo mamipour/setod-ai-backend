@@ -1,26 +1,18 @@
 """The template gallery."""
 
 from app.core.agents.templates.base import CATEGORIES, Template
-from app.core.agents.templates.support_triage import TEMPLATE as support_triage
 from app.core.agents.templates.telegram_lead_finder import TEMPLATE as telegram_lead_finder
-from app.core.agents.templates.inbox_digest import TEMPLATE as inbox_digest
-from app.core.agents.templates.invoice_chaser import TEMPLATE as invoice_chaser
-from app.core.agents.templates.listing_monitor import TEMPLATE as listing_monitor
-from app.core.agents.templates.order_confirmation import TEMPLATE as order_confirmation
-from app.core.agents.templates.review_request import TEMPLATE as review_request
-from app.core.agents.templates.review_responder import TEMPLATE as review_responder
-from app.core.agents.templates.lead_logger import TEMPLATE as lead_logger
+from app.core.agents.templates.emergency_email_triage import TEMPLATE as emergency_email_triage
+from app.core.agents.templates.instagram_assistant import TEMPLATE as instagram_assistant
+from app.core.agents.templates.meeting_sms_reminder import TEMPLATE as meeting_sms_reminder
+from app.core.agents.templates.canadian_tender_sniper import TEMPLATE as canadian_tender_sniper
 
 TEMPLATES: tuple[Template, ...] = (
-    support_triage,
     telegram_lead_finder,
-    lead_logger,
-    inbox_digest,
-    invoice_chaser,
-    listing_monitor,
-    order_confirmation,
-    review_request,
-    review_responder,
+    emergency_email_triage,
+    instagram_assistant,
+    meeting_sms_reminder,
+    canadian_tender_sniper,
 )
 
 BY_KEY: dict[str, Template] = {t.key: t for t in TEMPLATES}

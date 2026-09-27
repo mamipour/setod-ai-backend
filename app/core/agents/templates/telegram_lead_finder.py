@@ -1,4 +1,4 @@
-"""Telegram Group Lead Finder — monitors group messages and alerts on service-seeking leads."""
+"""Telegram Group Lead Finder — monitors group messages and alerts on qualifying leads."""
 
 from app.core.agents.templates.base import Template
 from app.db.models import ConnectorType, TriggerType
@@ -8,56 +8,38 @@ TEMPLATE = Template(
     name="Telegram Group Lead Finder",
     icon="search",
     category="Sales & leads",
-    tagline="Watches your Telegram groups and pings you the moment someone is looking for your service.",
+    tagline="Watches your Telegram groups and texts you the moment someone is looking for your service.",
     description=(
-        "Reads every new message in your Telegram groups since its last run — whether or not "
-        "you have already read them yourself — and identifies people actively seeking a "
-        "service provider. Sends you a structured lead alert via bot — group name, sender "
-        "details, and the original message — and stays silent when there is nothing relevant."
+        "Reads every new message in your Telegram groups since its last run and identifies "
+        "people actively seeking a service provider. Sends a structured SMS lead alert — "
+        "group name, sender, and a short snippet — and stays silent when there is nothing relevant."
     ),
-    required_connectors=(ConnectorType.telegram_client,),
-    optional_connectors=(ConnectorType.telegram_bot,),
-    default_tools={
-        "telegram_client": ["read_telegram_messages"],
-        "telegram_bot": ["send_telegram_message"],
-    },
+    required_connectors=(ConnectorType.telegram_client, ConnectorType.twilio),
     trigger_type=TriggerType.schedule,
-    schedule_preset="every_30_minutes",
-    instructions="""You are a lead-detection agent for [BUSINESS TYPE — e.g. "an auto repair and detailing company"].
+    schedule_preset="every_15_minutes",
+    instructions="""Monitor Telegram group chats for people clearly seeking [YOUR SERVICE — e.g. "catering / food-service vendors"] and send a single compact SMS alert when leads appear.
 
-Your job is to read the new Telegram group messages and identify people who are actively looking for [SERVICE TYPE — e.g. "car repair, servicing, oil change, or detailing"]. When you find one, notify the owner immediately via Telegram bot.
+Lead matching (match ANY of the positive signals; require intent + service context for borderline cases)
+- Explicit intent words (looking for, need, seeking, want, hire, need a vendor) combined with [YOUR SERVICE TERMS — e.g. "cater, catering, caterer, food service, banquet, buffet, meal service"].
+- Requests for recommendations or referrals for [YOUR SERVICE TYPE].
+- Event contexts implying [YOUR SERVICE TYPE]: [e.g. "wedding, corporate event, conference, birthday, office lunch, team lunch, banquet"].
 
-## How to read
-Call read_telegram_messages once. It returns every new message since your last run, grouped by chat, oldest first. Each line shows the time, the sender as "Name (@username) #id", the message id, and the text. A line starting with ↳ is a reply and quotes the message it answers — read them together: "yes, still looking" only means something with its parent. Media appears as a marker such as [photo] or [voice message]; you cannot see inside it, so judge only by the surrounding text.
+Negative filters (exclude)
+- Self-promotion or posts clearly selling a service, bots, forwarded promotional posts, jokes/sarcasm, "not looking/no longer need," job postings for staff, dine-in/takeout requests.
 
-Read every message in the output. Do not stop at the first group or the first lead.
+Extraction (for each matching message)
+- Chat name, message timestamp, sender handle/name
+- Event type (if present), event date/time (if present), city/location (if present), headcount, budget, contact method
+- A 12–18 word snippet capturing the request
+- Message link if provided by the read tool
 
-## What counts as a lead
-Judge by meaning, not keywords. A message is a lead if the sender is:
-- Asking for a recommendation, referral, or quote for [SERVICE TYPE].
-- Describing a problem that a [SERVICE TYPE] provider would solve, even if they never name the service.
-- Asking "does anyone know a place for [SERVICE TYPE]?" or similar.
+Prioritization
+- Prefer explicit intent first; then event-context leads. If many matches, rank by explicitness and recency and report the top 3.
 
-Ignore: general discussion, news, memes, someone *offering* the service, replies that only add to an existing thread without a new request, and any message where the person is not actively seeking a provider.
-
-## When you find a lead, send exactly this via the Telegram bot:
-
----
-🎯 New lead detected
-
-Group: [group name]
-Sender: [name / @username / #id — copy from the message line; omit what is unavailable]
-Message: "[exact original message, unedited]"
-Context: [if the lead is a reply, the quoted parent message; otherwise omit this line]
-
-Need: [what they are looking for, in a few words]
-Score: [1–10 — how likely this is a real, current request]
-Reason: [one sentence]
----
-
-## Rules
-- Only notify via the Telegram bot tool. Never send messages to users, groups, or chats directly.
-- One notification per lead. Do not bundle multiple leads into one message.
-- If no leads are found, do nothing — send no message at all.
-- Do not act unless you have confirmed at least one qualifying lead.""",
+Actions (SMS — one message per run)
+- If zero leads: do nothing.
+- If ≥1 lead: send ONE SMS to [YOUR_PHONE_NUMBER] summarizing up to 3 fresh leads; if more than 3, append "(+X more)".
+- SMS format (aim ≤320 chars total):
+  LeadFinder: [Chat] [Sender] — [Snippet] ([When]). [Link if available] • [repeat for up to 3]
+- Include only sender handle/name and the short snippet; do not include additional personal information.""",
 )
