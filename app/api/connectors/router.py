@@ -2195,16 +2195,9 @@ async def gbp_oauth_callback(
         return RedirectResponse(f"{frontend}/connectors?error=gbp_token")
 
     access_token = token_data.get("access_token", "")
-    try:
-        detail = await google_business_profile.test_connection(access_token)
-    except Exception:
-        detail = "Google Business Profile"
-
-    name = (
-        detail.replace("Connected — locations: ", "GBP · ")
-        if "locations:" in detail
-        else "Google Business Profile"
-    )
+    # Skip the API call here to avoid burning quota on every reconnect.
+    # The connector name is set generically; Test button does the live check.
+    name = "Google Business Profile"
     new_config = {
         "access_token": access_token,
         "refresh_token": token_data.get("refresh_token", ""),
