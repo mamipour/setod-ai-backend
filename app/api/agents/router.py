@@ -32,6 +32,52 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# ---------------------------------------------------------------------------
+# Token-level cost table (input_price, output_price) in USD per 1 million tokens.
+# Kept in sync with platform-ui/src/components/agents/shared.tsx MODEL_PRICING.
+# ---------------------------------------------------------------------------
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    # OpenAI
+    "gpt-5":            (10.00, 40.00),
+    "gpt-5-mini":       ( 0.25,  2.00),
+    "gpt-5.4":          ( 2.50, 10.00),
+    "gpt-5.4-mini":     ( 0.75,  4.50),
+    "gpt-4o":           ( 2.50, 10.00),
+    "gpt-4o-mini":      ( 0.15,  0.60),
+    "gpt-4-turbo":      (10.00, 30.00),
+    "gpt-4":            (30.00, 60.00),
+    "gpt-3.5-turbo":    ( 0.50,  1.50),
+    "o1":               (15.00, 60.00),
+    "o1-mini":          ( 3.00, 12.00),
+    "o3-mini":          ( 1.10,  4.40),
+    # Anthropic
+    "claude-opus-4-5":  (15.00, 75.00),
+    "claude-sonnet-4-5":( 3.00, 15.00),
+    "claude-haiku-3-5": ( 0.80,  4.00),
+    "claude-opus-4":    (15.00, 75.00),
+    "claude-sonnet-4":  ( 3.00, 15.00),
+    "claude-haiku-3":   ( 0.25,  1.25),
+}
+_DEFAULT_PRICE: tuple[float, float] = (0.75, 4.50)  # gpt-5.4-mini platform default
+
+
+def _price_for(model_slug: str) -> tuple[float, float]:
+    if not model_slug:
+        return _DEFAULT_PRICE
+    for key, price in _MODEL_PRICING.items():
+        if model_slug == key or model_slug.startswith(key):
+            return price
+    return _DEFAULT_PRICE
+
+
+def _compute_spend(rows: list[tuple[str, int, int]]) -> float:
+    """Sum spend in USD from a list of (model_slug, prompt_tokens, completion_tokens)."""
+    total = 0.0
+    for slug, prompt, completion in rows:
+        inp, out = _price_for(slug)
+        total += (prompt / 1_000_000) * inp + (completion / 1_000_000) * out
+    return round(total, 6)
 from typing import Annotated
 from uuid import UUID
 
@@ -396,6 +442,21 @@ async def workspace_overview(
     )
     tokens_today += copilot_today.one()
 
+    # Per-model spend for today (accurate pricing, not a single blended rate).
+    spend_today_rows = await session.exec(
+        select(
+            AgentSession.model_slug,
+            func.coalesce(func.sum(AgentSession.prompt_tokens), 0),
+            func.coalesce(func.sum(AgentSession.completion_tokens), 0),
+        )
+        .where(
+            AgentSession.org_id == org_id,
+            AgentSession.started_at >= midnight,
+        )
+        .group_by(AgentSession.model_slug)
+    )
+    spend_today = _compute_spend(list(spend_today_rows.all()))
+
     yesterday_midnight = midnight - timedelta(days=1)
     yesterday = await session.exec(
         select(
@@ -427,6 +488,22 @@ async def workspace_overview(
         )
     )
     tokens_yesterday += copilot_yesterday.one()
+
+    # Per-model spend for yesterday.
+    spend_yesterday_rows = await session.exec(
+        select(
+            AgentSession.model_slug,
+            func.coalesce(func.sum(AgentSession.prompt_tokens), 0),
+            func.coalesce(func.sum(AgentSession.completion_tokens), 0),
+        )
+        .where(
+            AgentSession.org_id == org_id,
+            AgentSession.started_at >= yesterday_midnight,
+            AgentSession.started_at < midnight,
+        )
+        .group_by(AgentSession.model_slug)
+    )
+    spend_yesterday = _compute_spend(list(spend_yesterday_rows.all()))
 
     # Last 7 days of activity for the dashboard chart, bucketed in the user's local timezone.
     # AT TIME ZONE converts the stored UTC timestamp to local time before truncating to day.
@@ -476,9 +553,11 @@ async def workspace_overview(
         "runs_today": runs_today,
         "failures_today": failures_today,
         "tokens_today": tokens_today,
+        "spend_today": spend_today,
         "runs_yesterday": runs_yesterday,
         "failures_yesterday": failures_yesterday,
         "tokens_yesterday": tokens_yesterday,
+        "spend_yesterday": spend_yesterday,
         "daily_runs": daily_runs,
         "recent_sessions": recent,
     }
