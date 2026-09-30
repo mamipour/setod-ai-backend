@@ -17,7 +17,22 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.api.auth.dependencies import get_current_user, require_owner
 from app.core import notify as _notify
 from app.core.workspace import load_web_settings, load_notify_settings, save_web_settings, save_notify_settings, DEFAULT_TIMEZONE
-from app.db.models import Connector, ConnectorType, Invitation, MemberRole, Organization, OrganizationMember, User
+from app.db.models import (
+    Agent,
+    AgentLink,
+    AgentSession,
+    AgentTool,
+    AgentTrigger,
+    Connector,
+    ConnectorType,
+    Invitation,
+    MemberRole,
+    Organization,
+    OrganizationMember,
+    SessionStatus,
+    TriggerType,
+    User,
+)
 from app.db.session import get_session
 from app.integrations.websearch import TAVILY_SEARCH_URL
 
@@ -89,6 +104,222 @@ async def update_timezone(
     session.add(org)
     await session.commit()
     return TimezoneSettings(timezone=body.timezone)
+
+
+# ── Workspace graph (read-only map of agents, connectors, and links) ──────────
+#
+# One payload for the /map page: every agent and non-LLM connector as a node, and
+# three kinds of edges — connector→agent "uses" (from agent_tools), connector→agent
+# "trigger" (channel triggers), and agent→agent "calls" (agent_links). A 24h activity
+# layer is folded in so the UI can dim idle parts of the graph without extra calls.
+
+ACTIVITY_WINDOW_H = 24
+
+# LLM provider connectors are an agent's "brain", not a data source — drawing them would
+# connect every agent to one node and hide the real topology. Shown on the agent node instead.
+_MODEL_CONNECTOR_TYPES = [ConnectorType.openai, ConnectorType.anthropic]
+
+_PRESET_LABELS = {
+    "every_15_minutes": "every 15 min",
+    "every_30_minutes": "every 30 min",
+    "hourly": "hourly",
+    "every_weekday_9am": "weekdays 9am",
+    "daily_9am": "daily 9am",
+    "weekly_monday_9am": "Mondays 9am",
+}
+
+
+class GraphNode(BaseModel):
+    id: str
+    kind: str  # "agent" | "connector"
+    name: str
+    # agent
+    icon: str | None = None
+    status: str | None = None          # agent: draft/published/paused · connector: active/error/…
+    model: str | None = None
+    schedule: str | None = None        # human label, e.g. "every 15 min"
+    last_run_at: datetime | None = None
+    last_run_status: str | None = None
+    runs_24h: int = 0
+    running: bool = False
+    # connector
+    type: str | None = None
+
+
+class GraphEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    kind: str  # "uses" | "trigger" | "calls"
+    label: str | None = None
+    active: bool = False  # fired within the activity window
+    count_24h: int = 0    # calls only
+
+
+class WorkspaceGraph(BaseModel):
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
+    generated_at: datetime
+    window_hours: int = ACTIVITY_WINDOW_H
+
+
+@router.get("/{org_id}/graph", response_model=WorkspaceGraph)
+async def workspace_graph(
+    org_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> WorkspaceGraph:
+    org = await _get_org_as_member(session, current_user, org_id)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(hours=ACTIVITY_WINDOW_H)
+
+    agents = (await session.exec(
+        select(Agent).where(Agent.org_id == org.id).order_by(Agent.created_at)
+    )).all()
+    agent_ids = [a.id for a in agents]
+
+    connectors = (await session.exec(
+        select(Connector)
+        .where(Connector.org_id == org.id, Connector.type.not_in(_MODEL_CONNECTOR_TYPES))  # type: ignore[attr-defined]
+        .order_by(Connector.created_at)
+    )).all()
+    connector_ids = {c.id for c in connectors}
+    connector_name = {c.id: c.name for c in connectors}
+
+    # Model connector names, for the agent card.
+    model_connectors = (await session.exec(
+        select(Connector).where(Connector.org_id == org.id, Connector.type.in_(_MODEL_CONNECTOR_TYPES))  # type: ignore[attr-defined]
+    )).all()
+    model_connector_name = {c.id: c.name for c in model_connectors}
+
+    tools = (await session.exec(
+        select(AgentTool).where(AgentTool.agent_id.in_(agent_ids))  # type: ignore[attr-defined]
+    )).all() if agent_ids else []
+
+    triggers = (await session.exec(
+        select(AgentTrigger).where(AgentTrigger.agent_id.in_(agent_ids))  # type: ignore[attr-defined]
+    )).all() if agent_ids else []
+
+    links = (await session.exec(
+        select(AgentLink).where(AgentLink.agent_id.in_(agent_ids))  # type: ignore[attr-defined]
+    )).all() if agent_ids else []
+
+    # ── Activity: recent sessions, newest first ─────────────────────────────
+    recent = (await session.exec(
+        select(AgentSession)
+        .where(AgentSession.agent_id.in_(agent_ids), AgentSession.started_at >= cutoff)  # type: ignore[attr-defined]
+        .order_by(AgentSession.started_at.desc())  # type: ignore[attr-defined]
+    )).all() if agent_ids else []
+
+    runs_24h: dict[UUID, int] = {}
+    running: set[UUID] = set()
+    last_run: dict[UUID, AgentSession] = {}
+    session_agent: dict[UUID, UUID] = {}
+    for s in recent:
+        runs_24h[s.agent_id] = runs_24h.get(s.agent_id, 0) + 1
+        session_agent[s.id] = s.agent_id
+        if s.status == SessionStatus.running:
+            running.add(s.agent_id)
+        last_run.setdefault(s.agent_id, s)  # first seen = newest
+
+    # Agents with no run in the window still need a "last run" — one query for the rest.
+    stale_ids = [a.id for a in agents if a.id not in last_run]
+    if stale_ids:
+        from sqlalchemy import func as _f
+        latest_sq = (
+            select(AgentSession.agent_id, _f.max(AgentSession.started_at).label("m"))
+            .where(AgentSession.agent_id.in_(stale_ids))  # type: ignore[attr-defined]
+            .group_by(AgentSession.agent_id)
+            .subquery()
+        )
+        stale_rows = (await session.exec(
+            select(AgentSession).join(
+                latest_sq,
+                (AgentSession.agent_id == latest_sq.c.agent_id) & (AgentSession.started_at == latest_sq.c.m),
+            )
+        )).all()
+        for s in stale_rows:
+            last_run.setdefault(s.agent_id, s)
+
+    # Agent→agent call counts in the window: child sessions of trigger_type=agent whose
+    # parent session belongs to the caller. Parents outside the window need a lookup.
+    parent_ids = {s.triggered_by_session_id for s in recent
+                  if s.trigger_type == TriggerType.agent and s.triggered_by_session_id
+                  and s.triggered_by_session_id not in session_agent}
+    if parent_ids:
+        parents = (await session.exec(
+            select(AgentSession.id, AgentSession.agent_id).where(AgentSession.id.in_(parent_ids))  # type: ignore[attr-defined]
+        )).all()
+        for pid, aid in parents:
+            session_agent[pid] = aid
+    call_counts: dict[tuple[UUID, UUID], int] = {}
+    for s in recent:
+        if s.trigger_type == TriggerType.agent and s.triggered_by_session_id:
+            caller = session_agent.get(s.triggered_by_session_id)
+            if caller:
+                key = (caller, s.agent_id)
+                call_counts[key] = call_counts.get(key, 0) + 1
+
+    # ── Nodes ────────────────────────────────────────────────────────────────
+    schedule_by_agent: dict[UUID, str] = {}
+    for t in triggers:
+        if t.type == TriggerType.schedule and t.enabled:
+            preset = t.config.get("preset")
+            schedule_by_agent[t.agent_id] = _PRESET_LABELS.get(preset, t.config.get("cron") or preset or "scheduled")
+
+    nodes: list[GraphNode] = []
+    for a in agents:
+        lr = last_run.get(a.id)
+        model_label = a.model or None
+        if a.model_connector_id and a.model_connector_id in model_connector_name and not model_label:
+            model_label = model_connector_name[a.model_connector_id]
+        nodes.append(GraphNode(
+            id=str(a.id), kind="agent", name=a.name, icon=a.icon, status=a.status.value,
+            model=model_label, schedule=schedule_by_agent.get(a.id),
+            last_run_at=lr.started_at if lr else None,
+            last_run_status=lr.status.value if lr else None,
+            runs_24h=runs_24h.get(a.id, 0), running=a.id in running,
+        ))
+    for c in connectors:
+        nodes.append(GraphNode(
+            id=str(c.id), kind="connector", name=c.name, type=c.type.value, status=c.status.value,
+        ))
+
+    # ── Edges ────────────────────────────────────────────────────────────────
+    edges: list[GraphEdge] = []
+    for t in tools:
+        if t.connector_id not in connector_ids:
+            continue  # LLM connector or dangling
+        edges.append(GraphEdge(
+            id=f"uses:{t.connector_id}:{t.agent_id}",
+            source=str(t.connector_id), target=str(t.agent_id), kind="uses",
+            active=runs_24h.get(t.agent_id, 0) > 0,
+        ))
+    for t in triggers:
+        if t.type != TriggerType.channel or not t.enabled:
+            continue
+        cid = t.config.get("connector_id")
+        try:
+            cuuid = UUID(str(cid))
+        except (ValueError, TypeError):
+            continue
+        if cuuid not in connector_ids:
+            continue
+        edges.append(GraphEdge(
+            id=f"trigger:{cuuid}:{t.agent_id}",
+            source=str(cuuid), target=str(t.agent_id), kind="trigger",
+            label=f"triggers · {connector_name.get(cuuid, '')}".strip(" ·"),
+            active=runs_24h.get(t.agent_id, 0) > 0,
+        ))
+    for l in links:
+        n = call_counts.get((l.agent_id, l.target_agent_id), 0)
+        edges.append(GraphEdge(
+            id=f"calls:{l.agent_id}:{l.target_agent_id}",
+            source=str(l.agent_id), target=str(l.target_agent_id), kind="calls",
+            label=l.description, active=n > 0, count_24h=n,
+        ))
+
+    return WorkspaceGraph(nodes=nodes, edges=edges, generated_at=now)
 
 
 # ── Web search settings ────────────────────────────────────────────────────────
