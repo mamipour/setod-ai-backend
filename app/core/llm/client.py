@@ -318,7 +318,7 @@ LLMClient = OpenAIClient | AnthropicClient
 # claude-haiku-4-5-20251001) get retired, so we use their "latest" aliases which
 # Anthropic keeps pointing at the current supported version.
 DEFAULT_MODELS = {
-    "openai": "gpt-4o-mini",
+    "openai": "gpt-5.4-mini",
     "anthropic": "claude-haiku-4-5",
 }
 
