@@ -237,7 +237,7 @@ async def claim_inbound(
     ready_bundles: list[tuple[UUID | None, list[UUID]]] = []
 
     for conversation_id, events in by_conversation.items():
-        if len(by_conversation) >= limit:
+        if len(ready_bundles) >= limit:
             break  # claimed enough
 
         oldest = min(ev.received_at for ev in events)
