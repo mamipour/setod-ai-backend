@@ -62,7 +62,6 @@ from app.integrations import (
     hubspot,
     instagram,
     mcp,
-    notion,
     pipedrive,
     sheets,
     shopify,
@@ -317,13 +316,6 @@ async def test_connector(
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
 
-    if connector.type == ConnectorType.notion:
-        try:
-            config = decrypt_json(connector.config)
-            detail = await notion.test_connection(config["api_token"])
-            return TestResult(ok=True, detail=detail)
-        except notion.IntegrationError as exc:
-            return TestResult(ok=False, detail=str(exc))
         except Exception as exc:
             return TestResult(ok=False, detail=str(exc))
 
@@ -715,7 +707,7 @@ async def update_connector_credentials(
 
     # ── Single-token connectors ───────────────────────────────────────────────
     elif ct in (
-        ConnectorType.hubspot, ConnectorType.pipedrive, ConnectorType.notion,
+        ConnectorType.hubspot, ConnectorType.pipedrive,
         ConnectorType.airtable, ConnectorType.calendly,
     ):
         api_token = (body.api_token or "").strip()
@@ -726,8 +718,6 @@ async def update_connector_credentials(
                 await hubspot.test_connection(api_token)
             elif ct == ConnectorType.pipedrive:
                 await pipedrive.test_connection(api_token)
-            elif ct == ConnectorType.notion:
-                await notion.test_connection(api_token)
             elif ct == ConnectorType.airtable:
                 await airtable.test_connection(api_token)
             elif ct == ConnectorType.calendly:
@@ -1964,49 +1954,6 @@ async def create_pipedrive_connector(
     return connector
 
 
-# ── Notion ────────────────────────────────────────────────────────────────────
-
-class NotionCreate(BaseModel):
-    org_id: UUID
-    name: str = ""
-    api_token: str
-
-
-@router.post("/notion/validate", response_model=TestResult)
-async def validate_notion(body: NotionCreate):
-    try:
-        detail = await notion.test_connection(body.api_token.strip())
-        return TestResult(ok=True, detail=detail)
-    except notion.IntegrationError as exc:
-        return TestResult(ok=False, detail=str(exc))
-    except Exception as exc:
-        return TestResult(ok=False, detail=str(exc))
-
-
-@router.post("/notion", response_model=ConnectorOut, status_code=201)
-async def create_notion_connector(
-    body: NotionCreate,
-    current_user: Annotated[User, Depends(get_current_user)],
-    session: Annotated[AsyncSession, Depends(get_session)],
-):
-    await assert_org_owner(session, current_user, body.org_id)
-    try:
-        await notion.test_connection(body.api_token.strip())
-    except notion.IntegrationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    connector = Connector(
-        org_id=body.org_id,
-        created_by=current_user.id,
-        name=body.name or "Notion",
-        type=ConnectorType.notion,
-        status=ConnectorStatus.active,
-        config=encrypt_json({"api_token": body.api_token.strip()}),
-    )
-    session.add(connector)
-    await session.commit()
-    await session.refresh(connector)
-    return connector
 
 
 # ── Airtable ──────────────────────────────────────────────────────────────────
