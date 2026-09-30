@@ -56,7 +56,7 @@ BUILDERS = {
     ConnectorType.twilio: twilio.build_tools,
     ConnectorType.mcp: mcp.build_tools,
     ConnectorType.slack_webhook: slack.build_tools,
-    ConnectorType.google_sheets: sheets.build_tools,
+    # ConnectorType.google_sheets: sheets.build_tools,  # disabled — use Airtable
     ConnectorType.whatsapp: whatsapp.build_tools,
     ConnectorType.instagram: instagram.build_tools,
     ConnectorType.hubspot: hubspot.build_tools,

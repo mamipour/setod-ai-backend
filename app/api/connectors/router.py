@@ -667,25 +667,25 @@ async def update_connector_credentials(
             "phone_number": num, "friendly_name": result.friendly_name,
         })
 
-    # ── Google Sheets ─────────────────────────────────────────────────────────
-    elif ct == ConnectorType.google_sheets:
-        sa_json_str = (body.sa_json or "").strip()
-        if not sa_json_str:
-            raise HTTPException(status_code=422, detail="sa_json is required")
-        try:
-            sa_dict = json.loads(sa_json_str)
-            svc_email = await sheets.validate(sa_json_str)
-        except sheets.IntegrationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
-        connector.config = encrypt_json({
-            "sa_json": sa_dict,
-            "service_account_email": svc_email,
-            "default_spreadsheet_id": (body.default_spreadsheet_id or "").strip()
-                                       or old_cfg.get("default_spreadsheet_id", ""),
-        })
-        connector.name = f"Sheets · {svc_email}"
+    # ── Google Sheets (disabled — use Airtable instead) ───────────────────────
+    # elif ct == ConnectorType.google_sheets:
+    #     sa_json_str = (body.sa_json or "").strip()
+    #     if not sa_json_str:
+    #         raise HTTPException(status_code=422, detail="sa_json is required")
+    #     try:
+    #         sa_dict = json.loads(sa_json_str)
+    #         svc_email = await sheets.validate(sa_json_str)
+    #     except sheets.IntegrationError as exc:
+    #         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    #     except Exception as exc:
+    #         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    #     connector.config = encrypt_json({
+    #         "sa_json": sa_dict,
+    #         "service_account_email": svc_email,
+    #         "default_spreadsheet_id": (body.default_spreadsheet_id or "").strip()
+    #                                    or old_cfg.get("default_spreadsheet_id", ""),
+    #     })
+    #     connector.name = f"Sheets · {svc_email}"
 
     # ── WhatsApp ──────────────────────────────────────────────────────────────
     elif ct == ConnectorType.whatsapp:
@@ -1670,53 +1670,52 @@ async def create_slack_webhook(
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
-class SheetsCreate(BaseModel):
-    org_id: UUID
-    name: str = ""
-    sa_json: str  # service-account JSON string
-    default_spreadsheet_id: str = ""
-
-
-@router.post("/sheets/validate", response_model=TestResult)
-async def validate_sheets(body: SheetsCreate):
-    try:
-        email = await sheets.validate(body.sa_json)
-        return TestResult(ok=True, detail=f"Valid — share your spreadsheets with {email}")
-    except sheets.IntegrationError as exc:
-        return TestResult(ok=False, detail=str(exc))
-
-
-@router.post("/sheets", response_model=ConnectorOut, status_code=201)
-async def create_sheets_connector(
-    body: SheetsCreate,
-    current_user: Annotated[User, Depends(get_current_user)],
-    session: Annotated[AsyncSession, Depends(get_session)],
-):
-    await assert_org_owner(session, current_user, body.org_id)
-    try:
-        sa_dict = json.loads(body.sa_json)
-        email = await sheets.validate(body.sa_json)
-    except sheets.IntegrationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
-
-    connector = Connector(
-        org_id=body.org_id,
-        created_by=current_user.id,
-        name=body.name or f"Sheets · {email}",
-        type=ConnectorType.google_sheets,
-        status=ConnectorStatus.active,
-        config=encrypt_json({
-            "sa_json": sa_dict,
-            "service_account_email": email,
-            "default_spreadsheet_id": body.default_spreadsheet_id,
-        }),
-    )
-    session.add(connector)
-    await session.commit()
-    await session.refresh(connector)
-    return connector
+# ── Google Sheets (disabled — use Airtable instead) ───────────────────────────
+# class SheetsCreate(BaseModel):
+#     org_id: UUID
+#     name: str = ""
+#     sa_json: str  # service-account JSON string
+#     default_spreadsheet_id: str = ""
+#
+# @router.post("/sheets/validate", response_model=TestResult)
+# async def validate_sheets(body: SheetsCreate):
+#     try:
+#         email = await sheets.validate(body.sa_json)
+#         return TestResult(ok=True, detail=f"Valid — share your spreadsheets with {email}")
+#     except sheets.IntegrationError as exc:
+#         return TestResult(ok=False, detail=str(exc))
+#
+# @router.post("/sheets", response_model=ConnectorOut, status_code=201)
+# async def create_sheets_connector(
+#     body: SheetsCreate,
+#     current_user: Annotated[User, Depends(get_current_user)],
+#     session: Annotated[AsyncSession, Depends(get_session)],
+# ):
+#     await assert_org_owner(session, current_user, body.org_id)
+#     try:
+#         sa_dict = json.loads(body.sa_json)
+#         email = await sheets.validate(body.sa_json)
+#     except sheets.IntegrationError as exc:
+#         raise HTTPException(status_code=422, detail=str(exc)) from exc
+#     except Exception as exc:
+#         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+#
+#     connector = Connector(
+#         org_id=body.org_id,
+#         created_by=current_user.id,
+#         name=body.name or f"Sheets · {email}",
+#         type=ConnectorType.google_sheets,
+#         status=ConnectorStatus.active,
+#         config=encrypt_json({
+#             "sa_json": sa_dict,
+#             "service_account_email": email,
+#             "default_spreadsheet_id": body.default_spreadsheet_id,
+#         }),
+#     )
+#     session.add(connector)
+#     await session.commit()
+#     await session.refresh(connector)
+#     return connector
 
 
 # ── WhatsApp Business ─────────────────────────────────────────────────────────
