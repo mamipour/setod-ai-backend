@@ -33,11 +33,14 @@ reading a long listing knows it saw part of the page rather than assuming it saw
 
 import asyncio
 import html
+import os
 import random
 import re
+import tempfile
 import time
 from typing import Any
 from urllib.parse import urljoin
+from uuid import uuid4
 
 import httpx
 from lxml import etree
@@ -98,6 +101,115 @@ _ANCHOR = re.compile(
 )
 _TAG = re.compile(r"<[^>]+>")
 _BLANK_LINES = re.compile(r"\n{3,}")
+
+# ── fetch_and_query_csv ────────────────────────────────────────────────────────
+# A larger byte cap than fetch_page: we hand the bytes to DuckDB, not to the model,
+# so pulling 10 MB is fine — the model only ever sees filtered rows.
+CSV_MAX_BYTES = 10 * 1024 * 1024
+CSV_DOWNLOAD_TIMEOUT = 60  # seconds — larger files from open-data endpoints can be slow
+CSV_TABLE_NAME = "tbl"     # stable name the model always uses in its SQL
+
+
+def _csv_schema_text(draft: Any) -> str:
+    """Format schema + first-row sample for the model so it can write SQL next."""
+    lines = [
+        f"Table name: `{CSV_TABLE_NAME}`  ({draft.row_count:,} rows)",
+        "Columns (snake_case; original CSV header shown as [was: …] when different):",
+    ]
+    for col in draft.columns:
+        note = f"  [was: {col['original']}]" if col["original"] != col["name"] else ""
+        lines.append(f"  {col['name']}  ({col['type']}){note}")
+    if draft.sample:
+        lines.append("\nFirst data row:")
+        for col, val in zip(draft.columns, draft.sample[0]):
+            if val:
+                lines.append(f"  {col['name']}: {val[:120]!r}")
+
+    from app.core.tabular import MAX_RESULT_ROWS
+
+    lines.append(
+        f"\nCall this tool again with the same `url` and a `sql` argument to query.\n"
+        f"DuckDB dialect — dates stored as VARCHAR need TRY_CAST(col AS DATE) or strptime().\n"
+        f"Results are capped at {MAX_RESULT_ROWS} rows — use WHERE / GROUP BY / LIMIT."
+    )
+    return "\n".join(lines)
+
+
+async def _download_csv_bytes(url: str) -> bytes:
+    """Stream a remote CSV up to CSV_MAX_BYTES. Raises ValueError with a readable message."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=CSV_DOWNLOAD_TIMEOUT, follow_redirects=True
+        ) as client:
+            async with client.stream("GET", url, headers=HEADERS) as resp:
+                resp.raise_for_status()
+                ctype = resp.headers.get("content-type", "").lower()
+                if any(t in ctype for t in _BINARY_TYPES):
+                    raise ValueError(
+                        f"URL returned content-type '{ctype}', which is not a readable data file."
+                    )
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in resp.aiter_bytes():
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= CSV_MAX_BYTES:
+                        raise ValueError(
+                            f"File exceeds the {CSV_MAX_BYTES // (1024 * 1024)} MB download limit. "
+                            "Use a more specific URL (a filtered endpoint or a smaller file)."
+                        )
+        return b"".join(chunks)
+    except httpx.HTTPStatusError as exc:
+        raise ValueError(
+            f"Server returned {exc.response.status_code} for that URL."
+        ) from exc
+    except httpx.RequestError as exc:
+        raise ValueError(f"Could not reach URL: {exc}") from exc
+
+
+def _build_fetch_and_query_csv_handler():
+    async def handler(args: dict[str, Any], dry_run: bool) -> str:
+        from app.core import tabular
+
+        url = str(args.get("url", "")).strip()
+        if not url or not url.startswith(("http://", "https://")):
+            return "Error: url must start with http:// or https://"
+
+        sql = (args.get("sql") or "").strip() or None
+
+        # 1. Download the CSV.
+        try:
+            data = await _download_csv_bytes(url)
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+        # 2. Parse into DuckDB and produce a Parquet snapshot in memory.
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                csv_path = os.path.join(tmp, "data.csv")
+                with open(csv_path, "wb") as fh:
+                    fh.write(data)
+                try:
+                    draft = tabular._draft_from_csv_path(
+                        csv_path, name=CSV_TABLE_NAME, sheet=None
+                    )
+                except tabular.TabularError as exc:
+                    return f"Error parsing CSV: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"Unexpected error preparing CSV: {exc}"
+
+        # 3. Schema-only call: give the model column names so it can write SQL.
+        if not sql:
+            return _csv_schema_text(draft)
+
+        # 4. Query call: write parquet to the cache dir and run the SQL.
+        try:
+            cache_path = tabular._write_cache(uuid4(), draft.parquet)
+            return await tabular.query([(CSV_TABLE_NAME, cache_path)], sql)
+        except Exception as exc:  # noqa: BLE001
+            return f"Error running query: {exc}"
+
+    return handler
 
 
 def build_tools(
@@ -162,6 +274,45 @@ def build_tools(
                     },
                 ),
                 handler=_fetch_handler,
+            )
+        )
+
+        from app.core.tabular import MAX_RESULT_ROWS as _CSV_MAX_ROWS
+
+        tools.append(
+            RegisteredTool(
+                spec=ToolSpec(
+                    name="fetch_and_query_csv",
+                    description=(
+                        "Download a CSV file from a URL and either inspect its schema or "
+                        "run a SQL query against it using DuckDB — without loading the whole "
+                        "file into context. "
+                        "Call with `url` only (no `sql`) to get column names, types, and a "
+                        "sample row so you can write the right SQL. "
+                        "Then call again with `url` + `sql` to filter/aggregate. "
+                        "The table is always named `tbl`. "
+                        "Handles files up to 10 MB. "
+                        f"Results are capped at {_CSV_MAX_ROWS} rows."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "Full https:// URL of the CSV file.",
+                            },
+                            "sql": {
+                                "type": "string",
+                                "description": (
+                                    "One SELECT / SUMMARIZE / DESCRIBE statement against "
+                                    "table `tbl`. Omit on the first call to get the schema."
+                                ),
+                            },
+                        },
+                        "required": ["url"],
+                    },
+                ),
+                handler=_build_fetch_and_query_csv_handler(),
             )
         )
 
