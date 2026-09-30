@@ -16,6 +16,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.api.auth.dependencies import get_current_user, require_owner
 from app.core import notify as _notify
+from app.core.llm.client import DEFAULT_MODELS
 from app.core.workspace import load_web_settings, load_notify_settings, save_web_settings, save_notify_settings, DEFAULT_TIMEZONE
 from app.db.models import (
     Agent,
@@ -186,11 +187,14 @@ async def workspace_graph(
     connector_ids = {c.id for c in connectors}
     connector_name = {c.id: c.name for c in connectors}
 
-    # Model connector names, for the agent card.
+    # Agents with no explicit model run on the provider default; show that slug rather than
+    # the connector's display name so the card answers "which model is this on?".
     model_connectors = (await session.exec(
         select(Connector).where(Connector.org_id == org.id, Connector.type.in_(_MODEL_CONNECTOR_TYPES))  # type: ignore[attr-defined]
     )).all()
-    model_connector_name = {c.id: c.name for c in model_connectors}
+    model_connector_name = {
+        c.id: DEFAULT_MODELS.get(c.type.value, c.name) for c in model_connectors
+    }
 
     tools = (await session.exec(
         select(AgentTool).where(AgentTool.agent_id.in_(agent_ids))  # type: ignore[attr-defined]
