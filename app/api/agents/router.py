@@ -65,7 +65,8 @@ _DEFAULT_PRICE: tuple[float, float] = (0.75, 4.50)  # gpt-5.4-mini platform defa
 def _price_for(model_slug: str) -> tuple[float, float]:
     if not model_slug:
         return _DEFAULT_PRICE
-    for key, price in _MODEL_PRICING.items():
+    # Sort longest key first so "gpt-5.4-mini" beats "gpt-5" on prefix matches.
+    for key, price in sorted(_MODEL_PRICING.items(), key=lambda x: -len(x[0])):
         if model_slug == key or model_slug.startswith(key):
             return price
     return _DEFAULT_PRICE
