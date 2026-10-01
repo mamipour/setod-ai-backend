@@ -230,7 +230,8 @@ PRESETS: dict[str, dict] = {
 
 @router.get("/presets")
 async def list_presets():
-    return {"presets": list(PRESETS.keys()), "definitions": PRESETS}
+    # Returns a flat dict: { "leads": { name, description, columns, unique_on }, … }
+    return PRESETS
 
 
 @router.get("/presets/{key}")
