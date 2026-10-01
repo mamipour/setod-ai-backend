@@ -150,7 +150,8 @@ async def build_tools_for_agent(
                 continue
             built = builder(ctx)
 
-        if agent_tool.enabled_tools:
+        # None = every tool the connector offers; a list (even empty) is the exact allow-list.
+        if agent_tool.enabled_tools is not None:
             allowed = set(agent_tool.enabled_tools)
             built = [t for t in built if t.spec.name in allowed or _base_name(t.spec.name, alias) in allowed]
 

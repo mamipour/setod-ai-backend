@@ -253,7 +253,8 @@ class Agent(SQLModel, table=True):
 
 class AgentTool(SQLModel, table=True):
     """Binds a connector to an agent. The available tools derive from the connector's type;
-    `enabled_tools` narrows that set when null/empty means "all tools for this type"."""
+    `enabled_tools` narrows that set: null means "all tools for this type", a list is the
+    exact allow-list (an empty list means none — the default for the built-in tables connector)."""
 
     __tablename__ = "agent_tools"
     __table_args__ = (UniqueConstraint("agent_id", "connector_id", name="uq_agent_connector"),)

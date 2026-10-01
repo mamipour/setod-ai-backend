@@ -1249,7 +1249,7 @@ When the user shares run logs and asks why something went wrong:
 """
 
 
-# All tools each connector type can expose; used when enabled_tools is null/empty (= all on).
+# All tools each connector type can expose; used when enabled_tools is null (= all on).
 _ALL_CONNECTOR_TOOLS: dict[str, list[str]] = {
     "gmail": [
         "read_unread_emails",
@@ -1347,13 +1347,13 @@ async def _build_agent_context_block(session: AsyncSession, agent: Agent) -> str
     for at in tool_rows.all():
         connector = await session.get(Connector, at.connector_id)
         if connector:
-            # None or [] both mean "all tools enabled" (same convention as the agent runner)
+            # None means "all tools enabled"; a list is the exact allow-list (same as the runner)
             if connector.type == ConnectorType.mcp and connector.config:
                 frozen = decrypt_json(connector.config).get("tools") or []
                 catalog = [t.get("name") for t in frozen if t.get("name")]
             else:
                 catalog = _ALL_CONNECTOR_TOOLS.get(connector.type.value, [])
-            active = at.enabled_tools or catalog
+            active = at.enabled_tools if at.enabled_tools is not None else catalog
             tool_lines.append(f"  - {connector.name or connector.type.value} ({', '.join(active)})")
 
     skills_result = await session.exec(
@@ -2042,7 +2042,7 @@ async def _agent_tool_out(
         # list pre-fetched — same as the agent runner path in registry.build_tools_for_agent.
         from app.integrations.registry import _fetch_org_tables
         object.__setattr__(ctx, "_org_tables", await _fetch_org_tables(session, connector.org_id))
-    enabled = set(agent_tool.enabled_tools) if agent_tool.enabled_tools else None
+    enabled = set(agent_tool.enabled_tools) if agent_tool.enabled_tools is not None else None
     approval = set(agent_tool.approval_tools) if agent_tool.approval_tools else set()
     return AgentToolOut(
         id=agent_tool.id,
@@ -2118,6 +2118,10 @@ async def attach_agent_tool(
     agent_tool.alias = body.alias.strip()
     agent_tool.enabled_tools = body.enabled_tools
     agent_tool.approval_tools = body.approval_tools
+    # Built-in tables connector: first attach grants nothing. Table data is business-sensitive,
+    # so the owner opts each table in (read / write) explicitly rather than opting out.
+    if existing is None and connector.type == ConnectorType.tables and body.enabled_tools is None:
+        agent_tool.enabled_tools = []
     # First attach of an MCP server: gate write-like tools until the owner opts them on.
     if (
         existing is None
