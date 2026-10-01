@@ -251,6 +251,9 @@ async def list_tables(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> list[TableOut]:
     await _assert_member(db, current_user, org_id)
+    # Auto-provision the tables connector so it's always available even if
+    # someone accidentally removed it from the connectors page.
+    await svc.get_or_create_tables_connector(db, org_id, current_user.id)
     tables = await svc.list_tables(db, org_id)
     out = []
     for tbl in tables:
