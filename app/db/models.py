@@ -41,6 +41,7 @@ class ConnectorType(str, Enum):
     openai = "openai"
     anthropic = "anthropic"
     mcp = "mcp"
+    tables = "tables"  # built-in: org-level typed tables, auto-provisioned per org
 
 
 class ConnectorStatus(str, Enum):
@@ -1102,4 +1103,97 @@ class AgentScenario(SQLModel, table=True):
     # Last dry-run session id (None if never run)
     last_session_id: UUID | None = Field(default=None)
     last_ran_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    created_at: datetime = _ts()
+
+
+# ── Org Tables ────────────────────────────────────────────────────────────────
+# Agent-native business data layer.  One OrgTable == one typed spreadsheet-like
+# table owned by an organisation.  Rows are stored as JSONB and agents access
+# them through generated tools (leads_search, leads_create, …) exposed via the
+# built-in "tables" connector (ConnectorType.tables).
+
+
+class OrgTable(SQLModel, table=True):
+    """Schema definition for one org-level typed table.
+
+    `columns` is a list of column descriptors:
+      {
+        "key":  "contact",           # slug used as JSONB key and in tool args
+        "name": "Contact",           # display name shown in the grid
+        "type": "phone",             # one of COLUMN_TYPES
+        "options": ["new","done"],   # only for select
+        "link_table_id": "<uuid>",   # only for link columns
+        "required": false,
+        "hidden_from_agents": false  # strip from tool descriptions + DuckDB loads
+      }
+
+    `unique_on` is a list of column keys that together form a dedup key.  When
+    create_row finds a collision it returns the existing row id rather than
+    inserting a duplicate (idempotent create semantics).
+    """
+
+    __tablename__ = "org_tables"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True, nullable=False)
+    )
+    name: str
+    slug: str  # tool-safe; unique per org; e.g. "leads"
+    description: str = Field(default="")
+    columns: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default="'[]'"))
+    unique_on: list[str] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default="'[]'"))
+    created_by: UUID = Field(foreign_key="users.id")
+    created_at: datetime = _ts()
+    updated_at: datetime = _ts()
+    deleted_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class OrgTableRow(SQLModel, table=True):
+    """One data row in an OrgTable.  All values stored as JSONB keyed by column key."""
+
+    __tablename__ = "org_table_rows"
+    __table_args__ = (
+        Index("ix_org_table_rows_table_deleted", "table_id", "deleted_at"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True, nullable=False)
+    )
+    table_id: UUID = Field(
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("org_tables.id", ondelete="CASCADE"), index=True, nullable=False)
+    )
+    data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
+    version: int = Field(default=1)
+    created_at: datetime = _ts()
+    updated_at: datetime = _ts()
+    deleted_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    created_by_user_id: UUID | None = Field(default=None)
+    created_by_session_id: UUID | None = Field(default=None)
+
+
+class OrgTableEvent(SQLModel, table=True):
+    """Audit log: every mutation of an OrgTable or its rows.
+
+    `action` values: create, update, delete, restore, schema
+    `before`/`after`: full row data snapshot (None for creates/schema).
+    """
+
+    __tablename__ = "org_table_events"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True, nullable=False)
+    )
+    table_id: UUID = Field(
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("org_tables.id", ondelete="CASCADE"), index=True, nullable=False)
+    )
+    row_id: UUID | None = Field(default=None)
+    action: str  # create | update | delete | restore | schema
+    before: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    after: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    actor_user_id: UUID | None = Field(default=None)
+    actor_session_id: UUID | None = Field(default=None)
+    agent_id: UUID | None = Field(default=None)
     created_at: datetime = _ts()

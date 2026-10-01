@@ -15,6 +15,7 @@ TEMPLATE = Template(
         "group name, sender, and a short snippet — and stays silent when there is nothing relevant."
     ),
     required_connectors=(ConnectorType.telegram_client, ConnectorType.twilio),
+    optional_connectors=(ConnectorType.tables,),
     trigger_type=TriggerType.schedule,
     schedule_preset="every_15_minutes",
     instructions="""Monitor Telegram group chats for people clearly seeking [YOUR SERVICE — e.g. "catering / food-service vendors"] and send a single compact SMS alert when leads appear.
@@ -41,5 +42,9 @@ Actions (SMS — one message per run)
 - If ≥1 lead: send ONE SMS to [YOUR_PHONE_NUMBER] summarizing up to 3 fresh leads; if more than 3, append "(+X more)".
 - SMS format (aim ≤320 chars total):
   LeadFinder: [Chat] [Sender] — [Snippet] ([When]). [Link if available] • [repeat for up to 3]
-- Include only sender handle/name and the short snippet; do not include additional personal information.""",
+- Include only sender handle/name and the short snippet; do not include additional personal information.
+
+Lead logging (optional — only if you have access to the leads table)
+- After sending the SMS, for each new lead found, call leads_create with: name=sender handle, phone="" (unknown), source="telegram", status="New", notes=snippet.
+- Use leads_search first to check if the sender is already stored; skip if already logged.""",
 )

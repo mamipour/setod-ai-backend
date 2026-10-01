@@ -25,6 +25,7 @@ from app.db.models import (
     Connector,
     ConnectorStatus,
     ConnectorType,
+    OrgTable,
     ProcessedItemStatus,
     SessionStatus,
 )
@@ -40,6 +41,7 @@ from app.integrations import (
     sheets,
     shopify,
     slack,
+    tables as tables_integration,
     telegram,
     twilio,
     whatsapp,
@@ -64,6 +66,7 @@ BUILDERS = {
     ConnectorType.shopify: shopify.build_tools,
     ConnectorType.google_business_profile: google_business_profile.build_tools,
     ConnectorType.calendly: calendly.build_tools,
+    # tables: handled separately (requires async table list fetch before build)
 }
 
 
@@ -115,9 +118,6 @@ async def build_tools_for_agent(
     approval_required: set[str] = set()
 
     for agent_tool, connector in pairs:
-        builder = BUILDERS.get(connector.type)
-        if builder is None:
-            continue
         if connector.status != ConnectorStatus.active:
             log.warning(
                 "agent %s skipping connector %s — status is %s",
@@ -137,7 +137,17 @@ async def build_tools_for_agent(
             session_id=session_id,
             conversation_id=conversation_id,
         )
-        built = builder(ctx)
+
+        # Tables connector: async pre-fetch of table list before building tools.
+        if connector.type == ConnectorType.tables:
+            org_tables = await _fetch_org_tables(db, connector.org_id)
+            object.__setattr__(ctx, "_org_tables", org_tables)
+            built = tables_integration._build_tools_sync(ctx, connector.org_id)
+        else:
+            builder = BUILDERS.get(connector.type)
+            if builder is None:
+                continue
+            built = builder(ctx)
 
         if agent_tool.enabled_tools:
             allowed = set(agent_tool.enabled_tools)
@@ -153,6 +163,17 @@ async def build_tools_for_agent(
         contexts.append(ctx)
 
     return _dedupe(tools), contexts, approval_required
+
+
+async def _fetch_org_tables(db: AsyncSession, org_id: UUID) -> list[OrgTable]:
+    """Fetch non-deleted org tables for the tables connector tool builder."""
+    rows = await db.exec(
+        select(OrgTable).where(
+            OrgTable.org_id == org_id,
+            OrgTable.deleted_at.is_(None),
+        ).order_by(OrgTable.created_at)
+    )
+    return list(rows.all())
 
 
 async def flush_seen(
