@@ -66,7 +66,8 @@ BUILDERS = {
     ConnectorType.shopify: shopify.build_tools,
     ConnectorType.google_business_profile: google_business_profile.build_tools,
     ConnectorType.calendly: calendly.build_tools,
-    # tables: handled separately (requires async table list fetch before build)
+    # tables: handled separately in build_tools_for_agent (requires async table list fetch)
+    ConnectorType.tables: tables_integration.build_tools,
 }
 
 
