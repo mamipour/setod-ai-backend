@@ -25,6 +25,8 @@ from app.core.tables.schema import (
     validate_row_data,
 )
 from app.db.models import (
+    Agent,
+    AgentTool,
     Connector,
     ConnectorStatus,
     ConnectorType,
@@ -45,6 +47,16 @@ class TableError(ValueError):
 
 class WriteCapExceeded(TableError):
     """Raised when an agent exceeds AGENT_WRITES_PER_SESSION in a single session."""
+
+
+class TableInUse(TableError):
+    """Raised by delete_table when agents still have access and force=False.
+    Surfaced as HTTP 409; `agents` lists who would lose access."""
+
+    def __init__(self, agents: list[dict[str, Any]]):
+        names = ", ".join(a["name"] for a in agents)
+        super().__init__(f"Table is used by {len(agents)} agent(s): {names}")
+        self.agents = agents
 
 
 class RowConflict(Exception):
@@ -282,20 +294,67 @@ async def remove_column(
     return tbl
 
 
+async def agents_using_table(
+    db: AsyncSession, org_id: UUID, tbl: OrgTable
+) -> list[dict[str, Any]]:
+    """Agents whose Tables attachment grants access to `tbl`, with the access they hold.
+
+    `enabled_tools` is None for attachments made before per-table opt-in existed; those
+    agents can reach every table, so they count as having full access here."""
+    rows = await db.exec(
+        select(Agent, AgentTool)
+        .join(AgentTool, AgentTool.agent_id == Agent.id)
+        .join(Connector, Connector.id == AgentTool.connector_id)
+        .where(Connector.org_id == org_id, Connector.type == ConnectorType.tables)
+        .order_by(Agent.name)
+    )
+    out: list[dict[str, Any]] = []
+    for agent, at in rows.all():
+        if at.enabled_tools is None:
+            read = write = True
+        else:
+            names = set(at.enabled_tools)
+            read = bool(names & {f"{tbl.slug}_search", f"{tbl.slug}_get"})
+            write = bool(names & {f"{tbl.slug}_create", f"{tbl.slug}_update"})
+        if read or write:
+            out.append({"id": str(agent.id), "name": agent.name, "read": read, "write": write})
+    return out
+
+
 async def delete_table(
     db: AsyncSession,
     org_id: UUID,
     table_id: UUID,
     *,
     actor_user_id: UUID | None = None,
+    force: bool = False,
 ) -> None:
-    """Soft-delete a table (sets deleted_at)."""
+    """Soft-delete a table (sets deleted_at).
+
+    Refuses with TableInUse if any agent still has access, unless `force` is set — in which
+    case the table's tools are stripped from those agents' allow-lists so nothing stale remains."""
     tbl = await get_table(db, org_id, table_id)
+    users = await agents_using_table(db, org_id, tbl)
+    if users and not force:
+        raise TableInUse(users)
+
+    if users:
+        verbs = {f"{tbl.slug}_{v}" for v in ("search", "get", "create", "update")}
+        rows = await db.exec(
+            select(AgentTool)
+            .join(Connector, Connector.id == AgentTool.connector_id)
+            .where(Connector.org_id == org_id, Connector.type == ConnectorType.tables)
+        )
+        for at in rows.all():
+            if at.enabled_tools is not None and verbs & set(at.enabled_tools):
+                at.enabled_tools = [n for n in at.enabled_tools if n not in verbs]
+                db.add(at)
+
     tbl.deleted_at = datetime.now(UTC)
     db.add(tbl)
     await db.commit()
     await _log_event(db, org_id, table_id, action="schema",
-                     after={"deleted": True},
+                     after={"deleted": True, "agents_detached": [u["name"] for u in users]},
                      actor_user_id=actor_user_id)
 
 

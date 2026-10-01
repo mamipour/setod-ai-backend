@@ -322,16 +322,35 @@ async def update_table(
     return _table_out(tbl, rc)
 
 
+@router.get("/{table_id}/agents")
+async def table_agents(
+    table_id: UUID,
+    org_id: Annotated[UUID, Query()],
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> list[dict[str, Any]]:
+    """Agents that can read or write this table — shown before deleting it."""
+    await _assert_member(db, current_user, org_id)
+    try:
+        tbl = await svc.get_table(db, org_id, table_id)
+    except svc.TableError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return await svc.agents_using_table(db, org_id, tbl)
+
+
 @router.delete("/{table_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_table(
     table_id: UUID,
     org_id: Annotated[UUID, Query()],
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    force: Annotated[bool, Query(description="Delete even if agents use it; their access is removed")] = False,
 ):
     await assert_org_owner(db, current_user, org_id)
     try:
-        await svc.delete_table(db, org_id, table_id, actor_user_id=current_user.id)
+        await svc.delete_table(db, org_id, table_id, actor_user_id=current_user.id, force=force)
+    except svc.TableInUse as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except svc.TableError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
