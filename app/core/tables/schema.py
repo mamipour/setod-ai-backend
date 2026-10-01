@@ -232,16 +232,19 @@ def strip_hidden(columns: list[dict[str, Any]], data: dict[str, Any]) -> dict[st
     return {k: v for k, v in data.items() if k not in hidden}
 
 
-def render_tool_description(table_name: str, columns: list[dict[str, Any]]) -> str:
+def render_tool_description(table_name: str, columns: list[dict[str, Any]], description: str = "") -> str:
     """Generate the tool description shown to the model for a specific table.
 
-    Uses synthetic (non-PII) sample values.  Only agent-visible columns are described.
+    Includes the table's purpose (its description, if set) so the model knows what the
+    table is *for*, not just what's in it.  Uses synthetic (non-PII) sample values.
+    Only agent-visible columns are described.
     """
     visible = [c for c in columns if not c.get("hidden_from_agents")]
+    purpose = f" — {description.strip()}" if description and description.strip() else ""
     if not visible:
-        return f"Table '{table_name}' (no agent-visible columns)"
+        return f"Table '{table_name}'{purpose} (no agent-visible columns)"
 
-    lines = [f"Table '{table_name}' columns:"]
+    lines = [f"Table '{table_name}'{purpose}", "Columns:"]
     sample: dict[str, Any] = {}
 
     for col in visible:

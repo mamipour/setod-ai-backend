@@ -71,7 +71,7 @@ def _build_tools_sync(ctx: ToolContext, org_id: UUID) -> list[RegisteredTool]:
     for tbl in tables:
         slug = tbl.slug
         visible_cols = [c for c in tbl.columns if not c.get("hidden_from_agents")]
-        desc = render_tool_description(tbl.name, tbl.columns)
+        desc = render_tool_description(tbl.name, tbl.columns, tbl.description or "")
         col_props = {
             c["key"]: {
                 "type": "string" if c["type"] not in ("number", "checkbox") else

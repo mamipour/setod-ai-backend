@@ -185,6 +185,15 @@ def test_render_tool_description_not_empty():
     assert len(desc) > 0
 
 
+def test_render_tool_description_includes_purpose():
+    cols = [{"key": "email", "name": "Email", "type": "email"}]
+    desc = render_tool_description("Leads", cols, "Inbound leads from Telegram, one row per person")
+    assert "Inbound leads from Telegram" in desc
+    assert "email" in desc
+    # Empty description adds nothing
+    assert "—" not in render_tool_description("Leads", cols, "")
+
+
 # ── CSV import preview ─────────────────────────────────────────────────────────
 
 def test_import_preview_csv():
