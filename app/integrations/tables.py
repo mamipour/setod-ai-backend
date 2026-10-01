@@ -8,8 +8,8 @@ Produces a set of generated tools from the org's live table schemas:
   {slug}_create(data)                        — insert (dedup via unique_on)
   {slug}_update(id, data, expected_version?) — partial update
 
-Plus one org-wide:
-  query_tables(sql)  — sandboxed DuckDB SELECT across permitted tables
+There is deliberately no cross-table SQL tool: access is granted per table (read / write)
+on the agent page, and an org-wide query would bypass that.
 
 The builder is registered under ConnectorType.tables in registry.py.
 The connector has no credentials — the connector row is auto-provisioned
@@ -32,7 +32,6 @@ from uuid import UUID
 from app.core.agents.base import RegisteredTool
 from app.core.llm.client import ToolSpec
 from app.core.tables import service as svc
-from app.core.tables.query import load_permitted_tables, run_query
 from app.core.tables.schema import render_tool_description, strip_hidden
 from app.db.models import OrgTable
 from app.integrations.base import IntegrationError, ToolContext
@@ -51,52 +50,14 @@ def _write_counter(ctx: ToolContext) -> dict:
 
 
 def build_tools(ctx: ToolContext) -> list[RegisteredTool]:
-    """Build tools for every non-deleted table in this org."""
-    # We need to do this async but build_tools is called synchronously.
-    # Use a lazy pattern: tools are closures that fetch data at call time.
-    # The org_id comes from the connector's org_id.
-    org_id = ctx.connector.org_id
+    """Build tools for every non-deleted table in this org.
 
-    # We can't do async here, so we return async handlers that query at call time.
-    tools: list[RegisteredTool] = []
-
-    # We'll build the tool list lazily at first call using a sync stub.
-    # Instead, use the standard pattern: build closures that capture org_id.
-    # Tables list is fetched when tools are first built. We use a synchronous
-    # pattern by pre-fetching in an inner async call here... but build_tools is sync.
-    #
-    # Resolution: build_tools is called from build_tools_for_agent which is async.
-    # We return a special "deferred" approach: one async tool that does the list
-    # and builds everything, OR we just query tables inside each tool handler.
-    # The simplest safe approach: build the static tool specs with descriptions
-    # that will be populated at run time. Each handler fetches the table itself.
-
-    # For the tool DESCRIPTIONS to be correct, we need the table list at build time.
-    # We capture org_id and query inside each tool. The description will be generic
-    # until we can use the async build pattern.
-    #
-    # Actually, looking at the codebase: build_tools is called from an async context
-    # in registry.py (build_tools_for_agent is async and calls builder(ctx) sync).
-    # We return the static tools here; descriptions are derived from the table at
-    # call time. This is the same pattern as MCP (frozen schema on connector).
-    #
-    # Better: build per-table tools and query_tables. The registry caller is async;
-    # we need to make build_tools async too OR store the table schema on the connector
-    # config. Since the connector has no config, we fetch at call time.
-    #
-    # The cleanest fix: return a single async-capable "dispatcher" set. Each named
-    # tool fetches its table at call time. The description is populated from connector
-    # config if present, or a generic fallback.
-    #
-    # We adopt the pattern: build_tables_tools is an async function called from
-    # build_tools_for_agent, bypassing the BUILDERS dict for this connector type.
-    # See registry.py for the special-case handling.
-    #
-    # For now, emit one query_tables tool + mark this connector as needing dynamic
-    # tool expansion. The async build path (build_tables_tools_async) is called in
-    # registry.py.
-
-    return _build_tools_sync(ctx, org_id)
+    The BUILDERS protocol is sync, but the tool set depends on the org's live tables, which
+    need an async DB read. Callers (registry.build_tools_for_agent, agents.router._agent_tool_out)
+    therefore pre-fetch the tables and attach them to `ctx._org_tables` before calling this.
+    Without that attribute the builder sees no tables and returns no tools.
+    """
+    return _build_tools_sync(ctx, ctx.connector.org_id)
 
 
 def _build_tools_sync(ctx: ToolContext, org_id: UUID) -> list[RegisteredTool]:
@@ -106,11 +67,9 @@ def _build_tools_sync(ctx: ToolContext, org_id: UUID) -> list[RegisteredTool]:
     tables: list[OrgTable] = getattr(ctx, "_org_tables", [])
 
     tools: list[RegisteredTool] = []
-    permitted_slugs: set[str] = set()  # for query_tables scope
 
     for tbl in tables:
         slug = tbl.slug
-        permitted_slugs.add(slug)
         visible_cols = [c for c in tbl.columns if not c.get("hidden_from_agents")]
         desc = render_tool_description(tbl.name, tbl.columns)
         col_props = {
@@ -284,38 +243,6 @@ def _build_tools_sync(ctx: ToolContext, org_id: UUID) -> list[RegisteredTool]:
                 },
             ),
             handler=update_handler,
-        ))
-
-    # ── query_tables ──────────────────────────────────────────────────────────
-    if permitted_slugs:
-        table_list_str = ", ".join(sorted(permitted_slugs))
-
-        async def query_handler(args: dict[str, Any], dry_run: bool) -> str:
-            sql = str(args.get("sql", "")).strip()
-            if not sql:
-                return "Error: 'sql' is required."
-            if dry_run:
-                return f"[simulated] Would run SQL: {sql[:200]}"
-            table_data = await load_permitted_tables(ctx.db, org_id, permitted_slugs)
-            return await run_query(table_data, sql)
-
-        tools.append(RegisteredTool(
-            spec=ToolSpec(
-                name="query_tables",
-                description=(
-                    f"Run a read-only SQL SELECT across your business data tables: {table_list_str}. "
-                    "Use for aggregates, joins, and complex filters that the search tools can't express. "
-                    "Only SELECT is allowed. Table names are the slugs listed above."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {"type": "string", "description": "A single SQL SELECT statement."},
-                    },
-                    "required": ["sql"],
-                },
-            ),
-            handler=query_handler,
         ))
 
     return tools

@@ -185,65 +185,6 @@ def test_render_tool_description_not_empty():
     assert len(desc) > 0
 
 
-# ── DuckDB sandbox ─────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_query_tables_select_ok():
-    """Basic SELECT runs and returns rows."""
-    from app.core.tables.query import run_query
-
-    table_data = {
-        "leads": [
-            {"name": "Alice", "status": "New"},
-            {"name": "Bob",   "status": "Qualified"},
-        ]
-    }
-    result = await run_query(table_data, "SELECT * FROM leads")
-    assert "Alice" in result
-    assert "Bob" in result
-
-@pytest.mark.asyncio
-async def test_query_tables_create_blocked():
-    """DDL / write statements must be rejected."""
-    from app.core.tables.query import run_query
-
-    table_data: dict = {}
-    result = await run_query(table_data, "CREATE TABLE evil AS SELECT 1")
-    # Should return an error string, not raise
-    assert "error" in result.lower() or "only" in result.lower() or "select" in result.lower()
-
-@pytest.mark.asyncio
-async def test_query_tables_file_read_blocked():
-    """read_csv / parquet external file access must be blocked after lock_configuration."""
-    from app.core.tables.query import run_query
-
-    # This should either error with "external access" or "No such table"
-    result = await run_query({}, "SELECT * FROM read_csv('/etc/passwd')")
-    assert any(word in result.lower() for word in ("error", "external", "permission", "cannot"))
-
-@pytest.mark.asyncio
-async def test_query_tables_max_rows():
-    """Results capped at MAX_RESULT_ROWS."""
-    from app.core.tables.query import run_query, MAX_RESULT_ROWS
-
-    # Generate more rows than the cap
-    n = MAX_RESULT_ROWS + 50
-    table_data = {"big": [{"v": i} for i in range(n)]}
-    result = await run_query(table_data, "SELECT * FROM big")
-    # Result string mentions the cap or is truncated
-    assert str(MAX_RESULT_ROWS) in result or "truncated" in result.lower() or "limit" in result.lower()
-
-@pytest.mark.asyncio
-async def test_query_only_permitted_tables():
-    """Tables not in permitted_slugs must not be visible."""
-    from app.core.tables.query import run_query
-
-    table_data = {"leads": [{"name": "Alice"}]}
-    # Try to access a table not in the permitted set (not in table_data)
-    result = await run_query(table_data, "SELECT * FROM secret_table")
-    assert "error" in result.lower() or "secret_table" in result.lower()
-
-
 # ── CSV import preview ─────────────────────────────────────────────────────────
 
 def test_import_preview_csv():
