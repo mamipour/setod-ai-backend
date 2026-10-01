@@ -22,6 +22,7 @@ from app.core.tables.schema import (
     MAX_CELL_CHARS,
     MAX_COLUMNS_PER_TABLE,
     coerce_value,
+    derive_slug,
     render_tool_description,
     slugify,
     strip_hidden,
@@ -45,6 +46,42 @@ def test_slugify_strip_leading_trailing_underscores():
     s = slugify("  hello  ")
     assert not s.startswith("_") and not s.endswith("_")
 
+def test_slugify_folds_accents():
+    assert slugify("Café Leads") == "cafe_leads"
+    assert slugify("Ünïcödé") == "unicode"
+
+def test_slugify_leading_digit_prefixed():
+    assert slugify("123 Orders") == "t_123_orders"
+
+def test_derive_slug_refuses_non_latin_scripts():
+    # No faithful ASCII form → caller must ask for an explicit key; never silently "vip"
+    assert derive_slug("مشتریان") is None
+    assert derive_slug("مشتریان VIP") is None
+    assert derive_slug("Клиенты") is None
+    assert derive_slug("顧客") is None
+    assert derive_slug("!!!") is None
+
+def test_slugify_non_latin_without_explicit_raises():
+    with pytest.raises(ColumnError, match="English key"):
+        slugify("مشتریان")
+
+def test_slugify_explicit_key_wins_and_is_validated():
+    assert slugify("مشتریان", "customers") == "customers"
+    assert slugify("Leads", "lead_list") == "lead_list"   # explicit overrides derivation
+    for bad in ["Customers", "1abc", "my-key", "has space", "a" * 41, "mshtryan!"]:
+        with pytest.raises(ColumnError):
+            slugify("مشتریان", bad)
+
+def test_validate_column_def_derives_key_from_latin_name():
+    col = validate_column_def({"name": "Phone Number", "type": "phone"})
+    assert col["key"] == "phone_number"
+
+def test_validate_column_def_non_latin_name_needs_key():
+    with pytest.raises(ColumnError, match="English key"):
+        validate_column_def({"name": "تلفن", "type": "phone"})
+    col = validate_column_def({"key": "phone", "name": "تلفن", "type": "phone"})
+    assert col["key"] == "phone" and col["name"] == "تلفن"
+
 
 # ── validate_column_def ────────────────────────────────────────────────────────
 
@@ -54,11 +91,10 @@ def test_validate_column_def_minimal():
     assert col["type"] == "text"
 
 def test_validate_column_def_generates_key_from_name():
-    # validate_column_def requires key — key generation is done by the router layer.
-    # If key is absent it raises ColumnError.
+    # A missing key is derived from a Latin-script name; an explicit key is kept as-is.
+    assert validate_column_def({"name": "Full Name", "type": "text"})["key"] == "full_name"
     with pytest.raises(ColumnError):
-        validate_column_def({"name": "Full Name", "type": "text"})
-    # But providing a key works:
+        validate_column_def({"name": "", "type": "text"})   # no name, no key → nothing to derive
     col = validate_column_def({"key": "full_name", "name": "Full Name", "type": "text"})
     assert col["key"] == "full_name"
 

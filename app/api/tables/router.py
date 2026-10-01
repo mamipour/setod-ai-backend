@@ -130,6 +130,9 @@ class TableCreate(BaseModel):
     description: str = ""
     columns: list[dict[str, Any]] = []
     unique_on: list[str] = []
+    # Explicit English identifier (becomes the agent tool prefix). Optional when the
+    # name is Latin-script and can be derived; required for e.g. Persian names.
+    slug: str | None = None
 
 
 class TablePatch(BaseModel):
@@ -276,6 +279,7 @@ async def create_table(
             columns=body.columns,
             description=body.description,
             unique_on=body.unique_on,
+            slug=body.slug,
         )
     except (ColumnError, svc.TableError) as e:
         raise HTTPException(status_code=422, detail=str(e))

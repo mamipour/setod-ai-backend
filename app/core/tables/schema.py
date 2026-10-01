@@ -8,6 +8,7 @@ data, so no PII appears in prompts.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 # ── Supported column types ─────────────────────────────────────────────────────
@@ -57,16 +58,57 @@ class ColumnError(ValueError):
     """Raised when a column definition or a cell value is invalid."""
 
 
-def slugify(name: str) -> str:
-    """Turn a human column/table name into a safe slug for use in tool names and JSONB keys."""
-    cleaned = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
-    cleaned = cleaned.strip("_")[:MAX_TABLE_SLUG_LEN]
+# Identifier rule for table slugs and column keys. They become LLM tool names
+# ({slug}_search) and tool parameter names, which providers restrict to ASCII.
+KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+KEY_RULE_MSG = "must be lowercase English letters, digits or underscores, start with a letter, max 40 chars"
+
+
+def derive_slug(name: str) -> str | None:
+    """Derive an ASCII identifier from a display name, or None if that would be lossy.
+
+    Display names are free-form (any language). The identifier is auto-derived only when
+    every letter in the name survives the trip to ASCII: accents are folded ("Café" → "cafe"),
+    spaces and punctuation become underscores. If the name contains letters from a non-Latin
+    script (Persian, Cyrillic, CJK, …) there is no faithful ASCII form, so we return None and
+    the caller must ask the user for an explicit English key rather than silently producing
+    "vip" for "مشتریان VIP".
+    """
+    decomposed = unicodedata.normalize("NFKD", name)
+    # Any non-ASCII *letter* left after decomposition means a whole script would be dropped.
+    if any(ord(ch) > 127 and unicodedata.category(ch).startswith("L") for ch in decomposed):
+        return None
+    ascii_name = decomposed.encode("ascii", "ignore").decode()
+    cleaned = re.sub(r"[^a-z0-9]+", "_", ascii_name.lower().strip()).strip("_")[:MAX_TABLE_SLUG_LEN]
     if not cleaned:
-        raise ColumnError("Name produces an empty slug")
-    # Must not start with a digit (tool names are used as identifiers)
-    if cleaned[0].isdigit():
-        cleaned = "t_" + cleaned
+        return None
+    if cleaned[0].isdigit():  # identifiers can't start with a digit
+        cleaned = ("t_" + cleaned)[:MAX_TABLE_SLUG_LEN]
     return cleaned
+
+
+def validate_key(key: str, *, what: str = "Key") -> str:
+    """Validate a user-supplied identifier (explicit table slug or column key)."""
+    key = (key or "").strip()
+    if not KEY_RE.match(key):
+        raise ColumnError(f"{what} '{key}' {KEY_RULE_MSG}")
+    return key
+
+
+def slugify(name: str, explicit: str | None = None) -> str:
+    """Resolve the identifier for a table: the explicit key if given, else derived from the name.
+
+    Raises ColumnError when the name can't be derived and no explicit key was supplied.
+    """
+    if explicit and explicit.strip():
+        return validate_key(explicit, what="Table key")
+    derived = derive_slug(name)
+    if derived is None:
+        raise ColumnError(
+            f"'{name}' has no English letters to build an identifier from. "
+            "Provide an English key for agents (e.g. 'customers')."
+        )
+    return derived
 
 
 def validate_column_def(col: dict[str, Any]) -> dict[str, Any]:
@@ -78,12 +120,17 @@ def validate_column_def(col: dict[str, Any]) -> dict[str, Any]:
     name = str(col.get("name", "")).strip()
     typ  = str(col.get("type", "")).strip()
 
-    if not key:
-        raise ColumnError("Column key is required")
-    if not re.match(r"^[a-z][a-z0-9_]{0,39}$", key):
-        raise ColumnError(f"Column key '{key}' must be lowercase alphanumeric/underscore, start with a letter")
     if not name:
         raise ColumnError("Column name is required")
+    if not key:
+        # Clients may send just a display name; derive the key when that's lossless.
+        key = derive_slug(name) or ""
+        if not key:
+            raise ColumnError(
+                f"Column '{name}' has no English letters to build a key from. "
+                "Provide an English key for agents (e.g. 'customer_name')."
+            )
+    validate_key(key, what="Column key")
     if typ not in COLUMN_TYPES:
         raise ColumnError(f"Unknown column type '{typ}'. Allowed: {sorted(COLUMN_TYPES)}")
 

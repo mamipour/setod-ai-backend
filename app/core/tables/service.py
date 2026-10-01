@@ -158,11 +158,14 @@ async def create_table(
     columns: list[dict[str, Any]],
     description: str = "",
     unique_on: list[str] | None = None,
+    slug: str | None = None,
 ) -> OrgTable:
+    """Create a table. `slug` is the explicit English identifier; required only when the
+    display name has no faithful ASCII form (e.g. a Persian name)."""
     if len(columns) > MAX_COLUMNS_PER_TABLE:
         raise TableError(f"Maximum {MAX_COLUMNS_PER_TABLE} columns per table")
 
-    table_slug = slugify(name)
+    table_slug = slugify(name, slug)
 
     # Check slug uniqueness
     existing = await get_table_by_slug(db, org_id, table_slug)
