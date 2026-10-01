@@ -69,8 +69,14 @@ class VersionConflict(Exception):
 
 # ── Connector auto-provision ───────────────────────────────────────────────────
 
+TABLES_CONNECTOR_NAME = "Tables"
+
+
 async def get_or_create_tables_connector(db: AsyncSession, org_id: UUID, created_by: UUID) -> Connector:
-    """Return the built-in 'tables' connector for this org, creating it if absent."""
+    """Return the built-in 'tables' connector for this org, creating it if absent.
+
+    The name is not user-editable, so an existing row with a stale name (earlier builds
+    called it "Business data") is renamed in place to keep it matching the Tables page."""
     row = await db.exec(
         select(Connector).where(
             Connector.org_id == org_id,
@@ -79,13 +85,18 @@ async def get_or_create_tables_connector(db: AsyncSession, org_id: UUID, created
     )
     connector = row.first()
     if connector is not None:
+        if connector.name != TABLES_CONNECTOR_NAME:
+            connector.name = TABLES_CONNECTOR_NAME
+            db.add(connector)
+            await db.commit()
+            await db.refresh(connector)
         return connector
 
     connector = Connector(
         id=uuid4(),
         org_id=org_id,
         created_by=created_by,
-        name="Business data",
+        name=TABLES_CONNECTOR_NAME,
         type=ConnectorType.tables,
         status=ConnectorStatus.active,
         config=None,
