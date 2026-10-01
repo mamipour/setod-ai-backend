@@ -2028,7 +2028,7 @@ async def explain_session(
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
-def _agent_tool_out(
+async def _agent_tool_out(
     session: AsyncSession, agent_id: UUID, agent_tool: AgentTool, connector: Connector
 ) -> AgentToolOut:
     """Describe one attached account and the tools it contributes.
@@ -2037,6 +2037,11 @@ def _agent_tool_out(
     and the builder UI has to show the model's view of them, not an idealised one.
     """
     ctx = ToolContext(db=session, agent_id=agent_id, connector=connector, alias=agent_tool.alias)
+    if connector.type == ConnectorType.tables:
+        # The tables builder generates one tool set per table and needs the live table
+        # list pre-fetched — same as the agent runner path in registry.build_tools_for_agent.
+        from app.integrations.registry import _fetch_org_tables
+        object.__setattr__(ctx, "_org_tables", await _fetch_org_tables(session, connector.org_id))
     enabled = set(agent_tool.enabled_tools) if agent_tool.enabled_tools else None
     approval = set(agent_tool.approval_tools) if agent_tool.approval_tools else set()
     return AgentToolOut(
@@ -2074,7 +2079,7 @@ async def list_agent_tools(
         .order_by(AgentTool.created_at)
     )
     return [
-        _agent_tool_out(session, agent.id, agent_tool, connector)
+        await _agent_tool_out(session, agent.id, agent_tool, connector)
         for agent_tool, connector in rows.all()
         if connector.type in BUILDERS
     ]
@@ -2129,7 +2134,7 @@ async def attach_agent_tool(
     await session.commit()
     await session.refresh(agent_tool)
 
-    return _agent_tool_out(session, agent.id, agent_tool, connector)
+    return await _agent_tool_out(session, agent.id, agent_tool, connector)
 
 
 @router.delete("/{agent_id}/tools/{connector_id}", status_code=204)
