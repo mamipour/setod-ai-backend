@@ -279,6 +279,50 @@ async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription
         raise HTTPException(400, f"Stripe error: {e.user_message}")
 
 
+@router.post("/{org_id}/reactivate")
+async def reactivate(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Undo a scheduled cancellation (cancel_at_period_end → active)."""
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Billing not configured")
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+    from sqlmodel import select
+
+    sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+    if not sub or not sub.stripe_subscription_id:
+        raise HTTPException(400, "No subscription found")
+    if sub.status not in ("cancel_at_period_end", "downgrade_scheduled"):
+        raise HTTPException(400, "Subscription is not scheduled for cancellation or downgrade")
+
+    try:
+        if sub.status == "downgrade_scheduled":
+            # Release the schedule — subscription reverts to normal renewal
+            _raw = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+            stripe_sub = _raw._to_dict_recursive() if hasattr(_raw, "_to_dict_recursive") else dict(_raw)
+            schedule_id = stripe_sub.get("schedule")
+            if schedule_id:
+                stripe.SubscriptionSchedule.release(schedule_id)
+        else:
+            # Undo cancel_at_period_end
+            stripe.Subscription.modify(
+                sub.stripe_subscription_id,
+                cancel_at_period_end=False,
+            )
+    except stripe.error.InvalidRequestError as e:
+        log.error("Stripe reactivate error: %s", e.user_message)
+        raise HTTPException(400, f"Stripe error: {e.user_message}")
+
+    sub.status = "active"
+    db.add(sub)
+    await db.commit()
+    log.info("subscription reactivated: org=%s sub=%s", org_id, sub.stripe_subscription_id)
+    return {"status": "ok"}
+
+
 @router.post("/{org_id}/addon-checkout")
 async def create_addon_checkout(
     org_id: UUID,
