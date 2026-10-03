@@ -74,20 +74,23 @@ async def create_checkout(
     current_user: Annotated[User, Depends(require_owner)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ):
+    """Create a Stripe Checkout session for new subscribers (no existing subscription)."""
     if not settings.stripe_secret_key:
         raise HTTPException(503, "Billing not configured")
     import stripe
     stripe.api_key = settings.stripe_secret_key
+    from sqlmodel import select
 
     plan_code = body.get("plan_code", "pro")
     plan = await db.get(Plan, plan_code)
     if not plan or not plan.stripe_monthly_price_id:
         raise HTTPException(400, f"Plan '{plan_code}' has no Stripe price configured")
 
-    sub = (await db.exec(
-        __import__("sqlmodel", fromlist=["select"]).select(OrgSubscription)
-        .where(OrgSubscription.org_id == org_id)
-    )).first()
+    sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+
+    # If already subscribed, do an in-place subscription modification instead
+    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing"):
+        return await _change_plan_inline(db, stripe, sub, plan, plan_code)
 
     session_params: dict = {
         "mode": "subscription",
@@ -101,6 +104,90 @@ async def create_checkout(
 
     checkout = stripe.checkout.Session.create(**session_params)
     return {"url": checkout.url}
+
+
+@router.post("/{org_id}/change-plan")
+async def change_plan(
+    org_id: UUID,
+    body: dict,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Upgrade or downgrade an existing subscription in-place (no Stripe redirect needed).
+    For new subscribers, falls back to a Checkout session URL.
+    Returns either {"status": "ok"} for in-place change or {"url": "..."} for new checkout.
+    """
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Billing not configured")
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+    from sqlmodel import select
+
+    plan_code = body.get("plan_code")
+    if not plan_code:
+        raise HTTPException(400, "plan_code required")
+
+    plan = await db.get(Plan, plan_code)
+    if not plan or not plan.stripe_monthly_price_id:
+        raise HTTPException(400, f"Plan '{plan_code}' has no Stripe price configured")
+
+    sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+
+    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing"):
+        return await _change_plan_inline(db, stripe, sub, plan, plan_code)
+
+    # No existing sub — return a checkout URL
+    session_params: dict = {
+        "mode": "subscription",
+        "line_items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
+        "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
+        "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
+        "metadata": {"org_id": str(org_id), "plan_code": plan_code},
+    }
+    if sub and sub.stripe_customer_id:
+        session_params["customer"] = sub.stripe_customer_id
+    checkout = stripe.checkout.Session.create(**session_params)
+    return {"url": checkout.url}
+
+
+async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription, plan, plan_code: str) -> dict:
+    """Modify an existing Stripe subscription to a new plan (handles both upgrades and downgrades)."""
+    from datetime import timedelta as _td
+
+    # Retrieve current subscription to find the item ID
+    stripe_sub = stripe_mod.Subscription.retrieve(sub.stripe_subscription_id)
+    items = stripe_sub.get("items", {}).get("data", [])
+    if not items:
+        raise HTTPException(500, "Stripe subscription has no line items")
+
+    item_id = items[0]["id"]
+    current_price_id = items[0].get("price", {}).get("id", "")
+
+    # No-op if already on this plan
+    if current_price_id == plan.stripe_monthly_price_id:
+        return {"status": "ok", "message": "Already on this plan"}
+
+    # Modify the subscription in Stripe
+    updated = stripe_mod.Subscription.modify(
+        sub.stripe_subscription_id,
+        items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
+        proration_behavior="create_prorations",
+        metadata={"plan_code": plan_code},
+    )
+
+    # Optimistically update our DB (webhook will confirm)
+    now = datetime.now(UTC)
+    sub.plan_code = plan_code
+    sub.status = updated.get("status", "active")
+    if updated.get("current_period_start"):
+        sub.current_period_start = datetime.fromtimestamp(updated["current_period_start"], tz=UTC)
+    if updated.get("current_period_end"):
+        sub.current_period_end = datetime.fromtimestamp(updated["current_period_end"], tz=UTC)
+    db.add(sub)
+    await db.commit()
+
+    log.info("plan changed inline: sub=%s → plan=%s", sub.stripe_subscription_id, plan_code)
+    return {"status": "ok"}
 
 
 @router.post("/{org_id}/addon-checkout")
@@ -280,15 +367,18 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
         if sub:
             if event_type == "customer.subscription.deleted":
                 sub.status = "cancelled"
+                sub.plan_code = "free"
             else:
                 sub.status = data.get("status", sub.status)
                 if data.get("current_period_start"):
                     sub.current_period_start = datetime.fromtimestamp(data["current_period_start"], tz=UTC)
                 if data.get("current_period_end"):
                     sub.current_period_end = datetime.fromtimestamp(data["current_period_end"], tz=UTC)
-                plan_code = _plan_from_stripe_sub(data)
-                if plan_code:
-                    sub.plan_code = plan_code
+                # Resolve plan_code: prefer metadata, fall back to price-ID lookup in plans table
+                resolved = await _plan_code_from_stripe_sub(db, data)
+                if resolved:
+                    sub.plan_code = resolved
+                    log.info("subscription.updated: sub=%s → plan=%s", stripe_sub_id, resolved)
             db.add(sub)
 
     elif event_type == "invoice.payment_failed":
@@ -302,12 +392,26 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
                 db.add(sub)
 
 
-def _plan_from_stripe_sub(sub: dict) -> str:
-    """Extract plan code from a Stripe subscription object via Stripe price ID → plans table."""
+async def _plan_code_from_stripe_sub(db: AsyncSession, sub: dict) -> str | None:
+    """Resolve plan_code from a Stripe subscription object.
+    Priority: 1) subscription metadata  2) price-ID lookup in plans table  3) None.
+    """
+    from sqlmodel import select
+
+    # 1. Metadata set by our own modify() call
+    meta_code = (sub.get("metadata") or {}).get("plan_code")
+    if meta_code:
+        return meta_code
+
+    # 2. Look up by Stripe price ID in the plans table
     items = sub.get("items", {}).get("data", [])
-    if not items:
-        return "free"
-    price_id = items[0].get("price", {}).get("id")
-    # We store price IDs on the plans table — this is a best-effort sync.
-    # Full resolution happens via the sqladmin panel when price IDs are entered.
-    return sub.get("metadata", {}).get("plan_code", "pro")
+    if items:
+        price_id = items[0].get("price", {}).get("id")
+        if price_id:
+            plan = (await db.exec(
+                select(Plan).where(Plan.stripe_monthly_price_id == price_id)
+            )).first()
+            if plan:
+                return plan.plan_code
+
+    return None
