@@ -155,7 +155,8 @@ async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription
     from datetime import timedelta as _td
 
     # Retrieve current subscription to find the item ID
-    stripe_sub = stripe_mod.Subscription.retrieve(sub.stripe_subscription_id)
+    _raw = stripe_mod.Subscription.retrieve(sub.stripe_subscription_id)
+    stripe_sub: dict = _raw._to_dict_recursive() if hasattr(_raw, "_to_dict_recursive") else dict(_raw)
     items = stripe_sub.get("items", {}).get("data", [])
     if not items:
         raise HTTPException(500, "Stripe subscription has no line items")
@@ -169,18 +170,18 @@ async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription
 
     # Modify the subscription in Stripe
     try:
-        updated = stripe_mod.Subscription.modify(
+        _upd = stripe_mod.Subscription.modify(
             sub.stripe_subscription_id,
             items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
             proration_behavior="create_prorations",
             metadata={"plan_code": plan_code},
         )
+        updated: dict = _upd._to_dict_recursive() if hasattr(_upd, "_to_dict_recursive") else dict(_upd)
     except stripe_mod.error.InvalidRequestError as e:
         log.error("Stripe subscription modify error: %s", e.user_message)
         raise HTTPException(400, f"Stripe error: {e.user_message}")
 
     # Optimistically update our DB (webhook will confirm)
-    now = datetime.now(UTC)
     sub.plan_code = plan_code
     sub.status = updated.get("status", "active")
     if updated.get("current_period_start"):
