@@ -293,6 +293,37 @@ async def list_schedule_presets():
     ]
 
 
+@router.get("/platform-models")
+async def list_platform_models(
+    org_id: Annotated[UUID, Query()],
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Models available via Setod-managed keys (requires managed_models entitlement)."""
+    from app.core.billing.entitlements import resolve as resolve_ent
+    await _assert_org_member(session, current_user, org_id)
+    ent = await resolve_ent(session, org_id)
+    if not ent.allows("managed_models"):
+        return {"models": [], "available": False}
+
+    from app.config import get_settings
+    settings = get_settings()
+    models = []
+    if settings.platform_openai_api_key:
+        models += [
+            {"id": "gpt-4o",           "label": "GPT-4o",               "provider": "openai"},
+            {"id": "gpt-4o-mini",      "label": "GPT-4o mini",           "provider": "openai"},
+            {"id": "o3-mini",          "label": "o3 mini",               "provider": "openai"},
+        ]
+    if settings.platform_anthropic_api_key:
+        models += [
+            {"id": "claude-opus-4-5",  "label": "Claude Opus 4.5",       "provider": "anthropic"},
+            {"id": "claude-sonnet-4-5","label": "Claude Sonnet 4.5",      "provider": "anthropic"},
+            {"id": "claude-haiku-3-5", "label": "Claude Haiku 3.5",       "provider": "anthropic"},
+        ]
+    return {"models": models, "available": True}
+
+
 @router.get("/models")
 async def list_models(
     connector_id: Annotated[UUID, Query()],
