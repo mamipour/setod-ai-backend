@@ -61,7 +61,8 @@ class TriggerType(str, Enum):
     schedule = "schedule"
     channel = "channel"
     manual = "manual"
-    agent = "agent"  # run started by another agent calling this one as a tool
+    agent = "agent"   # run started by another agent calling this one as a tool
+    phone = "phone"   # inbound voice call via Twilio ConversationRelay
 
 
 class SessionStatus(str, Enum):
@@ -88,6 +89,7 @@ class User(SQLModel, table=True):
     email: str = Field(unique=True, index=True)
     name: str
     avatar_url: str | None = None
+    is_staff: bool = Field(default=False)
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 
@@ -164,6 +166,22 @@ class Invitation(SQLModel, table=True):
     @property
     def is_pending(self) -> bool:
         return self.accepted_at is None and not self.is_expired
+
+
+# ── Admin audit log ───────────────────────────────────────────────────────────
+
+class AdminAuditLog(SQLModel, table=True):
+    """Immutable audit trail for staff actions taken in the /admin panel."""
+
+    __tablename__ = "admin_audit_log"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    staff_user_id: UUID = Field(foreign_key="users.id", index=True)
+    action: str  # e.g. "update_is_staff", "update_connector_status", "create_org_override"
+    target_type: str | None = None  # "user" | "organization" | "connector" | …
+    target_id: str | None = None  # stringified UUID of the affected row
+    meta: dict | None = Field(default=None, sa_type=JSONB)
+    created_at: datetime = _ts()
 
 
 # ── Connector ──────────────────────────────────────────────────────────────────
@@ -1198,3 +1216,179 @@ class OrgTableEvent(SQLModel, table=True):
     actor_session_id: UUID | None = Field(default=None)
     agent_id: UUID | None = Field(default=None)
     created_at: datetime = _ts()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Billing / Plans / Entitlements
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Plan(SQLModel, table=True):
+    """Product catalog: a named plan with a feature set and soft limits."""
+
+    __tablename__ = "plans"
+
+    code: str = Field(primary_key=True)  # 'free' | 'pro' | 'business'
+    display_name: str
+    price_cad_monthly: int = Field(default=0)   # cents
+    price_cad_annual: int = Field(default=0)    # cents/year
+    # Feature flags included: e.g. {"managed_models": true, "voice": false}
+    features: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
+    # Soft limits: {"agents": 2, "members": 2, "rows": 5000, "model_credits": 0}
+    limits: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
+    # Included meter quantities per billing period: {"model_credits": 2000, "voice_minutes": 0}
+    included: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
+    stripe_monthly_price_id: str | None = Field(default=None)
+    stripe_annual_price_id: str | None = Field(default=None)
+    active: bool = Field(default=True)
+    sort_order: int = Field(default=0)
+    created_at: datetime = _ts()
+
+
+class Addon(SQLModel, table=True):
+    """Add-on product catalog: voice packs, row quota boosts, etc."""
+
+    __tablename__ = "addons"
+
+    code: str = Field(primary_key=True)  # 'voice_lite' | 'voice_standard' | 'rows_100k'
+    display_name: str
+    price_cad_monthly: int = Field(default=0)   # cents
+    # Feature flags enabled by this add-on
+    features: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
+    # Meter allocations: {"voice_minutes": 400}
+    included: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
+    meter: str | None = Field(default=None)  # 'voice_minutes' | 'model_credits' | None
+    stripe_price_id: str | None = Field(default=None)
+    active: bool = Field(default=True)
+    created_at: datetime = _ts()
+
+
+class ModelPrice(SQLModel, table=True):
+    """LLM pricing table (USD per million tokens).  Used for cost accounting and markup."""
+
+    __tablename__ = "model_prices"
+    __table_args__ = (
+        UniqueConstraint("provider", "model_slug", "active_from", name="uq_model_prices_slot"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    provider: str                      # 'openai' | 'anthropic'
+    model_slug: str                    # e.g. 'gpt-4.1', 'claude-sonnet-4-5'
+    input_per_m: float = Field(default=0.0)   # USD per 1M input tokens
+    output_per_m: float = Field(default=0.0)  # USD per 1M output tokens
+    audio_in_per_m: float = Field(default=0.0)
+    audio_out_per_m: float = Field(default=0.0)
+    # markup multiplier applied when Setod provides the key (platform managed)
+    managed_markup: float = Field(default=1.5)
+    active_from: datetime = Field(sa_type=DateTime(timezone=True), default_factory=lambda: datetime.now(UTC))
+    active: bool = Field(default=True)
+
+
+class OrgSubscription(SQLModel, table=True):
+    """Active subscription for an org (at most one non-cancelled row per org)."""
+
+    __tablename__ = "org_subscriptions"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True, unique=True)
+    plan_code: str = Field(foreign_key="plans.code")
+    status: str = Field(default="active")  # 'active' | 'past_due' | 'cancelled'
+    stripe_customer_id: str | None = Field(default=None, index=True)
+    stripe_subscription_id: str | None = Field(default=None, unique=True)
+    current_period_start: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    current_period_end: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    cancel_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    created_at: datetime = _ts()
+    updated_at: datetime = _ts()
+
+
+class OrgAddon(SQLModel, table=True):
+    """Add-on purchases active for an org."""
+
+    __tablename__ = "org_addons"
+    __table_args__ = (
+        UniqueConstraint("org_id", "addon_code", name="uq_org_addons_slot"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    addon_code: str = Field(foreign_key="addons.code")
+    stripe_subscription_item_id: str | None = Field(default=None)
+    created_at: datetime = _ts()
+
+
+class OrgOverride(SQLModel, table=True):
+    """Manual grants / limit overrides applied by staff (highest priority)."""
+
+    __tablename__ = "org_overrides"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    key: str           # e.g. 'voice' | 'agents' | 'voice_minutes_included'
+    value: str         # JSON-serialized value: "true" | "1000" | …
+    reason: str = Field(default="")
+    expires_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    created_by: UUID | None = Field(default=None, foreign_key="users.id")
+    created_at: datetime = _ts()
+
+
+class OrgCap(SQLModel, table=True):
+    """Hard caps that cannot be unlocked by any plan or override."""
+
+    __tablename__ = "org_caps"
+    __table_args__ = (
+        UniqueConstraint("org_id", "meter", name="uq_org_caps_meter"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    meter: str    # 'voice_minutes' | 'model_credits'
+    hard_cap: int
+    created_at: datetime = _ts()
+
+
+class UsageEvent(SQLModel, table=True):
+    """One billing event (one LLM turn, one voice call minute block, etc.)."""
+
+    __tablename__ = "usage_events"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(
+        sa_column=Column(PGUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True, nullable=False)
+    )
+    agent_id: UUID | None = Field(default=None)
+    session_id: UUID | None = Field(default=None)
+    meter: str            # 'model_credits' | 'voice_minutes'
+    quantity: float = Field(default=0.0)
+    cost_usd: float = Field(default=0.0)
+    billable: bool = Field(default=True)    # False for BYOK runs
+    idempotency_key: str = Field(unique=True, index=True)  # 'session:{id}:turn:{n}'
+    meta: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    created_at: datetime = _ts()
+
+
+class UsagePeriod(SQLModel, table=True):
+    """Rolled-up totals per org per meter per calendar month."""
+
+    __tablename__ = "usage_periods"
+    __table_args__ = (
+        UniqueConstraint("org_id", "period_start", "meter", name="uq_usage_periods_slot"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    period_start: datetime = Field(sa_type=DateTime(timezone=True))   # first day of month UTC
+    meter: str
+    included: float = Field(default=0.0)      # from plan/addons at snapshot time
+    used: float = Field(default=0.0)
+    overage: float = Field(default=0.0)
+    pushed_to_stripe_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    updated_at: datetime = _ts()
+
+
+class StripeEvent(SQLModel, table=True):
+    """Idempotency store for processed Stripe webhook events."""
+
+    __tablename__ = "stripe_events"
+
+    event_id: str = Field(primary_key=True)   # evt_… from Stripe
+    processed_at: datetime = _ts()

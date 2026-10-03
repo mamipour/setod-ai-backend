@@ -35,3 +35,7 @@ async def check_db() -> None:
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         yield session
+
+
+# Context-manager factory for code that cannot use FastAPI Depends() (e.g. admin auth backend)
+async_session_factory = AsyncSessionLocal

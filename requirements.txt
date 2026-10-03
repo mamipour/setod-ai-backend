@@ -55,6 +55,12 @@ lxml
 python-jose[cryptography]
 passlib[bcrypt]
 
+# ── Admin panel ───────────────────────────────────────────────────────────────
+sqladmin[full]
+
+# ── Billing / Stripe ──────────────────────────────────────────────────────────
+stripe
+
 # ── Dev & testing ─────────────────────────────────────────────────────────────
 pytest
 pytest-asyncio

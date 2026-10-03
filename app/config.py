@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     # https://resend.com/domains — verify setod.com, then set to "Setod <notifications@setod.com>"
     resend_from_email: str = "Setod <onboarding@resend.dev>"
 
+    # Stripe (billing)
+    stripe_secret_key: str = ""
+    stripe_publishable_key: str = ""
+    stripe_webhook_secret: str = ""
+
+    # Platform-managed LLM keys (managed model tier; users supply own keys otherwise)
+    platform_openai_api_key: str = ""
+    platform_anthropic_api_key: str = ""
+
     # Optional platform-owned OAuth apps for MCP catalog servers that refuse DCR
     # (Slack requires a fixed Slack app). When empty, the user pastes their own.
     slack_mcp_client_id: str = ""

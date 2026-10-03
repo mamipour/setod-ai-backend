@@ -580,6 +580,20 @@ async def create_agent(
     await _assert_org_member(session, current_user, body.org_id)
     await _assert_model_connector(session, body.org_id, body.model_connector_id)
 
+    # Entitlement gate: agent count limit
+    try:
+        from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError, _to_http
+        from app.db.models import Agent as _Agent
+        from sqlmodel import select as _select, func as _func
+        _ent = await _resolve_ent(session, body.org_id)
+        _agent_count = (await session.exec(
+            _select(_func.count()).where(_Agent.org_id == body.org_id, _Agent.status != "deleted")
+        )).one()
+        _ent.require_limit("agents", _agent_count)
+    except EntitlementError as e:
+        from app.core.billing.entitlements import _to_http
+        raise _to_http(e)
+
     template = templates.get(body.template_key) if body.template_key else None
     if body.template_key and template is None:
         raise HTTPException(status_code=404, detail="Unknown template")

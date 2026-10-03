@@ -165,6 +165,10 @@ async def create_table(
     if len(columns) > MAX_COLUMNS_PER_TABLE:
         raise TableError(f"Maximum {MAX_COLUMNS_PER_TABLE} columns per table")
 
+    # Entitlement: total row quota across all tables in this org
+    # We use a per-table check (table count is not limited) — row totals are checked at row insert.
+    # No gate here on number of tables; only per-row during create_row.
+
     table_slug = slugify(name, slug)
 
     # Check slug uniqueness
@@ -442,7 +446,7 @@ async def create_row(
     if session_write_counter is not None:
         _check_write_cap(session_write_counter)
 
-    # Row count cap
+    # Row count cap (per-table hard cap)
     from sqlalchemy import func
     count = (await db.exec(
         select(func.count()).where(
@@ -452,6 +456,27 @@ async def create_row(
     )).one()
     if count >= MAX_ROWS_PER_TABLE:
         raise TableError(f"Table has reached the maximum of {MAX_ROWS_PER_TABLE} rows")
+
+    # Entitlement gate: total org row quota
+    try:
+        from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError
+        from sqlalchemy import func as _func
+        _tbl_obj = await get_table(db, org_id, table_id)
+        _ent = await _resolve_ent(db, org_id)
+        _row_limit = _ent.limit("rows")
+        if _row_limit != -1:
+            _total_rows = (await db.exec(
+                select(_func.count()).where(
+                    OrgTableRow.org_id == org_id,
+                    OrgTableRow.deleted_at.is_(None),
+                )
+            )).one()
+            if _total_rows >= _row_limit:
+                raise TableError(
+                    f"Row limit of {_row_limit} reached. Upgrade your plan to add more rows."
+                )
+    except EntitlementError:
+        raise TableError("Row quota exceeded. Upgrade your plan.")
 
     validated = validate_row_data(tbl.columns, data)
 

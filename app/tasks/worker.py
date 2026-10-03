@@ -46,6 +46,7 @@ BATCH = 10
 MAX_CONCURRENT_RUNS = 4
 REAP_EVERY = timedelta(minutes=10)
 PRUNE_EVERY = timedelta(hours=24)
+ROLLUP_EVERY = timedelta(hours=1)
 # Slower tasks (schedules, files, approvals) run every 4th inbound tick (~20s).
 _SLOW_TASK_DIVISOR = 4
 
@@ -251,6 +252,7 @@ async def main() -> None:
     limiter = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
     next_reap = datetime.now(UTC)
     next_prune = datetime.now(UTC)
+    next_rollup = datetime.now(UTC)
     tick = 0
     log.info("scheduler started — polling every %ds (slow tasks every %ds)",
              POLL_SECONDS, POLL_SECONDS * _SLOW_TASK_DIVISOR)
@@ -264,6 +266,16 @@ async def main() -> None:
                     if reaped:
                         log.warning("closed %d abandoned session(s)", reaped)
                     next_reap = datetime.now(UTC) + REAP_EVERY
+
+                if datetime.now(UTC) >= next_rollup:
+                    try:
+                        from app.core.billing.usage import rollup_usage_periods
+                        async with AsyncSessionLocal() as db:
+                            await rollup_usage_periods(db)
+                        log.info("usage rollup completed")
+                    except Exception:
+                        log.exception("usage rollup failed")
+                    next_rollup = datetime.now(UTC) + ROLLUP_EVERY
 
                 if datetime.now(UTC) >= next_prune:
                     try:

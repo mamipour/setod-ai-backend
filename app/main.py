@@ -18,9 +18,12 @@ from app.api.tables.router import router as tables_router
 from app.api.webhooks.router import router as webhooks_router
 from app.api.hooks.router import router as hooks_router
 from app.api.workspace.router import router as workspace_router
+from app.api.billing.router import router as billing_router
+from app.api.voice.router import router as voice_router
 from app.config import settings
 import app.db.models  # noqa: F401 — registers all SQLModel tables
 from app.db.session import check_db
+from app.core.billing.entitlements import EntitlementError
 
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -90,6 +93,27 @@ app.include_router(tables_router)
 app.include_router(webhooks_router)
 app.include_router(hooks_router)
 app.include_router(workspace_router)
+app.include_router(billing_router)
+app.include_router(voice_router)
+
+
+# ── Admin panel ───────────────────────────────────────────────────────────────
+from app.admin.setup import create_admin  # noqa: E402
+create_admin(app)
+
+
+@app.exception_handler(EntitlementError)
+async def entitlement_error_handler(request, exc: EntitlementError):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=402,
+        content={
+            "feature": exc.feature,
+            "plan_required": exc.plan_required,
+            "upgrade_url": "/settings/plan",
+            "message": exc.detail,
+        },
+    )
 
 
 @app.get("/health")

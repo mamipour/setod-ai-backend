@@ -561,6 +561,20 @@ async def invite_member(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> dict:
     """Send an invitation email. If the address is already a member, returns 409."""
+    # Entitlement gate: member limit
+    try:
+        from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError, _to_http
+        from sqlmodel import func as _func, select as _select
+        from app.db.models import OrganizationMember as _OM
+        _ent = await _resolve_ent(session, org_id)
+        _member_count = (await session.exec(
+            _select(_func.count()).where(_OM.organization_id == org_id)
+        )).one()
+        _ent.require_limit("members", _member_count)
+    except EntitlementError as e:
+        from app.core.billing.entitlements import _to_http
+        raise _to_http(e)
+
     # Check not already a member
     existing_user = await session.exec(select(User).where(User.email == body.email))
     target_user = existing_user.first()

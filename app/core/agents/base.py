@@ -238,7 +238,7 @@ async def run_agent(
             if call_tools:
                 tools = tools + call_tools
 
-    client = await _build_client_for(db, agent, config)
+    client, _llm_provider, _llm_billable, _llm_managed = await _build_client_for(db, agent, config)
     if not session.model_slug:
         session.model_slug = client.model
         db.add(session)
@@ -338,6 +338,24 @@ async def run_agent(
             )
             session.prompt_tokens += response.prompt_tokens
             session.completion_tokens += response.completion_tokens
+            # Usage metering — record this turn (idempotent on key)
+            try:
+                from app.core.billing.usage import record_llm_usage as _rlu
+                await _rlu(
+                    db,
+                    org_id=agent.org_id,
+                    agent_id=agent.id,
+                    session_id=session.id,
+                    turn=iteration,
+                    prompt_tokens=response.prompt_tokens,
+                    completion_tokens=response.completion_tokens,
+                    provider=_llm_provider,
+                    model_slug=session.model_slug or "",
+                    billable=_llm_billable,
+                    managed=_llm_managed,
+                )
+            except Exception:  # noqa: BLE001
+                pass  # metering must never break the run
 
             messages.append(assistant_message(response.content, response.tool_calls))
             if response.content:
@@ -906,7 +924,7 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
         if call_tools:
             tools = tools + call_tools
 
-    client = await _build_client_for(db, agent, config)
+    client, _llm_provider, _llm_billable, _llm_managed = await _build_client_for(db, agent, config)
     if not session.model_slug:
         session.model_slug = client.model
         db.add(session)
@@ -980,6 +998,23 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
             response = await client.chat(messages, tools=[t.spec for t in tools] or None)
             session.prompt_tokens += response.prompt_tokens
             session.completion_tokens += response.completion_tokens
+            try:
+                from app.core.billing.usage import record_llm_usage as _rlu
+                await _rlu(
+                    db,
+                    org_id=agent.org_id,
+                    agent_id=agent.id,
+                    session_id=session.id,
+                    turn=iteration,
+                    prompt_tokens=response.prompt_tokens,
+                    completion_tokens=response.completion_tokens,
+                    provider=_llm_provider,
+                    model_slug=session.model_slug or "",
+                    billable=_llm_billable,
+                    managed=_llm_managed,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
             messages.append(assistant_message(response.content, response.tool_calls))
             if response.content:
@@ -1027,9 +1062,36 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
         return session
 
 
-async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, Any]) -> Any:
+async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, Any]) -> tuple:
+    """Return (client, provider_str, billable, managed).
+
+    billable=False  → BYOK (org's own key); usage is recorded but not charged.
+    managed=True    → Setod platform key; markup is applied.
+    """
+    from app.config import settings as _cfg
+
     connector_id = config.get("model_connector_id") or agent.model_connector_id
+
+    # ── Phase 3: platform-managed key fallback ───────────────────────────────
     if not connector_id:
+        # Try platform keys if the org is entitled
+        from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError
+        ent = await _resolve_ent(db, agent.org_id)
+        if ent.allows("managed_models"):
+            # Determine provider from model name
+            model = config.get("model", "")
+            if model.startswith("claude") and _cfg.platform_anthropic_api_key:
+                try:
+                    client = build_client("anthropic", _cfg.platform_anthropic_api_key, model)
+                    return client, "anthropic", True, True
+                except LLMError as exc:
+                    raise AgentRunError(str(exc)) from exc
+            if _cfg.platform_openai_api_key:
+                try:
+                    client = build_client("openai", _cfg.platform_openai_api_key, model)
+                    return client, "openai", True, True
+                except LLMError as exc:
+                    raise AgentRunError(str(exc)) from exc
         raise AgentRunError("This agent has no AI model selected.")
 
     connector = await db.get(Connector, UUID(str(connector_id)))
@@ -1039,8 +1101,149 @@ async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, An
         raise AgentRunError(f"The {connector.name} connector needs reconnecting.")
 
     api_key = decrypt_json(connector.config)["api_key"]
+    provider = connector.type.value  # 'openai' | 'anthropic'
     try:
-        client = build_client(connector.type.value, api_key, config.get("model", ""))
-        return client
+        client = build_client(provider, api_key, config.get("model", ""))
+        # BYOK: org supplied their own key → not billable to Setod's platform
+        return client, provider, False, False
     except LLMError as exc:
         raise AgentRunError(str(exc)) from exc
+
+
+# ── Voice streaming runner ─────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field as dc_field
+from collections.abc import AsyncIterator, Callable
+
+
+@dataclass
+class TurnResult:
+    """Result of one voice turn."""
+    content: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    interrupted: bool = False
+    tool_results: list[str] = dc_field(default_factory=list)
+
+
+async def stream_turn(
+    db: AsyncSession,
+    agent: Agent,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[RegisteredTool],
+    session: "AgentSession",
+    on_token: Callable[[str], Any],      # coroutine called with each text token
+    cancel: "asyncio.Event",
+    use_published: bool = True,
+    max_tool_iterations: int = 3,
+) -> TurnResult:
+    """Stream one conversational turn for voice (ConversationRelay WebSocket handler).
+
+    Streams text tokens to ``on_token`` as they arrive.  When a tool call is
+    needed, pauses streaming, runs the tool, then resumes with the result injected
+    as context.  Approval-gated tools return a spoken acknowledgement instead of
+    pausing the session.
+
+    Cancellation via ``cancel`` truncates streaming at the next token boundary
+    and returns what was generated so far.
+    """
+    import asyncio
+
+    config = _resolve_config(agent, use_published=use_published)
+    client, provider, billable, managed = await _build_client_for(db, agent, config)
+    model_slug = session.model_slug or client.model
+
+    total_prompt = 0
+    total_completion = 0
+    full_content_parts: list[str] = []
+    tool_results_spoken: list[str] = []
+
+    turn_messages = list(messages)
+
+    for tool_iter in range(max_tool_iterations):
+        if cancel.is_set():
+            return TurnResult(
+                content="".join(full_content_parts),
+                prompt_tokens=total_prompt,
+                completion_tokens=total_completion,
+                interrupted=True,
+                tool_results=tool_results_spoken,
+            )
+
+        # Stream text from LLM
+        response = await client.chat(
+            turn_messages,
+            tools=[t.spec for t in tools] if tools else None,
+            max_tokens=512,
+        )
+        total_prompt += response.prompt_tokens
+        total_completion += response.completion_tokens
+
+        # Stream content tokens
+        if response.content:
+            for char in response.content:
+                if cancel.is_set():
+                    break
+                result = on_token(char)
+                if asyncio.iscoroutine(result):
+                    await result
+            full_content_parts.append(response.content)
+
+        if cancel.is_set():
+            break
+
+        if not response.wants_tools:
+            break
+
+        # Tool calls: run them and continue
+        tool_call_spoken = False
+        for tc in response.tool_calls:
+            tool = next((t for t in tools if t.spec.name == tc.name), None)
+            if tool is None:
+                continue
+
+            # Filler before tool execution
+            filler = "One moment…"
+            if not tool_call_spoken:
+                result = on_token(filler)
+                if asyncio.iscoroutine(result):
+                    await result
+                tool_call_spoken = True
+
+            try:
+                from app.core.agents.base import _run_tool_call
+                tool_output = await tool.handler(tc.arguments)
+            except Exception as exc:
+                tool_output = f"Tool error: {exc}"
+
+            tool_results_spoken.append(tool_output[:200])
+            turn_messages.append(assistant_message(response.content, response.tool_calls))
+            turn_messages.append(tool_message(tc.id, tc.name, tool_output))
+
+    # Record usage
+    try:
+        from app.core.billing.usage import record_llm_usage as _rlu
+        await _rlu(
+            db,
+            org_id=agent.org_id,
+            agent_id=agent.id,
+            session_id=session.id,
+            turn=session.iterations,
+            prompt_tokens=total_prompt,
+            completion_tokens=total_completion,
+            provider=provider,
+            model_slug=model_slug,
+            billable=billable,
+            managed=managed,
+        )
+    except Exception:
+        pass
+
+    return TurnResult(
+        content="".join(full_content_parts),
+        prompt_tokens=total_prompt,
+        completion_tokens=total_completion,
+        interrupted=cancel.is_set(),
+        tool_results=tool_results_spoken,
+    )
