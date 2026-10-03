@@ -240,23 +240,11 @@ def upgrade() -> None:
             {"id": uid, "provider": provider, "slug": slug, "inp": inp, "out": out, "ain": ain, "aout": aout},
         )
 
-    # ── Create read-only Postgres role for Metabase ───────────────────────────
-    # Wrapped in a DO block so it is idempotent.
-    op.execute("""
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'setod_ro') THEN
-                CREATE ROLE setod_ro LOGIN PASSWORD 'changeme_setod_ro';
-            END IF;
-        END $$;
-    """)
-    op.execute("""
-        DO $$ BEGIN
-            GRANT USAGE ON SCHEMA public TO setod_ro;
-            GRANT SELECT ON ALL TABLES IN SCHEMA public TO setod_ro;
-        EXCEPTION WHEN others THEN
-            NULL;  -- role may not exist yet if the DO block above failed
-        END $$;
-    """)
+    # Note: The read-only Postgres role (setod_ro) for Metabase is created manually:
+    #   CREATE ROLE setod_ro LOGIN PASSWORD 'changeme_setod_ro';
+    #   GRANT USAGE ON SCHEMA public TO setod_ro;
+    #   GRANT SELECT ON ALL TABLES IN SCHEMA public TO setod_ro;
+    # This is outside the migration transaction because CREATE ROLE is not transactional.
 
 
 def downgrade() -> None:
