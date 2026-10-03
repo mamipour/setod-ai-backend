@@ -13,7 +13,7 @@ from app.api.auth.dependencies import get_current_user, require_owner
 from app.config import settings
 from app.core.billing.entitlements import resolve as resolve_ent
 from app.core.billing.usage import get_org_usage, rollup_usage_periods
-from app.db.models import OrgSubscription, Plan, StripeEvent, User
+from app.db.models import Addon, OrgAddon, OrgSubscription, Plan, StripeEvent, User
 from app.db.session import get_session
 
 log = logging.getLogger(__name__)
@@ -104,6 +104,45 @@ async def create_checkout(
     return {"url": checkout.url}
 
 
+@router.post("/{org_id}/addon-checkout")
+async def create_addon_checkout(
+    org_id: UUID,
+    body: dict,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Start a Stripe Checkout session for a voice add-on (voice_lite or voice_standard)."""
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Billing not configured")
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+    from sqlmodel import select
+
+    addon_code = body.get("addon_code")
+    if not addon_code:
+        raise HTTPException(400, "addon_code required")
+
+    addon = await db.get(Addon, addon_code)
+    if not addon or not addon.stripe_price_id:
+        raise HTTPException(400, f"Add-on '{addon_code}' has no Stripe price configured")
+
+    sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+
+    session_params: dict = {
+        "mode": "subscription",
+        "line_items": [{"price": addon.stripe_price_id, "quantity": 1}],
+        "success_url": f"{settings.frontend_origin}/settings/plan?addon=success",
+        "cancel_url": f"{settings.frontend_origin}/settings/plan?addon=cancel",
+        "metadata": {"org_id": str(org_id), "addon_code": addon_code},
+        "automatic_tax": {"enabled": True},
+    }
+    if sub and sub.stripe_customer_id:
+        session_params["customer"] = sub.stripe_customer_id
+
+    checkout = stripe.checkout.Session.create(**session_params)
+    return {"url": checkout.url}
+
+
 @router.post("/{org_id}/portal")
 async def create_portal(
     org_id: UUID,
@@ -172,8 +211,31 @@ async def _handle_stripe_event(db: AsyncSession, event: dict) -> None:
         org_id = UUID(data["metadata"]["org_id"])
         customer_id = data["customer"]
         subscription_id = data["subscription"]
+        addon_code = data.get("metadata", {}).get("addon_code")
 
-        if subscription_id:
+        if addon_code and subscription_id:
+            # Voice add-on purchase
+            import stripe
+            existing_addon = (await db.exec(
+                select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon_code)
+            )).first()
+            if existing_addon:
+                existing_addon.stripe_subscription_id = subscription_id
+                existing_addon.status = "active"
+                db.add(existing_addon)
+            else:
+                db.add(OrgAddon(
+                    org_id=org_id,
+                    addon_code=addon_code,
+                    stripe_subscription_id=subscription_id,
+                    status="active",
+                ))
+            # Ensure customer ID is stored
+            sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+            if sub and not sub.stripe_customer_id:
+                sub.stripe_customer_id = customer_id
+                db.add(sub)
+        elif subscription_id:
             import stripe
             sub_obj = stripe.Subscription.retrieve(subscription_id)
             plan_code = _plan_from_stripe_sub(sub_obj)

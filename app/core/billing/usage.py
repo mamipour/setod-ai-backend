@@ -177,6 +177,81 @@ async def rollup_usage_periods(db: AsyncSession) -> None:
     await db.commit()
 
 
+# ── Stripe overage push ───────────────────────────────────────────────────────
+
+async def push_voice_overage_to_stripe(db: AsyncSession) -> int:
+    """Push unpushed voice_minutes overage to Stripe as metered usage records.
+
+    Reads usage_periods rows where pushed_to_stripe_at is null and overage > 0,
+    reports to Stripe, then marks them as pushed.
+
+    Returns the number of records pushed.
+    """
+    from app.config import get_settings
+    from app.db.models import Addon, OrgAddon, OrgSubscription
+    settings = get_settings()
+    if not settings.stripe_secret_key:
+        return 0
+
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+
+    now = datetime.now(UTC)
+    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Get unpushed voice_minutes periods with overage
+    result = await db.exec(
+        select(UsagePeriod).where(
+            UsagePeriod.period_start == period_start,
+            UsagePeriod.meter == "voice_minutes",
+            UsagePeriod.pushed_to_stripe_at == None,  # noqa: E711
+            UsagePeriod.overage > 0,
+        )
+    )
+    periods = result.all()
+    pushed = 0
+
+    for period in periods:
+        # Look up the org's voice addon subscription
+        addon = (await db.exec(
+            select(OrgAddon).where(
+                OrgAddon.org_id == period.org_id,
+                OrgAddon.status == "active",
+            ).where(
+                OrgAddon.addon_code.in_(["voice_lite", "voice_standard"])
+            )
+        )).first()
+        if not addon or not addon.stripe_subscription_id:
+            continue
+
+        # Get the subscription item ID for the metered price
+        try:
+            sub = stripe.Subscription.retrieve(addon.stripe_subscription_id)
+            items = sub.get("items", {}).get("data", [])
+            item_id = items[0]["id"] if items else None
+            if not item_id:
+                continue
+
+            stripe.SubscriptionItem.create_usage_record(
+                item_id,
+                quantity=int(math.ceil(period.overage)),
+                timestamp=int(now.timestamp()),
+                action="set",
+            )
+            period.pushed_to_stripe_at = now
+            db.add(period)
+            pushed += 1
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "failed to push voice overage for org %s", period.org_id
+            )
+
+    if pushed:
+        await db.commit()
+    return pushed
+
+
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
 async def get_org_usage(

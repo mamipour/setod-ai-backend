@@ -269,10 +269,13 @@ async def main() -> None:
 
                 if datetime.now(UTC) >= next_rollup:
                     try:
-                        from app.core.billing.usage import rollup_usage_periods
                         async with AsyncSessionLocal() as db:
                             await rollup_usage_periods(db)
                         log.info("usage rollup completed")
+                        async with AsyncSessionLocal() as db:
+                            pushed = await push_voice_overage_to_stripe(db)
+                        if pushed:
+                            log.info("pushed %d voice overage record(s) to Stripe", pushed)
                     except Exception:
                         log.exception("usage rollup failed")
                     next_rollup = datetime.now(UTC) + ROLLUP_EVERY

@@ -1312,7 +1312,9 @@ class OrgAddon(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     org_id: UUID = Field(foreign_key="organizations.id", index=True)
     addon_code: str = Field(foreign_key="addons.code")
+    stripe_subscription_id: str | None = Field(default=None)
     stripe_subscription_item_id: str | None = Field(default=None)
+    status: str = Field(default="active")
     created_at: datetime = _ts()
 
 
