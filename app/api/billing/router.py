@@ -51,6 +51,34 @@ async def get_plan(
         .where(OrgSubscription.org_id == org_id)
     )).first()
     plan = await db.get(Plan, ent.plan_code)
+    # If downgrade is scheduled, fetch the pending plan code from metadata
+    pending_plan_code = None
+    if sub and sub.status == "downgrade_scheduled" and sub.stripe_subscription_id:
+        try:
+            import stripe
+            stripe.api_key = settings.stripe_secret_key
+            _raw = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+            stripe_sub = _raw._to_dict_recursive() if hasattr(_raw, "_to_dict_recursive") else dict(_raw)
+            schedule_id = stripe_sub.get("schedule")
+            if schedule_id:
+                _sched = stripe.SubscriptionSchedule.retrieve(schedule_id)
+                sched = _sched._to_dict_recursive() if hasattr(_sched, "_to_dict_recursive") else dict(_sched)
+                phases = sched.get("phases", [])
+                if len(phases) > 1:
+                    next_phase = phases[1]
+                    next_items = next_phase.get("items", [])
+                    if next_items:
+                        next_price = next_items[0].get("price")
+                        if isinstance(next_price, dict):
+                            next_price = next_price.get("id")
+                        if next_price:
+                            from sqlmodel import select
+                            next_plan = (await db.exec(select(Plan).where(Plan.stripe_monthly_price_id == next_price))).first()
+                            if next_plan:
+                                pending_plan_code = next_plan.code
+        except Exception:
+            log.exception("Failed to fetch pending downgrade plan")
+
     return {
         "plan_code": ent.plan_code,
         "plan_name": plan.display_name if plan else ent.plan_code,
@@ -61,6 +89,7 @@ async def get_plan(
             "status": sub.status if sub else None,
             "stripe_customer_id": sub.stripe_customer_id if sub else None,
             "current_period_end": sub.current_period_end.isoformat() if sub and sub.current_period_end else None,
+            "pending_plan_code": pending_plan_code,
         } if sub else None,
     }
 
@@ -151,10 +180,17 @@ async def change_plan(
 
 
 async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription, plan, plan_code: str) -> dict:
-    """Modify an existing Stripe subscription to a new plan (handles both upgrades and downgrades)."""
-    from datetime import timedelta as _td
+    """Upgrade or schedule a downgrade for an existing Stripe subscription.
 
-    # Retrieve current subscription to find the item ID
+    • Upgrade  (higher sort_order) → immediate with proration.
+    • Downgrade (lower sort_order) → scheduled at period end via subscription schedule.
+    """
+    # Determine direction: compare plan sort_order
+    current_plan = await db.get(Plan, sub.plan_code)
+    current_rank = current_plan.sort_order if current_plan else 0
+    target_rank = plan.sort_order if plan else 0
+
+    # Retrieve current Stripe subscription
     _raw = stripe_mod.Subscription.retrieve(sub.stripe_subscription_id)
     stripe_sub: dict = _raw._to_dict_recursive() if hasattr(_raw, "_to_dict_recursive") else dict(_raw)
     items = stripe_sub.get("items", {}).get("data", [])
@@ -168,31 +204,79 @@ async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription
     if current_price_id == plan.stripe_monthly_price_id:
         return {"status": "ok", "message": "Already on this plan"}
 
-    # Modify the subscription in Stripe
     try:
-        _upd = stripe_mod.Subscription.modify(
-            sub.stripe_subscription_id,
-            items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
-            proration_behavior="create_prorations",
-            metadata={"plan_code": plan_code},
-        )
-        updated: dict = _upd._to_dict_recursive() if hasattr(_upd, "_to_dict_recursive") else dict(_upd)
+        if target_rank > current_rank:
+            # ── Upgrade: immediate switch with prorated charge ──
+            _upd = stripe_mod.Subscription.modify(
+                sub.stripe_subscription_id,
+                items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
+                proration_behavior="create_prorations",
+                metadata={"plan_code": plan_code},
+            )
+            updated: dict = _upd._to_dict_recursive() if hasattr(_upd, "_to_dict_recursive") else dict(_upd)
+
+            sub.plan_code = plan_code
+            sub.status = updated.get("status", "active")
+            if updated.get("current_period_start"):
+                sub.current_period_start = datetime.fromtimestamp(updated["current_period_start"], tz=UTC)
+            if updated.get("current_period_end"):
+                sub.current_period_end = datetime.fromtimestamp(updated["current_period_end"], tz=UTC)
+            db.add(sub)
+            await db.commit()
+            log.info("upgrade: sub=%s → plan=%s (immediate)", sub.stripe_subscription_id, plan_code)
+            return {"status": "ok", "effective": "immediate"}
+
+        else:
+            # ── Downgrade: schedule the new plan for next billing period ──
+            # Use Stripe subscription schedule to switch price at period end.
+            # First, check if a schedule already exists (from a previous pending downgrade).
+            schedule_id = stripe_sub.get("schedule")
+            if schedule_id:
+                # Release the existing schedule so we can create a fresh one
+                stripe_mod.SubscriptionSchedule.release(schedule_id)
+
+            # Create a new schedule from the current subscription
+            _sched = stripe_mod.SubscriptionSchedule.create(from_subscription=sub.stripe_subscription_id)
+            sched: dict = _sched._to_dict_recursive() if hasattr(_sched, "_to_dict_recursive") else dict(_sched)
+
+            # The schedule has one phase (current). Add a second phase for the new plan.
+            current_phase = sched.get("phases", [{}])[0]
+            current_end = current_phase.get("end_date")  # unix ts of period end
+
+            stripe_mod.SubscriptionSchedule.modify(
+                sched["id"],
+                phases=[
+                    # Phase 1: keep current plan until period end
+                    {
+                        "items": [{"price": current_price_id, "quantity": 1}],
+                        "start_date": current_phase.get("start_date"),
+                        "end_date": current_end,
+                    },
+                    # Phase 2: switch to downgraded plan, auto-renew
+                    {
+                        "items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
+                        "start_date": current_end,
+                        "metadata": {"plan_code": plan_code},
+                    },
+                ],
+                end_behavior="release",
+                metadata={"plan_code": plan_code, "org_id": str(sub.org_id)},
+            )
+
+            # Mark pending downgrade in our DB
+            sub.status = "downgrade_scheduled"
+            if current_end:
+                sub.current_period_end = datetime.fromtimestamp(current_end, tz=UTC)
+            db.add(sub)
+            await db.commit()
+
+            effective_date = datetime.fromtimestamp(current_end, tz=UTC).strftime("%Y-%m-%d") if current_end else "next billing cycle"
+            log.info("downgrade scheduled: sub=%s → plan=%s on %s", sub.stripe_subscription_id, plan_code, effective_date)
+            return {"status": "ok", "effective": "end_of_period", "effective_date": effective_date}
+
     except stripe_mod.error.InvalidRequestError as e:
-        log.error("Stripe subscription modify error: %s", e.user_message)
+        log.error("Stripe plan change error: %s", e.user_message)
         raise HTTPException(400, f"Stripe error: {e.user_message}")
-
-    # Optimistically update our DB (webhook will confirm)
-    sub.plan_code = plan_code
-    sub.status = updated.get("status", "active")
-    if updated.get("current_period_start"):
-        sub.current_period_start = datetime.fromtimestamp(updated["current_period_start"], tz=UTC)
-    if updated.get("current_period_end"):
-        sub.current_period_end = datetime.fromtimestamp(updated["current_period_end"], tz=UTC)
-    db.add(sub)
-    await db.commit()
-
-    log.info("plan changed inline: sub=%s → plan=%s", sub.stripe_subscription_id, plan_code)
-    return {"status": "ok"}
 
 
 @router.post("/{org_id}/addon-checkout")
