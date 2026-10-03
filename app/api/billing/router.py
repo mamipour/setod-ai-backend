@@ -168,12 +168,16 @@ async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription
         return {"status": "ok", "message": "Already on this plan"}
 
     # Modify the subscription in Stripe
-    updated = stripe_mod.Subscription.modify(
-        sub.stripe_subscription_id,
-        items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
-        proration_behavior="create_prorations",
-        metadata={"plan_code": plan_code},
-    )
+    try:
+        updated = stripe_mod.Subscription.modify(
+            sub.stripe_subscription_id,
+            items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
+            proration_behavior="create_prorations",
+            metadata={"plan_code": plan_code},
+        )
+    except stripe_mod.error.InvalidRequestError as e:
+        log.error("Stripe subscription modify error: %s", e.user_message)
+        raise HTTPException(400, f"Stripe error: {e.user_message}")
 
     # Optimistically update our DB (webhook will confirm)
     now = datetime.now(UTC)
@@ -246,10 +250,14 @@ async def create_portal(
     if not sub or not sub.stripe_customer_id:
         raise HTTPException(400, "No active subscription — start with Checkout first")
 
-    portal = stripe.billing_portal.Session.create(
-        customer=sub.stripe_customer_id,
-        return_url=f"{settings.frontend_origin}/settings/plan",
-    )
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=sub.stripe_customer_id,
+            return_url=f"{settings.frontend_origin}/settings/plan",
+        )
+    except stripe.error.InvalidRequestError as e:
+        log.error("Stripe portal error: %s", e.user_message)
+        raise HTTPException(400, f"Stripe error: {e.user_message}")
     return {"url": portal.url}
 
 
