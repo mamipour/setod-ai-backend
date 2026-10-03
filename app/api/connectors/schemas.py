@@ -15,6 +15,8 @@ class ConnectorOut(BaseModel):
     updated_at: datetime
     # Non-None when the org lacks an OpenAI connector needed for media processing on this channel.
     media_hint: str | None = None
+    # Populated for twilio connectors — the E.164 phone number.
+    phone_number: str | None = None
 
     model_config = {"from_attributes": True}
 

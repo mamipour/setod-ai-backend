@@ -119,6 +119,12 @@ async def list_connectors(
         item = ConnectorOut.model_validate(c)
         if not has_openai and c.type in _MEDIA_CHANNELS:
             item.media_hint = _MEDIA_HINT
+        if c.type == ConnectorType.twilio and c.config:
+            try:
+                cfg = decrypt_json(c.config)
+                item.phone_number = cfg.get("phone_number")
+            except Exception:
+                pass
         out.append(item)
     return out
 
