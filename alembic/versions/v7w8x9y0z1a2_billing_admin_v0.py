@@ -190,7 +190,7 @@ def upgrade() -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO plans (code, display_name, price_cad_monthly, price_cad_annual, features, limits, included, sort_order)"
-                " VALUES (:code, :name, :monthly, :annual, :features::jsonb, :limits::jsonb, :included::jsonb, :sort)"
+                " VALUES (:code, :name, :monthly, :annual, cast(:features as jsonb), cast(:limits as jsonb), cast(:included as jsonb), :sort)"
                 " ON CONFLICT DO NOTHING"
             ),
             {"code": code, "name": name, "monthly": monthly, "annual": annual,
@@ -207,7 +207,7 @@ def upgrade() -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO addons (code, display_name, price_cad_monthly, features, included, meter)"
-                " VALUES (:code, :name, :price, :features::jsonb, :included::jsonb, :meter)"
+                " VALUES (:code, :name, :price, cast(:features as jsonb), cast(:included as jsonb), :meter)"
                 " ON CONFLICT DO NOTHING"
             ),
             {"code": code, "name": name, "price": price,
