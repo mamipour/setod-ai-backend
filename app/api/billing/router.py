@@ -295,9 +295,15 @@ async def stripe_webhook(
 
 
 async def _handle_stripe_event(db: AsyncSession, event: dict) -> None:
-    from sqlmodel import select
     event_type = event["type"]
-    data = event["data"]["object"]
+    # The Stripe SDK returns StripeObject (not a plain dict) — convert so we can call .get()
+    raw_data = event["data"]["object"]
+    if hasattr(raw_data, "_to_dict_recursive"):
+        data: dict = raw_data._to_dict_recursive()
+    elif hasattr(raw_data, "to_dict"):
+        data = raw_data.to_dict()
+    else:
+        data = dict(raw_data)
     log.info("stripe webhook: %s", event_type)
 
     try:
