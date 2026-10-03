@@ -36,7 +36,7 @@ class StaffAuthBackend(AuthenticationBackend):
         if not user or not user.is_staff:
             return self._login_redirect()
 
-        return None
+        return True
 
     async def login(self, request: Request) -> bool:
         # The admin has no password form — the /admin/login GET page is never shown.
