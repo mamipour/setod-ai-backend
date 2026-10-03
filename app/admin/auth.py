@@ -33,8 +33,19 @@ class StaffAuthBackend(AuthenticationBackend):
         async with async_session_factory() as db:
             user = await db.get(User, user_id)
 
-        if not user or not user.is_staff:
+        if not user:
             return self._login_redirect()
+
+        if not user.is_staff:
+            from starlette.responses import HTMLResponse
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:2rem'>"
+                "<h2>403 — Forbidden</h2>"
+                "<p>Your account does not have staff access to the admin panel.</p>"
+                "<a href='https://setod.com/dashboard'>← Back to dashboard</a>"
+                "</body></html>",
+                status_code=403,
+            )
 
         return True
 

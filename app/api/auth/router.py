@@ -188,6 +188,7 @@ async def me(
         "email": user.email,
         "name": user.name,
         "avatar_url": user.avatar_url,
+        "is_staff": user.is_staff,
         "organizations": [
             {
                 "id": org.id,
