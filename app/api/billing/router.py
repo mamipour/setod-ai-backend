@@ -383,16 +383,24 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
                 sub.status = "cancelled"
                 sub.plan_code = "free"
             else:
-                sub.status = data.get("status", sub.status)
+                # Map Stripe status → our status
+                stripe_status = data.get("status", "active")
+                cancel_at_period_end = data.get("cancel_at_period_end", False)
+                if cancel_at_period_end:
+                    sub.status = "cancel_at_period_end"
+                else:
+                    sub.status = stripe_status  # active, past_due, trialing, etc.
+                # Use cancel_at as the effective end date when scheduled for cancellation
+                period_end_ts = data.get("cancel_at") or data.get("current_period_end")
+                if period_end_ts:
+                    sub.current_period_end = datetime.fromtimestamp(period_end_ts, tz=UTC)
                 if data.get("current_period_start"):
                     sub.current_period_start = datetime.fromtimestamp(data["current_period_start"], tz=UTC)
-                if data.get("current_period_end"):
-                    sub.current_period_end = datetime.fromtimestamp(data["current_period_end"], tz=UTC)
                 # Resolve plan_code: prefer metadata, fall back to price-ID lookup in plans table
                 resolved = await _plan_code_from_stripe_sub(db, data)
                 if resolved:
                     sub.plan_code = resolved
-                    log.info("subscription.updated: sub=%s → plan=%s", stripe_sub_id, resolved)
+                    log.info("subscription.updated: sub=%s → plan=%s status=%s", stripe_sub_id, resolved, sub.status)
             db.add(sub)
 
     elif event_type == "invoice.payment_failed":
