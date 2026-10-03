@@ -119,3 +119,24 @@ async def entitlement_error_handler(request, exc: EntitlementError):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/admin-debug", include_in_schema=False)
+async def admin_debug(request: Request):
+    """Temporary: shows whether the access_token cookie reaches api.setod.com."""
+    from app.config import settings as _s
+    from app.api.auth.dependencies import decode_access_token
+    from app.db.session import get_session as _gs
+    token = request.cookies.get("access_token")
+    if not token:
+        return {"cookie": "MISSING", "cookies_received": list(request.cookies.keys())}
+    try:
+        user_id = decode_access_token(token)
+    except Exception as e:
+        return {"cookie": "INVALID", "error": str(e)}
+    async for db in _gs():
+        from app.db.models import User as _U
+        user = await db.get(_U, user_id)
+        if not user:
+            return {"cookie": "ok", "user_id": str(user_id), "found": False}
+        return {"cookie": "ok", "email": user.email, "is_staff": user.is_staff}
