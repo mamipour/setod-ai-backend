@@ -307,16 +307,22 @@ async def reactivate(
             if schedule_id:
                 stripe.SubscriptionSchedule.release(schedule_id)
         else:
-            # Undo cancel_at_period_end
-            stripe.Subscription.modify(
-                sub.stripe_subscription_id,
-                cancel_at_period_end=False,
-            )
+            # Undo cancellation — clear both the period-end flag and any portal-set cancel_at timestamp
+            _raw = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+            stripe_sub = _raw._to_dict_recursive() if hasattr(_raw, "_to_dict_recursive") else dict(_raw)
+            params: dict = {}
+            if stripe_sub.get("cancel_at_period_end"):
+                params["cancel_at_period_end"] = False
+            if stripe_sub.get("cancel_at"):
+                params["cancel_at"] = ""  # empty string clears the field
+            if params:
+                stripe.Subscription.modify(sub.stripe_subscription_id, **params)
     except stripe.error.InvalidRequestError as e:
         log.error("Stripe reactivate error: %s", e.user_message)
         raise HTTPException(400, f"Stripe error: {e.user_message}")
 
     sub.status = "active"
+    sub.cancel_at = None
     db.add(sub)
     await db.commit()
     log.info("subscription reactivated: org=%s sub=%s", org_id, sub.stripe_subscription_id)
@@ -514,13 +520,20 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
             else:
                 # Map Stripe status → our status
                 stripe_status = data.get("status", "active")
-                cancel_at_period_end = data.get("cancel_at_period_end", False)
-                if cancel_at_period_end:
+                # Portal cancellation sets `cancel_at` (timestamp); API cancellation sets `cancel_at_period_end`.
+                cancel_at_ts = data.get("cancel_at")
+                is_cancelling = bool(data.get("cancel_at_period_end")) or bool(cancel_at_ts)
+                if is_cancelling and stripe_status in ("active", "trialing"):
                     sub.status = "cancel_at_period_end"
+                elif data.get("schedule") and sub.status == "downgrade_scheduled":
+                    sub.status = "downgrade_scheduled"  # preserve our scheduled-downgrade marker
                 else:
                     sub.status = stripe_status  # active, past_due, trialing, etc.
-                # Use cancel_at as the effective end date when scheduled for cancellation
-                period_end_ts = data.get("cancel_at") or data.get("current_period_end")
+                sub.cancel_at = datetime.fromtimestamp(cancel_at_ts, tz=UTC) if cancel_at_ts else None
+                # Period end: newer API versions put it on the item, not the subscription
+                items = data.get("items", {}).get("data", [])
+                item_period_end = items[0].get("current_period_end") if items else None
+                period_end_ts = cancel_at_ts or data.get("current_period_end") or item_period_end
                 if period_end_ts:
                     sub.current_period_end = datetime.fromtimestamp(period_end_ts, tz=UTC)
                 if data.get("current_period_start"):
