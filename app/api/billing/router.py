@@ -95,7 +95,6 @@ async def create_checkout(
         "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
         "metadata": {"org_id": str(org_id)},
-        "automatic_tax": {"enabled": True},
     }
     if sub and sub.stripe_customer_id:
         session_params["customer"] = sub.stripe_customer_id
@@ -134,7 +133,6 @@ async def create_addon_checkout(
         "success_url": f"{settings.frontend_origin}/settings/plan?addon=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?addon=cancel",
         "metadata": {"org_id": str(org_id), "addon_code": addon_code},
-        "automatic_tax": {"enabled": True},
     }
     if sub and sub.stripe_customer_id:
         session_params["customer"] = sub.stripe_customer_id
