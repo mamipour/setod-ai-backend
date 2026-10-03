@@ -6,6 +6,7 @@ Create Date: 2026-10-03
 """
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy import text as _t
 from sqlalchemy.dialects import postgresql
 
 revision = "v7w8x9y0z1a2"
@@ -43,9 +44,9 @@ def upgrade() -> None:
         sa.Column("display_name", sa.Text(), nullable=False),
         sa.Column("price_cad_monthly", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("price_cad_annual", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("features", postgresql.JSONB(), nullable=False, server_default="'{}'"),
-        sa.Column("limits", postgresql.JSONB(), nullable=False, server_default="'{}'"),
-        sa.Column("included", postgresql.JSONB(), nullable=False, server_default="'{}'"),
+        sa.Column("features", postgresql.JSONB(), nullable=False, server_default=_t("'{}'::jsonb")),
+        sa.Column("limits", postgresql.JSONB(), nullable=False, server_default=_t("'{}'::jsonb")),
+        sa.Column("included", postgresql.JSONB(), nullable=False, server_default=_t("'{}'::jsonb")),
         sa.Column("stripe_monthly_price_id", sa.Text(), nullable=True),
         sa.Column("stripe_annual_price_id", sa.Text(), nullable=True),
         sa.Column("active", sa.Boolean(), nullable=False, server_default="true"),
@@ -59,8 +60,8 @@ def upgrade() -> None:
         sa.Column("code", sa.Text(), primary_key=True),
         sa.Column("display_name", sa.Text(), nullable=False),
         sa.Column("price_cad_monthly", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("features", postgresql.JSONB(), nullable=False, server_default="'{}'"),
-        sa.Column("included", postgresql.JSONB(), nullable=False, server_default="'{}'"),
+        sa.Column("features", postgresql.JSONB(), nullable=False, server_default=_t("'{}'::jsonb")),
+        sa.Column("included", postgresql.JSONB(), nullable=False, server_default=_t("'{}'::jsonb")),
         sa.Column("meter", sa.Text(), nullable=True),
         sa.Column("stripe_price_id", sa.Text(), nullable=True),
         sa.Column("active", sa.Boolean(), nullable=False, server_default="true"),
@@ -177,30 +178,41 @@ def upgrade() -> None:
     import json
     from uuid import uuid4
 
-    op.execute(f"""
-        INSERT INTO plans (code, display_name, price_cad_monthly, price_cad_annual, features, limits, included, sort_order) VALUES
-        ('free',     'Free',     0,     0,      '{json.dumps({"managed_models": False, "voice": False})}',
-                                                '{json.dumps({"agents": 2, "members": 2, "rows": 5000, "model_credits": 0})}',
-                                                '{json.dumps({"model_credits": 0})}',     0),
-        ('pro',      'Pro',      4900,  49000,  '{json.dumps({"managed_models": True, "voice": False})}',
-                                                '{json.dumps({"agents": 10, "members": 10, "rows": 100000, "model_credits": 2000})}',
-                                                '{json.dumps({"model_credits": 2000})}',  1),
-        ('business', 'Business', 14900, 149000, '{json.dumps({"managed_models": True, "voice": True})}',
-                                                '{json.dumps({"agents": -1, "members": -1, "rows": -1, "model_credits": 10000})}',
-                                                '{json.dumps({"model_credits": 10000})}', 2)
-        ON CONFLICT DO NOTHING
-    """)
+    # Use text() with bind params to avoid quoting issues with JSONB values
+    conn = op.get_bind()
 
-    op.execute(f"""
-        INSERT INTO addons (code, display_name, price_cad_monthly, features, included, meter) VALUES
-        ('voice_lite',     'Voice Lite (400 min/mo)',     14900,
-         '{json.dumps({"voice": True})}', '{json.dumps({"voice_minutes": 400})}',  'voice_minutes'),
-        ('voice_standard', 'Voice Standard (1,000 min/mo)', 29900,
-         '{json.dumps({"voice": True})}', '{json.dumps({"voice_minutes": 1000})}', 'voice_minutes'),
-        ('rows_100k',      '100k Extra Rows',             1900,
-         '{{}}', '{json.dumps({"rows": 100000})}', NULL)
-        ON CONFLICT DO NOTHING
-    """)
+    plans = [
+        ("free",     "Free",     0,     0,     {"managed_models": False, "voice": False}, {"agents": 2, "members": 2, "rows": 5000, "model_credits": 0}, {"model_credits": 0},     0),
+        ("pro",      "Pro",      4900,  49000, {"managed_models": True,  "voice": False}, {"agents": 10, "members": 10, "rows": 100000, "model_credits": 2000}, {"model_credits": 2000},  1),
+        ("business", "Business", 14900, 149000,{"managed_models": True,  "voice": True},  {"agents": -1, "members": -1, "rows": -1, "model_credits": 10000}, {"model_credits": 10000}, 2),
+    ]
+    for code, name, monthly, annual, features, limits, included, sort in plans:
+        conn.execute(
+            sa.text(
+                "INSERT INTO plans (code, display_name, price_cad_monthly, price_cad_annual, features, limits, included, sort_order)"
+                " VALUES (:code, :name, :monthly, :annual, :features::jsonb, :limits::jsonb, :included::jsonb, :sort)"
+                " ON CONFLICT DO NOTHING"
+            ),
+            {"code": code, "name": name, "monthly": monthly, "annual": annual,
+             "features": json.dumps(features), "limits": json.dumps(limits),
+             "included": json.dumps(included), "sort": sort},
+        )
+
+    addons = [
+        ("voice_lite",     "Voice Lite (400 min/mo)",        14900, {"voice": True}, {"voice_minutes": 400},  "voice_minutes"),
+        ("voice_standard", "Voice Standard (1,000 min/mo)",  29900, {"voice": True}, {"voice_minutes": 1000}, "voice_minutes"),
+        ("rows_100k",      "100k Extra Rows",                 1900,  {},              {"rows": 100000},         None),
+    ]
+    for code, name, price, features, included, meter in addons:
+        conn.execute(
+            sa.text(
+                "INSERT INTO addons (code, display_name, price_cad_monthly, features, included, meter)"
+                " VALUES (:code, :name, :price, :features::jsonb, :included::jsonb, :meter)"
+                " ON CONFLICT DO NOTHING"
+            ),
+            {"code": code, "name": name, "price": price,
+             "features": json.dumps(features), "included": json.dumps(included), "meter": meter},
+        )
 
     # Seed model prices (USD per million tokens, Oct 2026 pricing)
     prices = [
@@ -219,11 +231,14 @@ def upgrade() -> None:
     ]
     for provider, slug, inp, out, ain, aout in prices:
         uid = str(uuid4())
-        op.execute(f"""
-            INSERT INTO model_prices (id, provider, model_slug, input_per_m, output_per_m, audio_in_per_m, audio_out_per_m, managed_markup)
-            VALUES ('{uid}', '{provider}', '{slug}', {inp}, {out}, {ain}, {aout}, 1.5)
-            ON CONFLICT ON CONSTRAINT uq_model_prices_slot DO NOTHING
-        """)
+        conn.execute(
+            sa.text(
+                "INSERT INTO model_prices (id, provider, model_slug, input_per_m, output_per_m, audio_in_per_m, audio_out_per_m, managed_markup)"
+                " VALUES (:id, :provider, :slug, :inp, :out, :ain, :aout, 1.5)"
+                " ON CONFLICT ON CONSTRAINT uq_model_prices_slot DO NOTHING"
+            ),
+            {"id": uid, "provider": provider, "slug": slug, "inp": inp, "out": out, "ain": ain, "aout": aout},
+        )
 
     # ── Create read-only Postgres role for Metabase ───────────────────────────
     # Wrapped in a DO block so it is idempotent.
@@ -235,10 +250,12 @@ def upgrade() -> None:
         END $$;
     """)
     op.execute("""
-        GRANT CONNECT ON DATABASE postgres TO setod_ro;
-        GRANT USAGE ON SCHEMA public TO setod_ro;
-        GRANT SELECT ON ALL TABLES IN SCHEMA public TO setod_ro;
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO setod_ro;
+        DO $$ BEGIN
+            GRANT USAGE ON SCHEMA public TO setod_ro;
+            GRANT SELECT ON ALL TABLES IN SCHEMA public TO setod_ro;
+        EXCEPTION WHEN others THEN
+            NULL;  -- role may not exist yet if the DO block above failed
+        END $$;
     """)
 
 
