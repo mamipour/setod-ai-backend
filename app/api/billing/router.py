@@ -94,7 +94,7 @@ async def create_checkout(
         "line_items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
         "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
-        "metadata": {"org_id": str(org_id)},
+        "metadata": {"org_id": str(org_id), "plan_code": plan_code},
     }
     if sub and sub.stripe_customer_id:
         session_params["customer"] = sub.stripe_customer_id
@@ -203,17 +203,28 @@ async def _handle_stripe_event(db: AsyncSession, event: dict) -> None:
     from sqlmodel import select
     event_type = event["type"]
     data = event["data"]["object"]
-    log.info(f"stripe webhook: {event_type}")
+    log.info("stripe webhook: %s", event_type)
+
+    try:
+        await _process_stripe_event(db, event_type, data)
+    except Exception:
+        log.exception("stripe webhook handler failed for %s", event_type)
+        raise
+
+
+async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -> None:
+    from sqlmodel import select
 
     if event_type == "checkout.session.completed":
-        org_id = UUID(data["metadata"]["org_id"])
-        customer_id = data["customer"]
-        subscription_id = data["subscription"]
-        addon_code = data.get("metadata", {}).get("addon_code")
+        meta = data.get("metadata") or {}
+        org_id = UUID(meta["org_id"])
+        customer_id = data.get("customer")
+        subscription_id = data.get("subscription")
+        addon_code = meta.get("addon_code")
+        plan_code = meta.get("plan_code", "pro")
 
         if addon_code and subscription_id:
             # Voice add-on purchase
-            import stripe
             existing_addon = (await db.exec(
                 select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon_code)
             )).first()
@@ -228,23 +239,26 @@ async def _handle_stripe_event(db: AsyncSession, event: dict) -> None:
                     stripe_subscription_id=subscription_id,
                     status="active",
                 ))
-            # Ensure customer ID is stored
+            # Store customer ID on the main subscription row
             sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
             if sub and not sub.stripe_customer_id:
                 sub.stripe_customer_id = customer_id
                 db.add(sub)
+
         elif subscription_id:
-            import stripe
-            sub_obj = stripe.Subscription.retrieve(subscription_id)
-            plan_code = _plan_from_stripe_sub(sub_obj)
+            # Plan upgrade — no external Stripe call needed; plan_code is in session metadata
             sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+            now = datetime.now(UTC)
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            from datetime import timedelta as _td
+            period_end = (now.replace(day=1) + _td(days=32)).replace(day=1)
             if sub:
                 sub.stripe_customer_id = customer_id
                 sub.stripe_subscription_id = subscription_id
                 sub.plan_code = plan_code
                 sub.status = "active"
-                sub.current_period_start = datetime.fromtimestamp(sub_obj["current_period_start"], tz=UTC)
-                sub.current_period_end = datetime.fromtimestamp(sub_obj["current_period_end"], tz=UTC)
+                sub.current_period_start = period_start
+                sub.current_period_end = period_end
                 db.add(sub)
             else:
                 db.add(OrgSubscription(
@@ -253,9 +267,10 @@ async def _handle_stripe_event(db: AsyncSession, event: dict) -> None:
                     status="active",
                     stripe_customer_id=customer_id,
                     stripe_subscription_id=subscription_id,
-                    current_period_start=datetime.fromtimestamp(sub_obj["current_period_start"], tz=UTC),
-                    current_period_end=datetime.fromtimestamp(sub_obj["current_period_end"], tz=UTC),
+                    current_period_start=period_start,
+                    current_period_end=period_end,
                 ))
+            log.info("org %s upgraded to plan=%s sub=%s", org_id, plan_code, subscription_id)
 
     elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
         stripe_sub_id = data["id"]
