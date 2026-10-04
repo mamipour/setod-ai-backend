@@ -311,8 +311,7 @@ async def list_platform_models(
     if not ent.allows("managed_models"):
         return {"models": [], "available": False}
 
-    from app.config import get_settings
-    settings = get_settings()
+    from app.config import settings
     providers: list[str] = []
     if settings.platform_openai_api_key:
         providers.append("openai")

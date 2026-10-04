@@ -242,9 +242,8 @@ async def push_voice_overage_to_stripe(db: AsyncSession) -> int:
 
     Returns the number of MeterEvent records sent.
     """
-    from app.config import get_settings
+    from app.config import settings
     from app.db.models import Addon, OrgAddon, OrgSubscription, Organization
-    settings = get_settings()
     if not settings.stripe_secret_key:
         return 0
 
