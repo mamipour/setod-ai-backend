@@ -167,8 +167,8 @@ def _ensure_metered_price(product_id: str, meter_id: str, nickname: str) -> str:
     """Find or create a USD metered price backed by a Billing Meter."""
     prices = stripe.Price.list(product=product_id, currency="usd", active=True, limit=20)
     for p in prices.data:
-        rec = p.get("recurring") or {}
-        if rec.get("usage_type") == "metered" and rec.get("meter") == meter_id:
+        rec = p.recurring  # Stripe SDK object — use attribute access, not dict.get()
+        if rec and getattr(rec, "usage_type", None) == "metered" and getattr(rec, "meter", None) == meter_id:
             print(f"  Reusing metered price: {p.id} ({nickname})")
             return p.id
     price = stripe.Price.create(
