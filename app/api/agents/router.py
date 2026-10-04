@@ -323,14 +323,21 @@ async def list_platform_models(
     from app.core.billing.usage import default_managed_model
 
     priced = await _priced_models(session, providers)
+    # Per-provider default (recommended model if priced, else cheapest priced).
+    defaults = {p: await default_managed_model(session, p) for p in providers}
+
+    # Build list with the default model pinned first per provider, rest by price desc.
+    def _sort_key(item: tuple[str, str]) -> tuple[int, int]:
+        provider, slug = item
+        is_default = 0 if slug == defaults.get(provider) else 1
+        rank = next((i for i, (p, s) in enumerate(priced) if p == provider and s == slug), 999)
+        return (is_default, rank)
+
+    sorted_priced = sorted(priced, key=_sort_key)
     models = [
         {"id": slug, "label": _model_label(slug), "provider": provider}
-        for provider, slug in priced
+        for provider, slug in sorted_priced
     ]
-    # Per-provider default (recommended model if priced, else cheapest priced).  The UI sets
-    # this concretely when a user picks
-    # "<Provider> (Managed)", because the backend infers the managed provider from the slug.
-    defaults = {p: await default_managed_model(session, p) for p in providers}
     return {"models": models, "available": True, "providers": providers, "defaults": defaults}
 
 
@@ -418,14 +425,15 @@ async def list_models(
 
     # Only offer models we have a price row for.  The provider's live list confirms the
     # model still exists on the user's key; the price table confirms we can account for it.
-    # Sort by price descending — same order as the managed model list — so both pickers
-    # show models in the same sequence regardless of what order the provider API returns them.
+    # Sort by price descending with the default model pinned first — same ordering as the
+    # managed model list — so both pickers show models in the same sequence.
     priced = await _priced_models(session, [connector.type.value])
+    default_slug = DEFAULT_MODELS.get(connector.type.value, "")
     price_rank: dict[str, int] = {slug: i for i, (_, slug) in enumerate(priced)}
     models = [m for m in models if m["id"] in price_rank]
-    models.sort(key=lambda m: price_rank[m["id"]])
+    models.sort(key=lambda m: (0 if m["id"] == default_slug else 1, price_rank[m["id"]]))
 
-    return {"models": models, "default": DEFAULT_MODELS.get(connector.type.value, "")}
+    return {"models": models, "default": default_slug}
 
 
 @router.get("/templates")
