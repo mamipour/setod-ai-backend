@@ -217,8 +217,15 @@ async def get_plan(
 
     # Credit balance
     from app.core.billing.credits import balance as credit_balance
+    from sqlmodel import select as _select
     balance_cents = await credit_balance(db, org_id)
     monthly_credit_cents = plan.monthly_credit_cents if plan else 0
+
+    # Active add-on codes
+    active_addon_rows = (await db.exec(
+        _select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.status == "active")
+    )).all()
+    active_addons = [oa.addon_code for oa in active_addon_rows]
 
     return {
         "plan_code": ent.plan_code,
@@ -228,6 +235,7 @@ async def get_plan(
         "included": ent.included,
         "monthly_credit_cents": monthly_credit_cents,
         "credit_balance_cents": balance_cents,
+        "active_addons": active_addons,
         "subscription": {
             "status": sub.status if sub else None,
             "stripe_customer_id": sub.stripe_customer_id if sub else None,
