@@ -86,7 +86,7 @@ async def list_connectors(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     result = await session.exec(
         select(Connector).where(Connector.org_id == org_id).order_by(Connector.created_at)
     )
@@ -177,7 +177,7 @@ async def test_connector(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     connector = await session.get(Connector, connector_id)
     if not connector or connector.org_id != org_id:
         raise HTTPException(status_code=404, detail="Connector not found")
@@ -809,7 +809,7 @@ async def tg_client_start(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_member(session, current_user, body.org_id)
     _cleanup_tg_pending()
 
     client = _tg_client()
@@ -1122,7 +1122,7 @@ async def twilio_send_test_sms(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_member(session, current_user, body.org_id)
     connector = await session.get(Connector, connector_id)
     if not connector or connector.org_id != body.org_id:
         raise HTTPException(status_code=404, detail="Connector not found")
@@ -1215,7 +1215,7 @@ async def mcp_probe(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_member(session, current_user, body.org_id)
     try:
         url = mcp.validate_mcp_url(body.url)
         result = await mcp.probe_mcp(url, token=body.token or None)
@@ -1397,7 +1397,7 @@ async def mcp_oauth_start(
     url: Annotated[str, Query()] = "",
     name: Annotated[str, Query()] = "",
 ):
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     location = await _begin_mcp_oauth(
         request,
         org_id=org_id,

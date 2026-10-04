@@ -23,7 +23,7 @@ async def _get_skill(session: AsyncSession, user: User, skill_id: UUID) -> Skill
     skill = await session.get(Skill, skill_id)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    await _assert_org_member(session, user, skill.org_id)
+    await assert_org_member(session, user, skill.org_id)
     return skill
 
 
@@ -31,7 +31,7 @@ async def _get_owned_agent(session: AsyncSession, user: User, agent_id: UUID) ->
     agent = await session.get(Agent, agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    await _assert_org_member(session, user, agent.org_id)
+    await assert_org_member(session, user, agent.org_id)
     return agent
 
 
@@ -88,7 +88,7 @@ async def list_skills(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> list[SkillOut]:
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     result = await session.exec(
         select(Skill)
         .where(Skill.org_id == org_id)
@@ -103,7 +103,7 @@ async def create_skill(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SkillOut:
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_member(session, current_user, body.org_id)
     skill = Skill(
         org_id=body.org_id,
         name=body.name,

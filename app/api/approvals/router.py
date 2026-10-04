@@ -70,7 +70,7 @@ async def _get_owned_request(
     req = await session.get(ApprovalRequest, request_id)
     if req is None:
         raise HTTPException(status_code=404, detail="Approval request not found")
-    await _assert_org_member(session, user, req.org_id)
+    await assert_org_member(session, user, req.org_id)
     return req
 
 
@@ -103,7 +103,7 @@ async def pending_count(
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
     """Badge endpoint: just the number, polled from the sidebar."""
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     rows = await session.exec(
         select(ApprovalRequest).where(
             ApprovalRequest.org_id == org_id,
@@ -121,7 +121,7 @@ async def list_approvals(
     resolved: bool = False,
 ):
     """List approval requests. By default only pending ones; pass resolved=true for history."""
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     statuses = (
         [ApprovalStatus.approved, ApprovalStatus.rejected, ApprovalStatus.expired]
         if resolved

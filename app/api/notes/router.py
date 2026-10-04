@@ -24,7 +24,7 @@ async def _get_note(session: AsyncSession, user: User, note_id: UUID) -> OwnerNo
     note = await session.get(OwnerNote, note_id)
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
-    await _assert_org_member(session, user, note.org_id)
+    await assert_org_member(session, user, note.org_id)
     return note
 
 
@@ -86,7 +86,7 @@ async def list_notes(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> list[NoteOut]:
     """Return all notes for this org (live, resolved, and expired), newest first."""
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     result = await session.exec(
         select(OwnerNote)
         .where(OwnerNote.org_id == org_id)
@@ -101,7 +101,7 @@ async def create_note(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> NoteOut:
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_member(session, current_user, body.org_id)
 
     if len(body.body.strip()) == 0:
         raise HTTPException(status_code=422, detail="Note body cannot be empty")

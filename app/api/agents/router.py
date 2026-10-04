@@ -186,7 +186,7 @@ async def _get_owned_agent(session: AsyncSession, user: User, agent_id: UUID) ->
     agent = await session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
-    await _assert_org_member(session, user, agent.org_id)
+    await assert_org_member(session, user, agent.org_id)
     return agent
 
 
@@ -305,7 +305,7 @@ async def list_platform_models(
     against the credit ledger.  Add a row in the admin to expose a new model.
     """
     from app.core.billing.entitlements import resolve as resolve_ent
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     ent = await resolve_ent(session, org_id)
     if not ent.allows("managed_models"):
         return {"models": [], "available": False}
@@ -388,7 +388,7 @@ async def list_models(
     connector = await session.get(Connector, connector_id)
     if connector is None:
         raise HTTPException(status_code=404, detail="Connector not found")
-    await _assert_org_member(session, current_user, connector.org_id)
+    await assert_org_member(session, current_user, connector.org_id)
     if connector.type not in (ConnectorType.openai, ConnectorType.anthropic):
         raise HTTPException(status_code=422, detail="That connector is not a model provider")
 
@@ -447,7 +447,7 @@ async def list_templates(
     otherwise need its own copy of the rule for which connector types satisfy which
     requirement — a rule that would then drift from the one the create flow enforces.
     """
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
 
     rows = await session.exec(
         select(Connector).where(
@@ -483,7 +483,7 @@ async def workspace_overview(
     Aggregated here rather than assembled in the browser, because the alternative is the UI
     fetching sessions per agent — a request per agent on every dashboard visit.
     """
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
 
     # Resolve the user's timezone, falling back to UTC for unknown values.
     try:
@@ -664,7 +664,7 @@ async def create_agent(
     A template supplies defaults, not overrides: the create flow shows the instructions in an
     editable box before this is called, so anything the caller sends explicitly wins.
     """
-    await _assert_org_member(session, current_user, body.org_id)
+    await assert_org_member(session, current_user, body.org_id)
     await _assert_model_connector(session, body.org_id, body.model_connector_id)
 
     # Entitlement gate: agent count limit
@@ -714,7 +714,7 @@ async def list_agents(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    await _assert_org_member(session, current_user, org_id)
+    await assert_org_member(session, current_user, org_id)
     result = await session.exec(
         select(Agent).where(Agent.org_id == org_id).order_by(Agent.created_at.desc())
     )
