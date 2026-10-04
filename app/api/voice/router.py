@@ -309,8 +309,9 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                         "Do not use markdown, bullet points, or any formatting. "
                         "Read numbers and codes digit by digit with pauses. "
                         "If you need to do something that requires approval, say 'I'll have the team follow up on that.' "
-                        "IMPORTANT: always reply in the same language the caller is speaking. "
-                        "If they switch languages mid-call, switch with them immediately."
+                        "IMPORTANT: only reply in English or French. "
+                        "If the caller speaks French, reply in French. "
+                        "For any other language, always reply in English."
                     ))
 
                     # LLM-generated opening greeting — stream it immediately so the caller
@@ -368,7 +369,9 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                 # This is a system message so it doesn't pollute the visible conversation history.
                 turn_messages = list(messages)
                 if detected_lang:
-                    turn_messages.append(system_message(f"[Caller is speaking {detected_lang} — reply in {detected_lang}]"))
+                    # Only mirror French; fall back to English for all other detected languages
+                    reply_lang = "French" if detected_lang.startswith("fr") else "English"
+                    turn_messages.append(system_message(f"[Caller is speaking {detected_lang} — reply in {reply_lang}]"))
                 turn_messages.append(user_message(voice_text))
 
                 async with AsyncSessionLocal() as db:
