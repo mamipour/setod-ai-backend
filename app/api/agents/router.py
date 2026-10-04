@@ -671,11 +671,12 @@ async def create_agent(
     # Entitlement gate: agent count limit
     try:
         from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError, _to_http
-        from app.db.models import Agent as _Agent
+        from app.db.models import Agent as _Agent, AgentStatus as _AgentStatus
         from sqlmodel import select as _select, func as _func
         _ent = await _resolve_ent(session, body.org_id)
+        _active_statuses = [_AgentStatus.draft, _AgentStatus.published, _AgentStatus.paused]
         _agent_count = (await session.exec(
-            _select(_func.count()).where(_Agent.org_id == body.org_id, _Agent.status != "deleted")
+            _select(_func.count()).where(_Agent.org_id == body.org_id, _Agent.status.in_(_active_statuses))
         )).one()
         _ent.require_limit("agents", _agent_count)
     except EntitlementError as e:
