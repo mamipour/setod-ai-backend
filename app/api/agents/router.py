@@ -299,7 +299,12 @@ async def list_platform_models(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ):
-    """Models available via Setod-managed keys (requires managed_models entitlement)."""
+    """Models available via Setod-managed keys (requires managed_models entitlement).
+
+    The list is driven by ``model_prices``: a managed model is only offered if we
+    have an active price row for it, because an unpriced model would run for free
+    against the credit ledger.  Add a row in the admin to expose a new model.
+    """
     from app.core.billing.entitlements import resolve as resolve_ent
     await _assert_org_member(session, current_user, org_id)
     ent = await resolve_ent(session, org_id)
@@ -308,20 +313,51 @@ async def list_platform_models(
 
     from app.config import get_settings
     settings = get_settings()
-    models = []
+    providers: list[str] = []
     if settings.platform_openai_api_key:
-        models += [
-            {"id": "gpt-4o",           "label": "GPT-4o",               "provider": "openai"},
-            {"id": "gpt-4o-mini",      "label": "GPT-4o mini",           "provider": "openai"},
-            {"id": "o3-mini",          "label": "o3 mini",               "provider": "openai"},
-        ]
+        providers.append("openai")
     if settings.platform_anthropic_api_key:
-        models += [
-            {"id": "claude-opus-4-5",  "label": "Claude Opus 4.5",       "provider": "anthropic"},
-            {"id": "claude-sonnet-4-5","label": "Claude Sonnet 4.5",      "provider": "anthropic"},
-            {"id": "claude-haiku-3-5", "label": "Claude Haiku 3.5",       "provider": "anthropic"},
-        ]
+        providers.append("anthropic")
+    if not providers:
+        return {"models": [], "available": True}
+
+    priced = await _priced_models(session, providers)
+    models = [
+        {"id": slug, "label": _model_label(slug), "provider": provider}
+        for provider, slug in priced
+    ]
     return {"models": models, "available": True}
+
+
+async def _priced_models(session: AsyncSession, providers: list[str]) -> list[tuple[str, str]]:
+    """Return (provider, model_slug) pairs that have an active price row, ordered by cost desc."""
+    from app.db.models import ModelPrice
+    rows = await session.exec(
+        select(ModelPrice.provider, ModelPrice.model_slug, ModelPrice.input_per_m)
+        .where(ModelPrice.provider.in_(providers), ModelPrice.active == True)  # noqa: E712
+        .order_by(ModelPrice.provider, ModelPrice.input_per_m.desc())
+    )
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for provider, slug, _ in rows.all():
+        key = (provider, slug)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _model_label(slug: str) -> str:
+    """Human label for a model slug, e.g. 'claude-sonnet-4-5' → 'Claude Sonnet 4.5'."""
+    if slug.startswith("claude-"):
+        parts = slug.split("-")[1:]
+        words, version = [], []
+        for p in parts:
+            (version if p.isdigit() else words).append(p)
+        return "Claude " + " ".join(w.capitalize() for w in words) + (" " + ".".join(version) if version else "")
+    if slug.startswith("gpt-"):
+        return "GPT-" + slug[4:].replace("-mini", " mini").replace("-nano", " nano")
+    return slug
 
 
 @router.get("/models")
@@ -375,6 +411,11 @@ async def list_models(
         models = [{"id": m["id"], "label": m["id"]} for m in chat]
     else:
         models = [{"id": m["id"], "label": m.get("display_name") or m["id"]} for m in data]
+
+    # Only offer models we have a price row for.  The provider's live list confirms the
+    # model still exists on the user's key; the price table confirms we can account for it.
+    priced_slugs = {slug for _, slug in await _priced_models(session, [connector.type.value])}
+    models = [m for m in models if m["id"] in priced_slugs]
 
     return {"models": models, "default": DEFAULT_MODELS.get(connector.type.value, "")}
 

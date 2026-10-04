@@ -1,7 +1,11 @@
 """Usage metering — record and query billable events.
 
 Meters:
-  model_credits  — LLM tokens consumed (1 credit = 1 token for accounting purposes)
+  model_credits  — one event per LLM turn.  ``quantity`` is total tokens (for
+                   analytics); ``cost_usd`` is the marked-up USD cost and is only
+                   non-zero for managed (platform-key) turns.  BYOK turns are
+                   recorded with billable=false / cost_usd=0 and never draw credits.
+                   Rollups and the usage display sum billable cost_usd, not tokens.
   voice_minutes  — completed call minutes, rounded up per call
 
 Records are idempotent on ``idempotency_key``.  Duplicate inserts are silently
@@ -33,6 +37,25 @@ async def _get_price(db: AsyncSession, provider: str, model_slug: str) -> ModelP
         select(ModelPrice)
         .where(ModelPrice.provider == provider, ModelPrice.model_slug == model_slug, ModelPrice.active == True)
         .order_by(ModelPrice.active_from.desc())
+        .limit(1)
+    )
+    return rows.first()
+
+
+async def has_price(db: AsyncSession, provider: str, model_slug: str) -> bool:
+    """True if we can account for this provider+model (an active price row exists)."""
+    return await _get_price(db, provider, model_slug) is not None
+
+
+async def cheapest_priced_model(db: AsyncSession, provider: str) -> str | None:
+    """Slug of the lowest-input-cost active model for a provider, or None if none priced.
+
+    Used as the managed-key default so an agent left on "Default" never runs unpriced.
+    """
+    rows = await db.exec(
+        select(ModelPrice.model_slug)
+        .where(ModelPrice.provider == provider, ModelPrice.active == True)  # noqa: E712
+        .order_by(ModelPrice.input_per_m.asc(), ModelPrice.output_per_m.asc())
         .limit(1)
     )
     return rows.first()
@@ -103,15 +126,14 @@ async def record_llm_usage(
     When managed=True, the cost is drawn from the org's prepaid credit ledger.
     """
     price = await _get_price(db, provider, model_slug)
+    if managed and price is None:
+        # A managed run on an unpriced model would be free — flag it loudly.
+        log.warning("managed LLM usage with no price row: provider=%s model=%s org=%s", provider, model_slug, org_id)
     cost = _compute_llm_cost(price, prompt_tokens, completion_tokens, billable, markup=managed)
     total_tokens = prompt_tokens + completion_tokens
 
-    # Draw from credit ledger for managed-model usage
-    if managed and cost > 0:
-        from app.core.billing.credits import draw as _draw
-        await _draw(db, org_id, cost)
-
-    await record_event(
+    # Insert the event first; the idempotency key decides whether this turn is new.
+    inserted = await record_event(
         db,
         org_id=org_id,
         meter="model_credits",
@@ -129,6 +151,13 @@ async def record_llm_usage(
             "managed": managed,
         },
     )
+
+    # Only draw credits for a newly recorded managed turn — a retry of the same
+    # (session, turn) must not deduct twice.
+    if inserted and managed and cost > 0:
+        from app.core.billing.credits import draw as _draw
+        await _draw(db, org_id, cost)
+        await db.commit()
 
 
 async def record_voice_minutes(
@@ -175,7 +204,14 @@ async def rollup_usage_periods(db: AsyncSession) -> None:
                 :period_start,
                 meter,
                 0,
-                COALESCE(SUM(quantity), 0),
+                -- model_credits is accounted in USD of *billable* (managed) spend;
+                -- BYOK tokens are recorded but cost nothing, so they must not inflate it.
+                COALESCE(SUM(
+                    CASE
+                        WHEN meter = 'model_credits' THEN CASE WHEN billable THEN cost_usd ELSE 0 END
+                        ELSE quantity
+                    END
+                ), 0),
                 0,
                 now()
             FROM usage_events
@@ -368,5 +404,29 @@ async def get_org_usage(
             "used": voice_used,
             "overage": max(0.0, voice_used - allowance),
         }
+
+    # model_credits: USD drawn from credits this period (managed/billable only).
+    # BYOK turns are recorded with cost_usd=0 and billable=false, so they never count.
+    credits_period_start = sub.current_period_start if (sub and sub.current_period_start) else period_start
+    r = await db.execute(
+        text("SELECT COALESCE(SUM(cost_usd), 0) FROM usage_events "
+             "WHERE org_id=:oid AND meter='model_credits' AND billable AND created_at>=:ps"),
+        {"oid": org_id, "ps": credits_period_start},
+    )
+    credits_used_usd = round(float(r.scalar() or 0), 2)
+
+    credits_included_usd = 0.0
+    if sub:
+        from app.db.models import Plan
+        plan = await db.get(Plan, sub.plan_code)
+        if plan and plan.monthly_credit_cents:
+            credits_included_usd = plan.monthly_credit_cents / 100
+
+    meters["model_credits"] = {
+        "meter": "model_credits",
+        "included": credits_included_usd,
+        "used": credits_used_usd,
+        "overage": max(0.0, credits_used_usd - credits_included_usd) if credits_included_usd > 0 else 0.0,
+    }
 
     return list(meters.values())
