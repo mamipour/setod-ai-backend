@@ -44,6 +44,7 @@ from app.core import notes, kv
 from app.db.models import (
     Agent,
     AgentSession,
+    AgentSessionMessage,
     AgentTrigger,
     Connector,
     ConnectorType,
@@ -202,7 +203,7 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
     conversation: Conversation | None = None
     messages: list[dict[str, Any]] = []
     tools = []
-    seq = 0
+    seq = 0          # monotonic message sequence for AgentSessionMessage
     cancel: asyncio.Event = asyncio.Event()
     current_task: asyncio.Task | None = None
 
@@ -352,6 +353,24 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                     sess_obj.completion_tokens += result.completion_tokens
                     sess_obj.iterations += 1
                     db.add(sess_obj)
+
+                    # Persist transcript messages so the Runs page can show the conversation.
+                    db.add(AgentSessionMessage(
+                        session_id=sess_obj.id,
+                        sequence=seq,
+                        role=MessageRole.user,
+                        content=voice_text,
+                    ))
+                    seq += 1
+                    if result.content:
+                        db.add(AgentSessionMessage(
+                            session_id=sess_obj.id,
+                            sequence=seq,
+                            role=MessageRole.assistant,
+                            content=result.content,
+                        ))
+                        seq += 1
+
                     await db.commit()
 
                 await send_last()
