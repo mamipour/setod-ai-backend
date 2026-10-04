@@ -96,11 +96,12 @@ def _find_existing_usd_price(product_id: str, amount: int, interval: str = "mont
     """Return an existing active USD recurring price for this product/amount, or None."""
     prices = stripe.Price.list(product=product_id, currency="usd", active=True, limit=20)
     for p in prices.data:
-        rec = p.get("recurring") or {}
+        rec = p.recurring  # Stripe SDK object — use attribute access
         if (
             p.unit_amount == amount
-            and rec.get("interval") == interval
-            and rec.get("usage_type") == "licensed"
+            and rec is not None
+            and getattr(rec, "interval", None) == interval
+            and getattr(rec, "usage_type", "licensed") == "licensed"
         ):
             return p.id
     return None
