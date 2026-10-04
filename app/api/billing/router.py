@@ -98,7 +98,8 @@ async def get_catalog(
                 "price_usd_monthly": a.price_usd_monthly,
                 "included_minutes": (a.included or {}).get("voice_minutes", 0),
                 # overage_price_per_unit in cents (29 cents = $0.29/min)
-                "overage_price_per_unit": int(((a.features or {}).get("overage_price_usd", 0.29)) * 100),
+                # Use round() not int() to avoid float truncation (0.29 * 100 = 28.999...)
+                "overage_price_per_unit": round(((a.features or {}).get("overage_price_usd", 0.29)) * 100),
                 "features": a.features,
                 "sort_order": a.sort_order,
             }
