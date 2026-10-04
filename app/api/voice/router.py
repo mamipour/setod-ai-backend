@@ -207,6 +207,10 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
     seq = 0          # monotonic message sequence for AgentSessionMessage
     cancel: asyncio.Event = asyncio.Event()
     current_task: asyncio.Task | None = None
+    # Language-switch guard: only tell the LLM to use French after
+    # Deepgram has detected French (lang="fr*") on 2+ consecutive turns.
+    # A single ambiguous or misdetected utterance won't trigger a language switch.
+    _consecutive_fr = 0   # count of back-to-back French-detected turns
 
     async def send_token(token: str) -> None:
         if cancel.is_set():
@@ -309,9 +313,12 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                         "Do not use markdown, bullet points, or any formatting. "
                         "Read numbers and codes digit by digit with pauses. "
                         "If you need to do something that requires approval, say 'I'll have the team follow up on that.' "
-                        "IMPORTANT: only reply in English or French. "
-                        "If the caller speaks French, reply in French. "
-                        "For any other language, always reply in English."
+                        "LANGUAGE RULES: Your default language is English. "
+                        "Only switch to French if the caller has clearly and consistently spoken French "
+                        "across multiple turns — do NOT switch based on a single word, short phrase, or an "
+                        "ambiguous utterance that could be English. "
+                        "If you are at all unsure whether the caller is speaking French, stay in English. "
+                        "Never reply in any language other than English or French."
                     ))
 
                     # LLM-generated opening greeting — stream it immediately so the caller
@@ -367,11 +374,23 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
 
                 # Prepend a language hint so the LLM mirrors the caller's detected language.
                 # This is a system message so it doesn't pollute the visible conversation history.
+                # We require 2 consecutive French-detected turns before signalling a switch,
+                # to avoid flip-flopping from a single mis-detected or ambiguous utterance.
                 turn_messages = list(messages)
-                if detected_lang:
-                    # Only mirror French; fall back to English for all other detected languages
-                    reply_lang = "French" if detected_lang.startswith("fr") else "English"
-                    turn_messages.append(system_message(f"[Caller is speaking {detected_lang} — reply in {reply_lang}]"))
+                if detected_lang and detected_lang.startswith("fr"):
+                    _consecutive_fr += 1
+                else:
+                    _consecutive_fr = 0  # reset on any non-French turn
+
+                if _consecutive_fr >= 2:
+                    turn_messages.append(system_message(
+                        "[The caller is clearly speaking French — reply in French for this and future turns]"
+                    ))
+                elif _consecutive_fr == 1:
+                    # First French detection — don't switch yet, just note it softly
+                    turn_messages.append(system_message(
+                        "[Possible French detected — stay in English unless the caller continues in French]"
+                    ))
                 turn_messages.append(user_message(voice_text))
 
                 async with AsyncSessionLocal() as db:
