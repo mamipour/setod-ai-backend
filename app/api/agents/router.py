@@ -321,12 +321,17 @@ async def list_platform_models(
     if not providers:
         return {"models": [], "available": True}
 
+    from app.core.billing.usage import cheapest_priced_model
+
     priced = await _priced_models(session, providers)
     models = [
         {"id": slug, "label": _model_label(slug), "provider": provider}
         for provider, slug in priced
     ]
-    return {"models": models, "available": True}
+    # Per-provider default (cheapest priced).  The UI sets this concretely when a user picks
+    # "<Provider> (Managed)", because the backend infers the managed provider from the slug.
+    defaults = {p: await cheapest_priced_model(session, p) for p in providers}
+    return {"models": models, "available": True, "providers": providers, "defaults": defaults}
 
 
 async def _priced_models(session: AsyncSession, providers: list[str]) -> list[tuple[str, str]]:
