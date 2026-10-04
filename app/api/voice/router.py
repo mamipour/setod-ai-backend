@@ -52,7 +52,11 @@ from app.db.models import (
     Connector,
     ConnectorType,
     Conversation,
+    ConversationMessage,
     ConversationStatus,
+    MessageAuthor,
+    MessageDirection,
+    MessageKind,
     MessageRole,
     SessionStatus,
     User,
@@ -401,6 +405,15 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                             content=greeting_result.content,
                         ))
                         seq += 1
+                        # Save to conversation thread so Conversations page shows the transcript
+                        db.add(ConversationMessage(
+                            conversation_id=conversation.id,
+                            org_id=agent_obj.org_id,
+                            direction=MessageDirection.outbound,
+                            author=MessageAuthor.agent,
+                            kind=MessageKind.text,
+                            text=greeting_result.content,
+                        ))
                         session.prompt_tokens += greeting_result.prompt_tokens
                         session.completion_tokens += greeting_result.completion_tokens
                         session.iterations += 1
@@ -489,6 +502,33 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                             content=result.content,
                         ))
                         seq += 1
+
+                    # Also save to ConversationMessage so the Conversations page shows the transcript.
+                    db.add(ConversationMessage(
+                        conversation_id=conversation.id,
+                        org_id=agent_obj.org_id,
+                        direction=MessageDirection.inbound,
+                        author=MessageAuthor.peer,
+                        kind=MessageKind.text,
+                        text=voice_text,
+                    ))
+                    if result.content:
+                        db.add(ConversationMessage(
+                            conversation_id=conversation.id,
+                            org_id=agent_obj.org_id,
+                            direction=MessageDirection.outbound,
+                            author=MessageAuthor.agent,
+                            kind=MessageKind.text,
+                            text=result.content,
+                        ))
+                    # Update conversation timestamps
+                    conv_obj = await db.get(Conversation, conversation.id)
+                    if conv_obj:
+                        now = datetime.now(UTC)
+                        conv_obj.last_inbound_at = now
+                        if result.content:
+                            conv_obj.last_outbound_at = now
+                        db.add(conv_obj)
 
                     await db.commit()
 
