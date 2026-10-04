@@ -412,15 +412,18 @@ async def list_models(
         # can hold a conversation. Filtering by capability is not possible from this endpoint,
         # so it goes by prefix.
         chat = [m for m in data if m["id"].startswith(("gpt-", "o1", "o3", "o4"))]
-        chat.sort(key=lambda m: m.get("created", 0), reverse=True)
-        models = [{"id": m["id"], "label": m["id"]} for m in chat]
+        models = [{"id": m["id"], "label": _model_label(m["id"])} for m in chat]
     else:
-        models = [{"id": m["id"], "label": m.get("display_name") or m["id"]} for m in data]
+        models = [{"id": m["id"], "label": m.get("display_name") or _model_label(m["id"])} for m in data]
 
     # Only offer models we have a price row for.  The provider's live list confirms the
     # model still exists on the user's key; the price table confirms we can account for it.
-    priced_slugs = {slug for _, slug in await _priced_models(session, [connector.type.value])}
-    models = [m for m in models if m["id"] in priced_slugs]
+    # Sort by price descending — same order as the managed model list — so both pickers
+    # show models in the same sequence regardless of what order the provider API returns them.
+    priced = await _priced_models(session, [connector.type.value])
+    price_rank: dict[str, int] = {slug: i for i, (_, slug) in enumerate(priced)}
+    models = [m for m in models if m["id"] in price_rank]
+    models.sort(key=lambda m: price_rank[m["id"]])
 
     return {"models": models, "default": DEFAULT_MODELS.get(connector.type.value, "")}
 
