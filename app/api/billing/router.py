@@ -1695,10 +1695,29 @@ async def _reconcile_addons_from_items(
 
     items = sub_data.get("items", {}).get("data", [])
     item_price_ids = {item.get("price", {}).get("id") for item in items if item.get("price", {}).get("id")}
+    # Also build a set of product IDs from the subscription items — Stripe always includes
+    # price.product in webhook payloads, so we can match currency-agnostic.
+    item_product_ids = {item.get("price", {}).get("product") for item in items if item.get("price", {}).get("product")}
 
     addons = (await db.exec(select(Addon).where(Addon.active == True))).all()
     # Map price_id → addon
     price_to_addon = {a.stripe_price_id: a for a in addons if a.stripe_price_id}
+
+    # Resolve product IDs for our addon prices by looking them up in Stripe (once per unique price).
+    # We cache results in a local dict to avoid repeat calls.
+    import stripe as _stripe_mod
+    price_product_cache: dict[str, str | None] = {}
+
+    async def _product_for_price(price_id: str) -> str | None:
+        if price_id in price_product_cache:
+            return price_product_cache[price_id]
+        try:
+            p = _stripe_mod.Price.retrieve(price_id)
+            pid = p.get("product") if isinstance(p, dict) else getattr(p, "product", None)
+        except Exception:
+            pid = None
+        price_product_cache[price_id] = pid
+        return pid
 
     period_start = sub.current_period_start if sub else None
 
@@ -1709,7 +1728,12 @@ async def _reconcile_addons_from_items(
             select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon.code)
         )).first()
 
+        # Match by price ID first (fast path for USD subscriptions), then by product ID
+        # (currency-agnostic path for CAD or any other non-USD subscription).
         in_sub = addon.stripe_price_id in item_price_ids
+        if not in_sub and item_product_ids:
+            addon_product = await _product_for_price(addon.stripe_price_id)
+            in_sub = bool(addon_product and addon_product in item_product_ids)
 
         if in_sub:
             if oa is None:
