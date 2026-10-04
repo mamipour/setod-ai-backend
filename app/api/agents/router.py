@@ -2340,6 +2340,52 @@ async def list_agent_triggers(
     return [await _trigger_out(session, t) for t in rows.all()]
 
 
+async def _auto_configure_twilio_voice_webhook(connector: Connector, trigger_id: UUID) -> None:
+    """Point the Twilio phone number's Voice webhook URL at our TwiML endpoint for this trigger.
+
+    Idempotent — Twilio simply overwrites the existing value. Failures are logged and swallowed
+    so a network hiccup never blocks the trigger from being saved.
+    """
+    from app.config import settings as _cfg
+    try:
+        config = decrypt_json(connector.config)
+        account_sid = config["account_sid"]
+        auth_token = config["auth_token"]
+        phone_number = config["phone_number"]
+
+        base = (_cfg.api_public_origin or "https://api.setod.com").rstrip("/")
+        voice_url = f"{base}/voice/twiml/{trigger_id}"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            # 1. Find the Twilio phone number SID
+            r = await client.get(
+                f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/IncomingPhoneNumbers.json",
+                params={"PhoneNumber": phone_number},
+                auth=(account_sid, auth_token),
+            )
+            if r.status_code != 200:
+                log.warning("Twilio voice webhook: failed to list numbers (status=%s)", r.status_code)
+                return
+            numbers = r.json().get("incoming_phone_numbers", [])
+            if not numbers:
+                log.warning("Twilio voice webhook: phone %s not found in account", phone_number)
+                return
+            number_sid = numbers[0]["sid"]
+
+            # 2. Update the voice URL
+            r2 = await client.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/IncomingPhoneNumbers/{number_sid}.json",
+                data={"VoiceUrl": voice_url, "VoiceMethod": "POST"},
+                auth=(account_sid, auth_token),
+            )
+            if r2.status_code == 200:
+                log.info("Twilio voice webhook configured: %s → %s", phone_number, voice_url)
+            else:
+                log.warning("Twilio voice webhook update failed (status=%s): %s", r2.status_code, r2.text[:200])
+    except Exception:
+        log.exception("Unexpected error configuring Twilio voice webhook for trigger %s", trigger_id)
+
+
 async def _auto_register_telegram_webhook(session: AsyncSession, connector: Connector) -> None:
     """Register (or re-register) a Telegram bot webhook if PUBLIC_BASE_URL is configured.
 
@@ -2404,6 +2450,14 @@ async def create_agent_trigger(
     session.add(agent)
     await session.commit()
     await session.refresh(trigger)
+
+    # For phone triggers, point the Twilio number's Voice webhook at our TwiML endpoint.
+    # Done after commit so trigger.id is assigned.
+    if body.type == TriggerType.phone:
+        connector = await session.get(Connector, UUID(str(config["connector_id"])))
+        if connector and connector.type == ConnectorType.twilio:
+            await _auto_configure_twilio_voice_webhook(connector, trigger.id)
+
     return await _trigger_out(session, trigger)
 
 
@@ -2437,6 +2491,13 @@ async def update_agent_trigger(
     session.add(agent)
     await session.commit()
     await session.refresh(trigger)
+
+    # Keep Twilio voice webhook in sync if the connector or trigger changed.
+    if body.type == TriggerType.phone:
+        connector = await session.get(Connector, UUID(str(config["connector_id"])))
+        if connector and connector.type == ConnectorType.twilio:
+            await _auto_configure_twilio_voice_webhook(connector, trigger.id)
+
     return await _trigger_out(session, trigger)
 
 
