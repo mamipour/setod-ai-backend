@@ -97,7 +97,7 @@ def _twiml_busy() -> str:
     )
 
 
-def _twiml_connect(trigger_id: UUID, greeting: str, voice: str = "UgBBYS2sOqTuMpoF3BR0", language: str = "en-US") -> str:
+def _twiml_connect(trigger_id: UUID, voice: str = "UgBBYS2sOqTuMpoF3BR0", language: str = "en-US") -> str:
     wss_url = f"{cfg.api_public_origin.replace('https://', 'wss://').replace('http://', 'ws://')}/voice/ws/{trigger_id}"
     # Ensure HTTPS/WSS
     if cfg.api_public_origin.startswith("https://"):
@@ -105,11 +105,11 @@ def _twiml_connect(trigger_id: UUID, greeting: str, voice: str = "UgBBYS2sOqTuMp
     else:
         wss_url = f"wss://api.setod.com/voice/ws/{trigger_id}"
 
+    # No welcomeGreeting — the LLM generates the opening line after the setup handshake.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay url="{wss_url}"
-        welcomeGreeting="{greeting}"
         transcriptionProvider="Deepgram" speechModel="flux" eotThreshold="0.8"
         ttsProvider="ElevenLabs" voice="{voice}"
         interruptible="any" ignoreBackchannel="true"
@@ -168,13 +168,12 @@ async def voice_twiml(
             log.info("voice blocked: org=%s over allowance or overage disabled", agent.org_id)
             return Response(content=_twiml_busy(), media_type="application/xml")
 
-        greeting = trigger_config.get("greeting", "Thank you for calling. How can I help you?")
         voice = trigger_config.get("voice", "UgBBYS2sOqTuMpoF3BR0")
         language = trigger_config.get("language", "en-US")
 
     log.info("voice twiml: trigger=%s from=%s call=%s", trigger_id, form.get("From"), form.get("CallSid"))
     return Response(
-        content=_twiml_connect(trigger_id, greeting, voice, language),
+        content=_twiml_connect(trigger_id, voice, language),
         media_type="application/xml",
     )
 
@@ -309,6 +308,38 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                         "Read numbers and codes digit by digit with pauses. "
                         "If you need to do something that requires approval, say 'I'll have the team follow up on that.'"
                     ))
+
+                    # LLM-generated opening greeting — stream it immediately so the caller
+                    # hears a personalised hello rather than a static welcome message.
+                    greeting_trigger = user_message("[The phone was just answered. Say your opening greeting now.]")
+                    greeting_result = await stream_turn(
+                        db,
+                        agent_obj,
+                        messages=messages + [greeting_trigger],
+                        tools=[],          # no tools needed for the greeting
+                        session=session,
+                        on_token=send_token,
+                        cancel=cancel,
+                        use_published=True,
+                    )
+                    await send_last()
+
+                    if greeting_result.content:
+                        # Save as the first message in the transcript
+                        db.add(AgentSessionMessage(
+                            session_id=session.id,
+                            sequence=seq,
+                            role=MessageRole.assistant,
+                            content=greeting_result.content,
+                        ))
+                        seq += 1
+                        session.prompt_tokens += greeting_result.prompt_tokens
+                        session.completion_tokens += greeting_result.completion_tokens
+                        session.iterations += 1
+                        db.add(session)
+                        await db.commit()
+                        # Seed conversation history with the greeting so subsequent turns have context
+                        messages.append(assistant_message(greeting_result.content, []))
 
             elif msg_type == "prompt":
                 if not msg.get("last", True):
