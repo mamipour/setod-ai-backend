@@ -140,15 +140,24 @@ async def resolve(db: AsyncSession, org_id: UUID) -> Entitlements:
     limits: dict[str, Any] = dict(plan.limits or {})
     included: dict[str, Any] = dict(plan.included or {})
 
-    # 2. Add-ons
+    # 2. Add-ons — only active rows contribute; voice_minutes uses prorated snapshot when set
     addon_rows = (await db.exec(
-        select(OrgAddon).where(OrgAddon.org_id == org_id)
+        select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.status == "active")
     )).all()
+    now_dt = datetime.now(UTC)
     for oa in addon_rows:
         addon = await db.get(Addon, oa.addon_code)
         if addon and addon.active:
             features.update(addon.features or {})
             for meter, qty in (addon.included or {}).items():
+                if meter == "voice_minutes":
+                    # Use prorated snapshot for the period the add-on was activated mid-period
+                    if (
+                        oa.included_snapshot is not None
+                        and oa.snapshot_period_end
+                        and now_dt < oa.snapshot_period_end
+                    ):
+                        qty = oa.included_snapshot
                 included[meter] = included.get(meter, 0) + qty
 
     # 3. Overrides

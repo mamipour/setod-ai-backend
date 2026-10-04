@@ -1,6 +1,8 @@
 """Idempotent script: create USD Stripe prices for all plans and add-ons, archive old CAD
 prices, and write the new price IDs back to the DB.
 
+Also creates a Stripe Billing Meter for voice overage and a meter-backed metered price.
+
 Usage:
     cd platform
     python scripts/stripe_sync_prices.py
@@ -36,6 +38,14 @@ AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=F
 
 from app.db.models import Plan, Addon
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# This event name is shared with app/core/billing/voice.py — keep in sync.
+VOICE_OVERAGE_EVENT_NAME = "voice_overage_minutes"
+
+# Metered overage price for voice minutes (per minute, over included quota)
+VOICE_OVERAGE_PER_MINUTE_CENTS = 29  # $0.29/min
+
 # ── Product definitions ────────────────────────────────────────────────────────
 
 PLAN_PRODUCTS = [
@@ -68,9 +78,8 @@ ADDON_PRODUCTS = [
     },
 ]
 
-# Metered USD overage price for voice minutes (per minute, over included quota)
-VOICE_OVERAGE_PER_MINUTE_CENTS = 29  # $0.29/min
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _find_or_create_product(name: str) -> str:
     """Return an existing product ID by exact name or create one."""
@@ -98,12 +107,12 @@ def _find_existing_usd_price(product_id: str, amount: int, interval: str = "mont
 
 
 def _archive_non_usd_prices(product_id: str) -> None:
-    """Archive any CAD prices on a product."""
+    """Archive any non-USD prices on a product."""
     prices = stripe.Price.list(product=product_id, active=True, limit=50)
     for p in prices.data:
         if p.currency != "usd":
             stripe.Price.modify(p.id, active=False)
-            print(f"  Archived CAD price: {p.id}")
+            print(f"  Archived non-USD price: {p.id}")
 
 
 def _ensure_recurring_price(product_id: str, amount_cents: int, nickname: str) -> str:
@@ -122,27 +131,62 @@ def _ensure_recurring_price(product_id: str, amount_cents: int, nickname: str) -
     return price.id
 
 
-def _ensure_metered_price(product_id: str, amount_cents: int, nickname: str) -> str:
-    """Find or create a USD per-unit metered price (for voice overage)."""
+def _ensure_billing_meter() -> str:
+    """Find or create the Stripe Billing Meter for voice overage minutes.
+
+    Returns the meter ID.  The meter is looked up by event_name so running
+    this script multiple times is idempotent.
+    """
+    # List existing meters and find by event_name
+    try:
+        meters = stripe.billing.Meter.list(limit=20)
+        for m in meters.data:
+            if m.event_name == VOICE_OVERAGE_EVENT_NAME and m.status == "active":
+                print(f"  Reusing Billing Meter: {m.id} ({m.event_name})")
+                return m.id
+    except Exception as e:
+        print(f"  Warning: could not list meters: {e}")
+
+    meter = stripe.billing.Meter.create(
+        display_name="Voice Overage Minutes",
+        event_name=VOICE_OVERAGE_EVENT_NAME,
+        default_aggregation={"formula": "sum"},
+        customer_mapping={
+            "type": "by_id",
+            "event_payload_key": "stripe_customer_id",
+        },
+        value_settings={
+            "event_payload_key": "value",
+        },
+    )
+    print(f"  Created Billing Meter: {meter.id} ({VOICE_OVERAGE_EVENT_NAME})")
+    return meter.id
+
+
+def _ensure_metered_price(product_id: str, meter_id: str, nickname: str) -> str:
+    """Find or create a USD metered price backed by a Billing Meter."""
     prices = stripe.Price.list(product=product_id, currency="usd", active=True, limit=20)
     for p in prices.data:
         rec = p.get("recurring") or {}
-        if (
-            p.unit_amount == amount_cents
-            and rec.get("usage_type") == "metered"
-        ):
+        if rec.get("usage_type") == "metered" and rec.get("meter") == meter_id:
             print(f"  Reusing metered price: {p.id} ({nickname})")
             return p.id
     price = stripe.Price.create(
         product=product_id,
         currency="usd",
-        unit_amount=amount_cents,
-        recurring={"interval": "month", "usage_type": "metered", "aggregate_usage": "sum"},
+        unit_amount=VOICE_OVERAGE_PER_MINUTE_CENTS,
+        recurring={
+            "interval": "month",
+            "usage_type": "metered",
+            "meter": meter_id,
+        },
         nickname=nickname,
     )
     print(f"  Created metered price: {price.id} ({nickname})")
     return price.id
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     async with AsyncSessionLocal() as db:
@@ -159,6 +203,10 @@ async def main() -> None:
                 db.add(plan)
                 print(f"  DB updated: plans.{spec['code']}.stripe_monthly_price_id = {price_id}")
 
+        # ── Billing Meter (shared across both voice add-ons) ─────────────────
+        print("\n[voice_overage_meter]")
+        meter_id = _ensure_billing_meter()
+
         # ── Add-on prices ────────────────────────────────────────────────────
         voice_overage_product_id = _find_or_create_product("Setod Voice Overage")
 
@@ -169,7 +217,7 @@ async def main() -> None:
             price_id = _ensure_recurring_price(prod_id, spec["price_usd_cents"], spec["nickname"])
             overage_price_id = _ensure_metered_price(
                 voice_overage_product_id,
-                VOICE_OVERAGE_PER_MINUTE_CENTS,
+                meter_id,
                 "Voice Overage per minute",
             )
 

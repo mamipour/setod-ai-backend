@@ -48,6 +48,7 @@ REAP_EVERY = timedelta(minutes=10)
 PRUNE_EVERY = timedelta(hours=24)
 ROLLUP_EVERY = timedelta(hours=1)
 CREDIT_NOTIFY_EVERY = timedelta(hours=1)
+VOICE_OVERAGE_PUSH_EVERY = timedelta(minutes=10)
 # Slower tasks (schedules, files, approvals) run every 4th inbound tick (~20s).
 _SLOW_TASK_DIVISOR = 4
 
@@ -359,6 +360,7 @@ async def main() -> None:
     next_prune = datetime.now(UTC)
     next_rollup = datetime.now(UTC)
     next_credit_notify = datetime.now(UTC)
+    next_voice_overage_push = datetime.now(UTC)
     tick = 0
     log.info("scheduler started — polling every %ds (slow tasks every %ds)",
              POLL_SECONDS, POLL_SECONDS * _SLOW_TASK_DIVISOR)
@@ -378,13 +380,19 @@ async def main() -> None:
                         async with AsyncSessionLocal() as db:
                             await rollup_usage_periods(db)
                         log.info("usage rollup completed")
-                        async with AsyncSessionLocal() as db:
-                            pushed = await push_voice_overage_to_stripe(db)
-                        if pushed:
-                            log.info("pushed %d voice overage record(s) to Stripe", pushed)
                     except Exception:
                         log.exception("usage rollup failed")
                     next_rollup = datetime.now(UTC) + ROLLUP_EVERY
+
+                if datetime.now(UTC) >= next_voice_overage_push:
+                    try:
+                        async with AsyncSessionLocal() as db:
+                            pushed = await push_voice_overage_to_stripe(db)
+                        if pushed:
+                            log.info("pushed %d voice overage meter event(s) to Stripe", pushed)
+                    except Exception:
+                        log.exception("voice overage push failed")
+                    next_voice_overage_push = datetime.now(UTC) + VOICE_OVERAGE_PUSH_EVERY
 
                 if datetime.now(UTC) >= next_credit_notify:
                     await _check_credit_thresholds()

@@ -154,13 +154,17 @@ async def voice_twiml(
         if not agent:
             return Response(content=_twiml_busy(), media_type="application/xml")
 
-        # Entitlement check
+        # Entitlement check: feature gate (plan-level voice flag) then allowance/overage gate
         try:
             ent = await resolve_ent(adb, agent.org_id)
             ent.require("voice")
-            ent.require_quota("voice_minutes")
         except EntitlementError:
-            log.info("voice blocked: org=%s not entitled", agent.org_id)
+            log.info("voice blocked: org=%s not entitled (no voice feature)", agent.org_id)
+            return Response(content=_twiml_busy(), media_type="application/xml")
+
+        from app.core.billing.voice import voice_call_allowed
+        if not await voice_call_allowed(adb, agent.org_id):
+            log.info("voice blocked: org=%s over allowance or overage disabled", agent.org_id)
             return Response(content=_twiml_busy(), media_type="application/xml")
 
         greeting = trigger_config.get("greeting", "Thank you for calling. How can I help you?")

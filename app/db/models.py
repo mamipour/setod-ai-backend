@@ -1305,6 +1305,7 @@ class OrgSubscription(SQLModel, table=True):
     current_period_start: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     current_period_end: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     cancel_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    pending_plan_code: str | None = Field(default=None)  # downgrade scheduled: plan code at next renewal
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 
@@ -1322,7 +1323,17 @@ class OrgAddon(SQLModel, table=True):
     addon_code: str = Field(foreign_key="addons.code")
     stripe_subscription_id: str | None = Field(default=None)
     stripe_subscription_item_id: str | None = Field(default=None)
-    status: str = Field(default="active")
+    status: str = Field(default="active")  # 'active' | 'cancel_at_period_end' | 'cancelled'
+    # Proration: allowance for the partial period in which the add-on was added
+    activated_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    included_snapshot: float | None = Field(default=None)       # prorated minutes for current period
+    snapshot_period_end: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    # Scheduled removal / swap-down
+    cancel_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    pending_addon_code: str | None = Field(default=None)        # swap-down: code to activate at renewal
+    # Overage reporting (incremental delta sent to Stripe)
+    overage_reported: float = Field(default=0.0)
+    overage_period_start: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     created_at: datetime = _ts()
 
 
@@ -1450,4 +1461,5 @@ class OrgBillingSettings(SQLModel, table=True):
     notified_low_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     notified_zero_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     auto_recharge_failed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    allow_voice_overage: bool = Field(default=True)
     updated_at: datetime = _ts()
