@@ -43,8 +43,9 @@ from app.db.models import Plan, Addon
 # This event name is shared with app/core/billing/voice.py — keep in sync.
 VOICE_OVERAGE_EVENT_NAME = "voice_overage_minutes"
 
-# Metered overage price for voice minutes (per minute, over included quota)
-VOICE_OVERAGE_PER_MINUTE_CENTS = 29  # $0.29/min
+# Metered overage price for voice minutes (per minute, over included quota).
+# Users pay Twilio directly; this covers Setod orchestration/LLM overhead.
+VOICE_OVERAGE_PER_MINUTE_CENTS = 4  # $0.04/min
 
 # ── Product definitions ────────────────────────────────────────────────────────
 
@@ -169,7 +170,12 @@ def _ensure_metered_price(product_id: str, meter_id: str, nickname: str) -> str:
     prices = stripe.Price.list(product=product_id, currency="usd", active=True, limit=20)
     for p in prices.data:
         rec = p.recurring  # Stripe SDK object — use attribute access, not dict.get()
-        if rec and getattr(rec, "usage_type", None) == "metered" and getattr(rec, "meter", None) == meter_id:
+        if (
+            rec
+            and getattr(rec, "usage_type", None) == "metered"
+            and getattr(rec, "meter", None) == meter_id
+            and p.unit_amount == VOICE_OVERAGE_PER_MINUTE_CENTS
+        ):
             print(f"  Reusing metered price: {p.id} ({nickname})")
             return p.id
     price = stripe.Price.create(

@@ -2,7 +2,7 @@
 
 Priority stack (highest to lowest):
   1. OrgOverride  — manual staff grants with optional expiry
-  2. OrgAddon     — purchased add-ons (voice_lite, voice_standard, rows_100k)
+  2. OrgAddon     — legacy/extra add-ons (voice_lite, voice_standard, rows_100k)
   3. OrgSubscription → Plan — the org's active subscription plan
   4. plans('free') — every org that has no subscription row
 

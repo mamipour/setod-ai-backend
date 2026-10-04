@@ -1234,7 +1234,7 @@ class Plan(SQLModel, table=True):
     price_usd_monthly: int = Field(default=0)   # USD cents
     price_usd_annual: int = Field(default=0)    # USD cents/year
     # Monthly managed-model credit included in the plan, in USD cents.
-    # 0 for Free (no managed models), 2500 for Pro ($25), 12000 for Business ($120).
+    # 0 for Free (no managed models), 1500 for Pro ($15), 6000 for Business ($60).
     monthly_credit_cents: int = Field(default=0)
     # Feature flags: e.g. {"managed_models": true, "voice": false}
     features: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
@@ -1306,6 +1306,10 @@ class OrgSubscription(SQLModel, table=True):
     current_period_end: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     cancel_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     pending_plan_code: str | None = Field(default=None)  # downgrade scheduled: plan code at next renewal
+    # Plan-included voice overage tracking. Add-on overage tracking remains on OrgAddon
+    # for legacy purchases; new plan-based voice uses these fields.
+    voice_overage_reported: float = Field(default=0.0)
+    voice_overage_period_start: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 

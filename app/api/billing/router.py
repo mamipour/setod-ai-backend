@@ -124,7 +124,7 @@ async def _classify_items(db: AsyncSession, items: list[dict]) -> dict:
     """
     from sqlmodel import select as _sel
     plans = (await db.exec(_sel(Plan).where(Plan.active == True))).all()
-    addons = (await db.exec(_sel(Addon).where(Addon.active == True))).all()
+    addons = (await db.exec(_sel(Addon))).all()
 
     plan_price_ids = {p.stripe_monthly_price_id for p in plans if p.stripe_monthly_price_id}
     voice_price_ids = {a.stripe_price_id for a in addons if a.stripe_price_id and a.code in ("voice_lite", "voice_standard")}
@@ -150,6 +150,15 @@ async def _voice_price_to_addon(db: AsyncSession, price_id: str) -> "Addon | Non
     return (await db.exec(
         _sel(Addon).where(Addon.stripe_price_id == price_id, Addon.active == True)
     )).first()
+
+
+async def _voice_overage_price_id(db: AsyncSession) -> str | None:
+    """Return the shared Stripe metered price for voice overage."""
+    from sqlmodel import select as _sel
+    addon = (await db.exec(
+        _sel(Addon).where(Addon.stripe_overage_price_id.is_not(None))
+    )).first()
+    return addon.stripe_overage_price_id if addon else None
 
 
 async def _compute_prorated_minutes(total_minutes: int, period_start: datetime, period_end: datetime) -> int:
@@ -206,14 +215,12 @@ async def _build_phase2_items(db: AsyncSession, org_id: UUID, sub: "OrgSubscript
                 items.append({"price": addon.stripe_price_id, "quantity": 1})
                 voice_in_phase2 = True
 
-    # Overage item (if voice remains and we have an overage price)
-    if voice_in_phase2:
-        voice_addons = (await db.exec(_sel(Addon).where(
-            Addon.active == True, Addon.code.in_(["voice_lite", "voice_standard"])
-        ))).all()
-        overage_price_id = next((a.stripe_overage_price_id for a in voice_addons if a.stripe_overage_price_id), None)
+    # Overage item if the next-period plan/add-on set includes voice.
+    target_has_plan_voice = bool((target_plan.features or {}).get("voice")) if target_plan else False
+    if voice_in_phase2 or target_has_plan_voice:
+        overage_price_id = await _voice_overage_price_id(db)
         if overage_price_id:
-            items.append({"price": overage_price_id, "quantity": 1})
+            items.append({"price": overage_price_id})
 
     return items
 
@@ -292,6 +299,7 @@ async def get_catalog(
                 "max_rows": (p.limits or {}).get("rows", 5000),
                 "features": p.features,
                 "limits": p.limits,
+                "included": p.included,
                 "sort_order": p.sort_order,
             }
             for p in plans
@@ -302,9 +310,9 @@ async def get_catalog(
                 "display_name": a.display_name,
                 "price_usd_monthly": a.price_usd_monthly,
                 "included_minutes": (a.included or {}).get("voice_minutes", 0),
-                # overage_price_per_unit in cents (29 cents = $0.29/min)
-                # Use round() not int() to avoid float truncation (0.29 * 100 = 28.999...)
-                "overage_price_per_unit": round(((a.features or {}).get("overage_price_usd", 0.29)) * 100),
+                # overage_price_per_unit in cents (4 cents = $0.04/min)
+                # Use round() not int() to avoid float truncation.
+                "overage_price_per_unit": round(((a.features or {}).get("overage_price_usd", 0.04)) * 100),
                 "features": a.features,
                 "sort_order": a.sort_order,
             }
@@ -485,10 +493,16 @@ async def create_checkout(
         return await _change_plan_inline(db, stripe, sub, plan, plan_code)
 
     customer_id = await _get_or_create_stripe_customer(db, stripe, org_id)
+    line_items = [{"price": plan.stripe_monthly_price_id, "quantity": 1}]
+    if (plan.features or {}).get("voice"):
+        overage_price_id = await _voice_overage_price_id(db)
+        if overage_price_id:
+            line_items.append({"price": overage_price_id})
+
     session_params: dict = {
         "mode": "subscription",
         "customer": customer_id,
-        "line_items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
+        "line_items": line_items,
         "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
         "metadata": {"org_id": str(org_id), "plan_code": plan_code},
@@ -529,10 +543,16 @@ async def change_plan(
 
     # No existing sub — return a checkout URL
     customer_id = await _get_or_create_stripe_customer(db, stripe, org_id)
+    line_items = [{"price": plan.stripe_monthly_price_id, "quantity": 1}]
+    if (plan.features or {}).get("voice"):
+        overage_price_id = await _voice_overage_price_id(db)
+        if overage_price_id:
+            line_items.append({"price": overage_price_id})
+
     session_params: dict = {
         "mode": "subscription",
         "customer": customer_id,
-        "line_items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
+        "line_items": line_items,
         "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
         "metadata": {"org_id": str(org_id), "plan_code": plan_code},
@@ -571,9 +591,14 @@ async def _change_plan_inline(db: AsyncSession, stripe_mod, sub: OrgSubscription
     try:
         if target_rank > current_rank:
             # ── Upgrade: immediate switch with prorated charge ──
+            update_items = [{"id": item_id, "price": plan.stripe_monthly_price_id}]
+            if (plan.features or {}).get("voice") and not classified["overage_item"]:
+                overage_price_id = await _voice_overage_price_id(db)
+                if overage_price_id:
+                    update_items.append({"price": overage_price_id})
             _upd = stripe_mod.Subscription.modify(
                 sub.stripe_subscription_id,
-                items=[{"id": item_id, "price": plan.stripe_monthly_price_id}],
+                items=update_items,
                 proration_behavior="create_prorations",
                 metadata={"plan_code": plan_code},
             )

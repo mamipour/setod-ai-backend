@@ -237,13 +237,13 @@ async def rollup_usage_periods(db: AsyncSession) -> None:
 async def push_voice_overage_to_stripe(db: AsyncSession) -> int:
     """Push voice minute overage deltas to Stripe via Billing Meter events.
 
-    Uses an incremental approach: tracks `OrgAddon.overage_reported` and only sends
-    the delta since the last push.  Idempotent: each event has a stable identifier.
+    Uses an incremental approach: plan-based voice tracks reported overage on
+    OrgSubscription. Idempotent event IDs keep retries from double-billing.
 
     Returns the number of MeterEvent records sent.
     """
     from app.config import settings
-    from app.db.models import Addon, OrgAddon, OrgSubscription, Organization
+    from app.db.models import OrgSubscription, Organization
     if not settings.stripe_secret_key:
         return 0
 
@@ -253,25 +253,24 @@ async def push_voice_overage_to_stripe(db: AsyncSession) -> int:
     # Shared event name from stripe_sync_prices.py
     VOICE_OVERAGE_EVENT_NAME = "voice_overage_minutes"
 
-    now = datetime.now(UTC)
     pushed = 0
 
-    # Find all orgs with active voice add-ons
     from sqlmodel import select as _sel
-    voice_oa_rows = (await db.exec(
-        _sel(OrgAddon).where(
-            OrgAddon.status == "active",
-            OrgAddon.addon_code.in_(["voice_lite", "voice_standard"]),
+    from app.core.billing.entitlements import resolve as resolve_ent
+
+    subs = (await db.exec(
+        _sel(OrgSubscription).where(
+            OrgSubscription.status.in_(["active", "trialing", "downgrade_scheduled", "cancel_at_period_end"]),
+            OrgSubscription.current_period_start.is_not(None),
         )
     )).all()
 
-    for oa in voice_oa_rows:
-        org_id = oa.org_id
-        sub = (await db.exec(
-            _sel(OrgSubscription).where(OrgSubscription.org_id == org_id)
-        )).first()
-        if not sub or not sub.current_period_start:
+    for sub in subs:
+        org_id = sub.org_id
+        ent = await resolve_ent(db, org_id)
+        if not ent.allows("voice"):
             continue
+        allowance = float(ent.included_quantity("voice_minutes"))
 
         # Get Stripe customer ID
         org = await db.get(Organization, org_id)
@@ -289,37 +288,22 @@ async def push_voice_overage_to_stripe(db: AsyncSession) -> int:
         )
         used = float(r.scalar() or 0)
 
-        # Allowance for this period
-        addon_def = await db.get(Addon, oa.addon_code)
-        if not addon_def:
-            continue
-        full_minutes = int((addon_def.included or {}).get("voice_minutes", 0))
-        now_dt = datetime.now(UTC)
-        if (
-            oa.included_snapshot is not None
-            and oa.snapshot_period_end
-            and now_dt < oa.snapshot_period_end
-        ):
-            allowance = float(oa.included_snapshot)
-        else:
-            allowance = float(full_minutes)
-
         overage = max(0.0, used - allowance)
 
         # Detect period boundary (reset if period changed)
-        if oa.overage_period_start != sub.current_period_start:
-            oa.overage_reported = 0.0
-            oa.overage_period_start = sub.current_period_start
-            db.add(oa)
+        if sub.voice_overage_period_start != sub.current_period_start:
+            sub.voice_overage_reported = 0.0
+            sub.voice_overage_period_start = sub.current_period_start
+            db.add(sub)
 
-        delta = overage - oa.overage_reported
+        delta = overage - sub.voice_overage_reported
         if delta <= 0:
             continue
 
         delta_int = math.ceil(delta)
         # Stable identifier: org + period start + already-reported amount (ensures no double-send)
         period_key = sub.current_period_start.strftime("%Y%m%d%H%M") if sub.current_period_start else "noperiod"
-        event_id = f"voice_overage:{org_id}:{period_key}:{int(oa.overage_reported)}"
+        event_id = f"voice_overage:{org_id}:{period_key}:{int(sub.voice_overage_reported)}"
 
         try:
             stripe.billing.MeterEvent.create(
@@ -330,12 +314,12 @@ async def push_voice_overage_to_stripe(db: AsyncSession) -> int:
                 },
                 identifier=event_id,
             )
-            oa.overage_reported = oa.overage_reported + delta_int
-            db.add(oa)
+            sub.voice_overage_reported = sub.voice_overage_reported + delta_int
+            db.add(sub)
             pushed += 1
             log.info(
                 "voice overage: org=%s delta=%d total_reported=%.0f customer=%s",
-                org_id, delta_int, oa.overage_reported, customer_id,
+                org_id, delta_int, sub.voice_overage_reported, customer_id,
             )
         except Exception:
             log.exception("failed to send voice overage meter event for org %s", org_id)
@@ -375,7 +359,8 @@ async def get_org_usage(
 
     # Override voice_minutes with live period data from Stripe billing period
     from sqlmodel import select as _sel
-    from app.db.models import OrgSubscription, OrgAddon, Addon
+    from app.core.billing.entitlements import resolve as resolve_ent
+    from app.db.models import OrgSubscription
     sub = (await db.exec(_sel(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
     if sub and sub.current_period_start:
         r = await db.execute(
@@ -385,24 +370,8 @@ async def get_org_usage(
         )
         voice_used = float(r.scalar() or 0)
 
-        # Get allowance
-        voice_oa = (await db.exec(
-            _sel(OrgAddon).where(
-                OrgAddon.org_id == org_id,
-                OrgAddon.status == "active",
-                OrgAddon.addon_code.in_(["voice_lite", "voice_standard"]),
-            )
-        )).first()
-        allowance: float = 0.0
-        if voice_oa:
-            now_dt = datetime.now(UTC)
-            if (voice_oa.included_snapshot is not None
-                    and voice_oa.snapshot_period_end
-                    and now_dt < voice_oa.snapshot_period_end):
-                allowance = float(voice_oa.included_snapshot)
-            else:
-                addon_def = await db.get(Addon, voice_oa.addon_code)
-                allowance = float(int((addon_def.included or {}).get("voice_minutes", 0))) if addon_def else 0.0
+        ent = await resolve_ent(db, org_id)
+        allowance = ent.included_quantity("voice_minutes") if ent.allows("voice") else 0.0
 
         meters["voice_minutes"] = {
             "meter": "voice_minutes",
