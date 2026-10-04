@@ -124,8 +124,8 @@ class InvitationAdmin(ModelView, model=Invitation):
 
 
 class PlanAdmin(ModelView, model=Plan):
-    column_list = [Plan.code, Plan.display_name, Plan.price_cad_monthly, Plan.active, Plan.sort_order]
-    form_columns = [Plan.display_name, Plan.price_cad_monthly, Plan.price_cad_annual, Plan.features, Plan.limits, Plan.included, Plan.active, Plan.stripe_monthly_price_id, Plan.stripe_annual_price_id, Plan.sort_order]
+    column_list = [Plan.code, Plan.display_name, Plan.price_usd_monthly, Plan.active, Plan.sort_order]
+    form_columns = [Plan.display_name, Plan.price_usd_monthly, Plan.price_usd_annual, Plan.features, Plan.limits, Plan.included, Plan.active, Plan.stripe_monthly_price_id, Plan.stripe_annual_price_id, Plan.sort_order]
     can_delete = False
     name = "Plan"
     name_plural = "Plans"
@@ -133,7 +133,7 @@ class PlanAdmin(ModelView, model=Plan):
 
 
 class AddonAdmin(ModelView, model=Addon):
-    column_list = [Addon.code, Addon.display_name, Addon.price_cad_monthly, Addon.meter, Addon.active]
+    column_list = [Addon.code, Addon.display_name, Addon.price_usd_monthly, Addon.meter, Addon.active]
     can_delete = False
     name = "Addon"
     name_plural = "Addons"
