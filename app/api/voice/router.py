@@ -572,6 +572,12 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                         sess_obj.status = SessionStatus.succeeded
                         sess_obj.finished_at = datetime.now(UTC)
                         db.add(sess_obj)
+                        # Close the conversation — phone calls are always complete after hangup
+                        if sess_obj.conversation_id:
+                            conv_obj = await db.get(Conversation, sess_obj.conversation_id)
+                            if conv_obj:
+                                conv_obj.status = ConversationStatus.closed
+                                db.add(conv_obj)
                         await db.commit()
                     agent_obj = await db.get(Agent, trigger.agent_id)
                     if agent_obj:
