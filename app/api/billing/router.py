@@ -739,9 +739,19 @@ async def _add_addon_line_item(
         # Find existing voice item (if any)
         items = sub_dict.get("items", {}).get("data", [])
         voice_item_id: str | None = None
-        voice_prices = {a.stripe_price_id for a in (await db.exec(
-            select(OrgAddon).where(OrgAddon.org_id == org_id)
-        )).all() if a.addon_code in ("voice_lite", "voice_standard")}
+        # Collect Stripe price IDs of currently active voice add-ons for this org
+        voice_addon_codes = [oa.addon_code for oa in (await db.exec(
+            select(OrgAddon).where(
+                OrgAddon.org_id == org_id,
+                OrgAddon.addon_code.in_(["voice_lite", "voice_standard"]),
+                OrgAddon.status == "active",
+            )
+        )).all()]
+        voice_prices = set()
+        for vc in voice_addon_codes:
+            va = await db.get(Addon, vc)
+            if va and va.stripe_price_id:
+                voice_prices.add(va.stripe_price_id)
 
         for item in items:
             if item.get("price", {}).get("id") in voice_prices or (
