@@ -309,21 +309,59 @@ async def build_tool(db: AsyncSession, agent_id):
 MAX_URL_BYTES = 5 * 1024 * 1024  # 5 MB — web pages are rarely bigger
 
 
+_MAX_REDIRECTS = 5
+
+
 async def fetch_url_text(url: str) -> tuple[str, str]:
     """Fetch a URL and return (title_or_url, plain_text).
 
     Uses html2text to strip markup; falls back to raw response body for
     plain-text content types (txt, md, csv).
 
+    SSRF protection: redirects are followed manually so every hop is validated
+    against the private-network blocklist in app.core.net_guard before the
+    connection is made.
+
     Raises KnowledgeError with a user-readable message on failure.
     """
+    from urllib.parse import urljoin
+
     import html2text
     import httpx
 
+    from app.core.net_guard import UnsafeUrlError, assert_public_url
+
+    # Validate the initial URL (raises UnsafeUrlError → mapped to KnowledgeError below).
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            resp = await client.get(url, headers={"User-Agent": "setod-knowledge/1.0"})
+        current_url = assert_public_url(url, allowed_schemes=frozenset({"https", "http"}))
+    except UnsafeUrlError as exc:
+        raise KnowledgeError(f"URL not allowed: {exc}") from exc
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as client:
+            for _ in range(_MAX_REDIRECTS + 1):
+                resp = await client.get(
+                    current_url,
+                    headers={"User-Agent": "setod-knowledge/1.0"},
+                )
+                if resp.status_code in {301, 302, 303, 307, 308}:
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        raise KnowledgeError("Server sent a redirect with no Location header.")
+                    next_url = urljoin(current_url, location)
+                    try:
+                        current_url = assert_public_url(
+                            next_url, allowed_schemes=frozenset({"https", "http"})
+                        )
+                    except UnsafeUrlError as exc:
+                        raise KnowledgeError(f"Redirect target not allowed: {exc}") from exc
+                    continue
+                break
+            else:
+                raise KnowledgeError("Too many redirects.")
             resp.raise_for_status()
+    except KnowledgeError:
+        raise
     except httpx.HTTPStatusError as exc:
         raise KnowledgeError(
             f"The server returned {exc.response.status_code} for that URL."
@@ -352,5 +390,5 @@ async def fetch_url_text(url: str) -> tuple[str, str]:
         raise KnowledgeError("The page contained no extractable text.")
 
     # Use the final URL (after redirects) as the display name.
-    display = str(resp.url)
+    display = current_url
     return display, text

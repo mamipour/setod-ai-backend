@@ -12,16 +12,17 @@ from app.db.models import MemberRole, OrganizationMember, User
 from app.db.session import get_session
 
 
-def create_access_token(user_id: UUID) -> str:
+def create_access_token(user_id: UUID, token_version: int = 0) -> str:
     expire = datetime.now(UTC) + timedelta(minutes=settings.jwt_access_token_expire_minutes)
-    payload = {"sub": str(user_id), "exp": expire}
+    payload = {"sub": str(user_id), "ver": token_version, "exp": expire}
     return jwt.encode(payload, settings.app_secret_key, algorithm=settings.jwt_algorithm)
 
 
-def decode_access_token(token: str) -> UUID:
+def decode_access_token(token: str) -> tuple[UUID, int]:
+    """Decode and return (user_id, token_version). Raises 401 on any error."""
     try:
         payload = jwt.decode(token, settings.app_secret_key, algorithms=[settings.jwt_algorithm])
-        return UUID(payload["sub"])
+        return UUID(payload["sub"]), int(payload.get("ver", 0))
     except (JWTError, KeyError, ValueError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
@@ -33,11 +34,15 @@ async def get_current_user(
     if not access_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
-    user_id = decode_access_token(access_token)
+    user_id, token_ver = decode_access_token(access_token)
     user = await session.get(User, user_id)
 
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    # Reject tokens minted before the last logout (token_version bump).
+    if token_ver != user.token_version:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
 
     return user
 
@@ -68,6 +73,22 @@ async def require_owner(
             detail="Only workspace owners can perform this action",
         )
     return current_user
+
+
+async def assert_org_member(session: AsyncSession, user: User, org_id: UUID) -> None:
+    """Raise 403 unless *user* is any member (owner or member role) of *org_id*.
+
+    Use this inside route handlers that already know the org_id from a related
+    resource, instead of defining private copies in each router.
+    """
+    result = await session.exec(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == user.id,
+        )
+    )
+    if result.first() is None:
+        raise HTTPException(status_code=403, detail="Not a member of this workspace")
 
 
 async def assert_org_owner(session: AsyncSession, user: User, org_id: UUID) -> None:

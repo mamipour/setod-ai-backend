@@ -10,12 +10,10 @@ happens at connect / resync, not on every agent turn.
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import logging
 import re
 import secrets
-import socket
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode, urljoin, urlparse
@@ -24,6 +22,7 @@ import httpx
 
 from app.core.crypto import decrypt_json
 from app.core.llm.client import ToolSpec
+from app.core.net_guard import UnsafeUrlError, assert_public_url, _host_is_blocked  # noqa: F401
 from app.integrations.base import IntegrationError, RegisteredTool, ToolContext
 
 log = logging.getLogger(__name__)
@@ -83,10 +82,6 @@ CATALOG: dict[str, dict[str, str]] = {
 }
 
 
-class UnsafeUrlError(IntegrationError):
-    """The URL is not safe to fetch from this host."""
-
-
 class McpAuthRequired(IntegrationError):
     """The server wants credentials. `prm_url` is set when OAuth metadata is advertised."""
 
@@ -97,52 +92,12 @@ class McpAuthRequired(IntegrationError):
 
 
 # ── SSRF ──────────────────────────────────────────────────────────────────────
-
-_BLOCKED_NETWORKS = [
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-
-
-def _host_is_blocked(hostname: str) -> bool:
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror as exc:
-        raise UnsafeUrlError(f"Could not resolve host {hostname!r}") from exc
-    for info in infos:
-        raw = info[4][0]
-        try:
-            addr = ipaddress.ip_address(raw)
-        except ValueError:
-            continue
-        if any(addr in net for net in _BLOCKED_NETWORKS):
-            return True
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            return True
-    return False
-
+# Delegate to the shared guard in app.core.net_guard.  The alias keeps all
+# existing call-sites in this file working without further changes.
 
 def validate_mcp_url(url: str) -> str:
     """Return a cleaned HTTPS URL or raise UnsafeUrlError."""
-    cleaned = (url or "").strip()
-    parsed = urlparse(cleaned)
-    if parsed.scheme != "https":
-        raise UnsafeUrlError("MCP server URLs must use HTTPS")
-    if not parsed.hostname:
-        raise UnsafeUrlError("MCP server URL is missing a host")
-    host = parsed.hostname.lower()
-    if host in {"localhost", "metadata.google.internal"}:
-        raise UnsafeUrlError("That host is not allowed")
-    if _host_is_blocked(host):
-        raise UnsafeUrlError("That host resolves to a private or reserved address")
-    return cleaned
+    return assert_public_url(url)
 
 
 # ── HTTP / JSON-RPC ───────────────────────────────────────────────────────────

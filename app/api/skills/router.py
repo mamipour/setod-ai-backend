@@ -7,8 +7,8 @@ from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.auth.dependencies import get_current_user
-from app.db.models import Agent, AgentSkillLink, OrganizationMember, Skill, User
+from app.api.auth.dependencies import assert_org_member, get_current_user
+from app.db.models import Agent, AgentSkillLink, Skill, User
 from app.db.session import get_session
 
 router = APIRouter(prefix="/skills", tags=["skills"])
@@ -16,15 +16,7 @@ router = APIRouter(prefix="/skills", tags=["skills"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _assert_org_member(session: AsyncSession, user: User, org_id: UUID) -> None:
-    row = await session.exec(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == org_id,
-            OrganizationMember.user_id == user.id,
-        )
-    )
-    if not row.first():
-        raise HTTPException(status_code=403, detail="Not a member of this organisation")
+# assert_org_member is imported from app.api.auth.dependencies (shared R4 refactor)
 
 
 async def _get_skill(session: AsyncSession, user: User, skill_id: UUID) -> Skill:

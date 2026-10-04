@@ -54,6 +54,7 @@ lxml
 # ── Security ──────────────────────────────────────────────────────────────────
 python-jose[cryptography]
 passlib[bcrypt]
+slowapi
 
 # ── Admin panel ───────────────────────────────────────────────────────────────
 sqladmin[full]

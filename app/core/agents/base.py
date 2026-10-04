@@ -62,19 +62,13 @@ from app.db.models import (
 # Waiting sessions are auto-rejected after this period so they don't hang forever.
 APPROVAL_TIMEOUT = timedelta(hours=24)
 
-# A tool handler receives the model's parsed arguments and returns a string for the model.
-# It is given `dry_run` so write actions can describe themselves instead of happening.
-ToolHandler = Callable[[dict[str, Any], bool], Awaitable[str]]
-
-
-@dataclass
-class RegisteredTool:
-    spec: ToolSpec
-    handler: ToolHandler
-
-
-class AgentRunError(RuntimeError):
-    """Run could not start. Failures *during* a run are recorded on the session instead."""
+# Re-export from types module so that existing importers of agents.base
+# continue to work.  The canonical definitions now live in agents.types.
+from app.core.agents.types import (  # noqa: E402
+    AgentRunError,
+    RegisteredTool,
+    ToolHandler,
+)
 
 
 # Scheduled runs have no human message to react to, so they get a neutral nudge. Anything

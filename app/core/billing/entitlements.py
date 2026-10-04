@@ -68,8 +68,13 @@ class Entitlements:
         return int(self.limits.get(key, 0))
 
     def included_quantity(self, meter: str) -> float:
+        # Check for the suffixed key first (e.g. "voice_minutes_included"),
+        # then the bare meter key, then fall back to the plan's included dict.
+        suffixed = meter + "_included"
+        if suffixed in self._overrides:
+            return float(json.loads(self._overrides[suffixed]))
         if meter in self._overrides:
-            return float(json.loads(self._overrides[meter + "_included"] if meter + "_included" in self._overrides else self._overrides.get(meter, "0")))
+            return float(json.loads(self._overrides[meter]))
         return float(self.included.get(meter, 0.0))
 
     def hard_cap(self, meter: str) -> int | None:

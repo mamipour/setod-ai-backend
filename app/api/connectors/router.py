@@ -45,7 +45,7 @@ from telethon.sessions import StringSession
 
 from pydantic import BaseModel
 
-from app.api.auth.dependencies import assert_org_owner, get_current_user
+from app.api.auth.dependencies import assert_org_member, assert_org_owner, get_current_user
 from app.api.connectors.schemas import ConnectorOut, TestResult
 from app.config import settings
 from app.core.crypto import decrypt_json, encrypt_json
@@ -75,15 +75,7 @@ router = APIRouter(prefix="/connectors", tags=["connectors"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _assert_org_member(session: AsyncSession, user: User, org_id: UUID) -> None:
-    result = await session.exec(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == org_id,
-            OrganizationMember.user_id == user.id,
-        )
-    )
-    if not result.first():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this organization")
+# assert_org_member is imported from app.api.auth.dependencies (shared R4 refactor)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -844,10 +836,18 @@ async def tg_client_start(
 
 
 @router.post("/telegram-client/verify")
-async def tg_client_verify(body: TgClientVerify):
+async def tg_client_verify(
+    body: TgClientVerify,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
     pending = _tg_pending.get(body.session_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Session expired — please restart the flow")
+
+    # Ensure the session belongs to this user (prevents session hijacking).
+    if pending.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="This OTP session does not belong to you")
 
     client: TelegramClient = pending["client"]
 

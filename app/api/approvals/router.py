@@ -18,12 +18,11 @@ from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.auth.dependencies import assert_org_owner, get_current_user
+from app.api.auth.dependencies import assert_org_member, assert_org_owner, get_current_user
 from app.db.models import (
     Agent,
     ApprovalRequest,
     ApprovalStatus,
-    OrganizationMember,
     SessionStatus,
     User,
 )
@@ -62,15 +61,7 @@ class PendingCount(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-async def _assert_org_member(session: AsyncSession, user: User, org_id: UUID) -> None:
-    row = await session.exec(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == org_id,
-            OrganizationMember.user_id == user.id,
-        )
-    )
-    if row.first() is None:
-        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+# assert_org_member is imported from app.api.auth.dependencies (shared R4 refactor)
 
 
 async def _get_owned_request(

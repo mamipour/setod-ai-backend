@@ -8,11 +8,12 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
 
-from app.api.auth.dependencies import create_access_token, decode_access_token
+from app.api.auth.dependencies import create_access_token, decode_access_token, get_current_user
 from app.config import settings
 from app.core.agents.skills import DEFAULT_SKILLS
 from app.db.models import Invitation, MemberRole, Organization, OrganizationMember, Skill, User
 from app.db.session import get_session
+from app.limiter import limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -116,11 +117,13 @@ async def _accept_pending_invitations(session: AsyncSession, user: User) -> None
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/google/login")
+@limiter.limit("30/minute")
 async def google_login(request: Request):
     return await _get_oauth().google.authorize_redirect(request, settings.google_redirect_uri)
 
 
 @router.get("/google/callback")
+@limiter.limit("30/minute")
 async def google_callback(
     request: Request,
     response: Response,
@@ -135,7 +138,7 @@ async def google_callback(
     user = await _get_or_create_user(session, google_user)
     await _accept_pending_invitations(session, user)
 
-    access_token = create_access_token(user.id)
+    access_token = create_access_token(user.id, user.token_version)
 
     response = Response(status_code=status.HTTP_302_FOUND)
     response.headers["location"] = f"{settings.frontend_origin}/dashboard"
@@ -152,7 +155,18 @@ async def google_callback(
 
 
 @router.post("/logout")
-async def logout(response: Response):
+async def logout(
+    response: Response,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Invalidate the current session cookie and bump the user's token_version
+    so that any copies of the old JWT are immediately rejected on the next request.
+    """
+    current_user.token_version = (current_user.token_version or 0) + 1
+    session.add(current_user)
+    await session.commit()
+
     response.delete_cookie(
         "access_token",
         domain=settings.cookie_domain,
@@ -170,7 +184,7 @@ async def me(
     if not access_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
-    user_id: UUID = decode_access_token(access_token)
+    user_id, _ver = decode_access_token(access_token)
     user = await session.get(User, user_id)
 
     if not user:
@@ -222,7 +236,7 @@ async def accept_invitation_by_token(
     """
     if not access_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    user_id: UUID = decode_access_token(access_token)
+    user_id, _ver = decode_access_token(access_token)
     current_user = await session.get(User, user_id)
     if not current_user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")

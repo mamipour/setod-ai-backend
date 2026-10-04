@@ -7,9 +7,9 @@ from pydantic import BaseModel
 from sqlmodel import func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.auth.dependencies import get_current_user
+from app.api.auth.dependencies import assert_org_member, get_current_user
 from app.core.notes import MAX_BODY, MAX_LIVE_PER_ORG
-from app.db.models import OrganizationMember, OwnerNote, User
+from app.db.models import OwnerNote, User
 from app.db.session import get_session
 
 router = APIRouter(prefix="/notes", tags=["notes"])
@@ -17,15 +17,7 @@ router = APIRouter(prefix="/notes", tags=["notes"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _assert_org_member(session: AsyncSession, user: User, org_id: UUID) -> None:
-    row = await session.exec(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == org_id,
-            OrganizationMember.user_id == user.id,
-        )
-    )
-    if not row.first():
-        raise HTTPException(status_code=403, detail="Not a member of this organisation")
+# assert_org_member is imported from app.api.auth.dependencies (shared R4 refactor)
 
 
 async def _get_note(session: AsyncSession, user: User, note_id: UUID) -> OwnerNote:

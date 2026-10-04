@@ -1491,7 +1491,8 @@ async def stripe_webhook(
         return {"status": "already_processed"}
 
     db.add(StripeEvent(event_id=event_id))
-    await _handle_stripe_event(db, event)
+    from app.core.billing.stripe_events import handle_stripe_event
+    await handle_stripe_event(db, event)
     await db.commit()
     return {"status": "ok"}
 

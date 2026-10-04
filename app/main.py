@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.api.agents.router import router as agents_router
@@ -24,6 +27,7 @@ from app.config import settings
 import app.db.models  # noqa: F401 — registers all SQLModel tables
 from app.db.session import check_db
 from app.core.billing.entitlements import EntitlementError
+from app.limiter import limiter
 
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -50,8 +54,43 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _validate_production_config() -> None:
+    """Raise at startup if critical production-only settings are missing.
+
+    This prevents the server from starting with insecure defaults in production
+    (e.g. a weak or default secret key, missing Stripe webhook secret).
+    """
+    if not settings.is_production:
+        return
+
+    errors: list[str] = []
+    weak_secrets = {"secret", "changeme", "dev", "test", "development", "placeholder"}
+
+    if not settings.app_secret_key or settings.app_secret_key.lower() in weak_secrets:
+        errors.append("APP_SECRET_KEY is missing or insecure")
+
+    if not settings.encryption_key:
+        errors.append("ENCRYPTION_KEY is missing")
+
+    if not settings.cors_origins:
+        errors.append("CORS_ORIGINS is not set (no origins allowed in production)")
+
+    if not settings.stripe_webhook_secret:
+        errors.append("STRIPE_WEBHOOK_SECRET is not set")
+
+    if not settings.google_client_id or not settings.google_client_secret:
+        errors.append("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set")
+
+    if errors:
+        joined = "; ".join(errors)
+        raise RuntimeError(
+            f"Production startup blocked — fix the following config issues: {joined}"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _validate_production_config()
     await check_db()
     yield
 
@@ -63,6 +102,31 @@ app = FastAPI(
     docs_url=None if settings.is_production else "/docs",
     redoc_url=None,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+
+# ── Security headers middleware ────────────────────────────────────────────────
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "geolocation=(), microphone=(), camera=()",
+    )
+    # HSTS: enforce HTTPS for 1 year, include subdomains (production only).
+    if settings.is_production:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    return response
 
 # Session middleware required by Authlib OAuth state management
 app.add_middleware(
@@ -121,22 +185,3 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/admin-debug", include_in_schema=False)
-async def admin_debug(request: Request):
-    """Temporary: shows whether the access_token cookie reaches api.setod.com."""
-    from app.config import settings as _s
-    from app.api.auth.dependencies import decode_access_token
-    from app.db.session import get_session as _gs
-    token = request.cookies.get("access_token")
-    if not token:
-        return {"cookie": "MISSING", "cookies_received": list(request.cookies.keys())}
-    try:
-        user_id = decode_access_token(token)
-    except Exception as e:
-        return {"cookie": "INVALID", "error": str(e)}
-    async for db in _gs():
-        from app.db.models import User as _U
-        user = await db.get(_U, user_id)
-        if not user:
-            return {"cookie": "ok", "user_id": str(user_id), "found": False}
-        return {"cookie": "ok", "email": user.email, "is_staff": user.is_staff}

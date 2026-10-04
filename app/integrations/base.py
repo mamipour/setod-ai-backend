@@ -40,7 +40,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.core.agents.base import RegisteredTool
+from app.core.agents.types import RegisteredTool
 from app.db.models import AgentCursor, AgentProcessedItem, Connector, ProcessedItemStatus
 
 

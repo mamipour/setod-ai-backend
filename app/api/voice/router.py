@@ -11,20 +11,23 @@ when the org is over quota get a spoken "unable to take calls" message rather th
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import math
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from twilio.request_validator import RequestValidator
 
+from app.api.auth.dependencies import assert_org_owner, get_current_user
 from app.config import settings as cfg
 from app.core.agents.base import (
     MASTER_PREAMBLE,
@@ -52,6 +55,7 @@ from app.db.models import (
     ConversationStatus,
     MessageRole,
     SessionStatus,
+    User,
 )
 from app.db.session import get_session, AsyncSessionLocal
 from app.integrations.registry import build_tools_for_agent
@@ -97,13 +101,50 @@ def _twiml_busy() -> str:
     )
 
 
+# ── WebSocket single-use token ────────────────────────────────────────────────
+# Twilio's TwiML POST is already signature-validated, so only Twilio can trigger
+# _twiml_connect. We mint a short-lived HMAC token there and embed it in the WSS
+# URL so the WebSocket endpoint can verify that the connection was opened by a
+# real Twilio call — not by an attacker who discovered a trigger_id.
+
+_WS_TOKEN_TTL = 300  # 5 minutes; call must connect within this window
+
+
+def _mint_ws_token(trigger_id: UUID) -> str:
+    """Return a token string '{exp}.{hex}' valid for _WS_TOKEN_TTL seconds."""
+    exp = int(time.time()) + _WS_TOKEN_TTL
+    msg = f"{trigger_id}:{exp}".encode()
+    sig = hmac.new(cfg.app_secret_key.encode(), msg, hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _verify_ws_token(trigger_id: UUID, token: str | None) -> bool:
+    """Return True iff the token was minted for this trigger_id and has not expired."""
+    if not token:
+        return False
+    try:
+        exp_str, sig = token.split(".", 1)
+        exp = int(exp_str)
+    except (ValueError, TypeError):
+        return False
+    if int(time.time()) > exp:
+        return False
+    msg = f"{trigger_id}:{exp}".encode()
+    expected = hmac.new(cfg.app_secret_key.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
 def _twiml_connect(trigger_id: UUID, voice: str = "UgBBYS2sOqTuMpoF3BR0") -> str:
-    wss_url = f"{cfg.api_public_origin.replace('https://', 'wss://').replace('http://', 'ws://')}/voice/ws/{trigger_id}"
     # Ensure HTTPS/WSS
     if cfg.api_public_origin.startswith("https://"):
         wss_url = f"wss://{cfg.api_public_origin.split('://',1)[1]}/voice/ws/{trigger_id}"
     else:
         wss_url = f"wss://api.setod.com/voice/ws/{trigger_id}"
+
+    # Append a short-lived HMAC token so the WebSocket endpoint can verify that
+    # this connection was opened by a real Twilio call (C3 security fix).
+    ws_token = _mint_ws_token(trigger_id)
+    wss_url = f"{wss_url}?t={ws_token}"
 
     # language="multi" enables Deepgram's automatic language detection per utterance.
     # The detected language code is forwarded in every "prompt" frame as msg["lang"],
@@ -167,7 +208,7 @@ async def voice_twiml(
             return Response(content=_twiml_busy(), media_type="application/xml")
 
         from app.core.billing.voice import voice_call_allowed
-        if not await voice_call_allowed(adb, agent.org_id):
+        if not await voice_call_allowed(adb, agent.org_id, ent=ent):
             log.info("voice blocked: org=%s over allowance or overage disabled", agent.org_id)
             return Response(content=_twiml_busy(), media_type="application/xml")
 
@@ -194,7 +235,18 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
       { "type": "prompt", "voicePrompt": "...", "lang": "...", "last": true }
       { "type": "interrupt", "utteranceUntilInterrupt": "..." }
       { "type": "error", "description": "..." }
+
+    Security: connection is only accepted when it carries a valid HMAC token
+    minted by the TwiML endpoint (which is itself Twilio-signature-validated).
+    This prevents arbitrary callers who know the trigger_id from injecting turns.
     """
+    # Verify the WS token BEFORE accepting — once accepted, Twilio starts sending frames.
+    ws_token = ws.query_params.get("t")
+    if not _verify_ws_token(trigger_id, ws_token):
+        log.warning("voice ws: rejected — invalid or missing token trigger=%s", trigger_id)
+        await ws.close(code=1008)
+        return
+
     await ws.accept()
     log.info("voice ws: connected trigger=%s", trigger_id)
 
@@ -203,6 +255,10 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
     session: AgentSession | None = None
     conversation: Conversation | None = None
     messages: list[dict[str, Any]] = []
+    # Keep at most this many completed turn-pairs (user + assistant) in the
+    # context window.  Voice turns are short but a long call would otherwise
+    # fill the context with hundreds of messages and add unnecessary latency.
+    _VOICE_HISTORY_TURNS = 20   # = 40 messages max (20 user + 20 assistant)
     tools = []
     seq = 0          # monotonic message sequence for AgentSessionMessage
     cancel: asyncio.Event = asyncio.Event()
@@ -442,6 +498,14 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                     messages.append(user_message(voice_text))
                     messages.append(assistant_message(result.content, []))
 
+                    # Trim conversation history: keep system messages + last N turn-pairs.
+                    sys_msgs = [m for m in messages if m.get("role") == "system"]
+                    turn_msgs = [m for m in messages if m.get("role") != "system"]
+                    max_msgs = _VOICE_HISTORY_TURNS * 2
+                    if len(turn_msgs) > max_msgs:
+                        turn_msgs = turn_msgs[-max_msgs:]
+                    messages = sys_msgs + turn_msgs
+
             elif msg_type == "interrupt":
                 heard = msg.get("utteranceUntilInterrupt", "")
                 log.info("voice ws: interrupt callSid=%s heard=%r", call_sid, heard[:60])
@@ -488,22 +552,26 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
 @router.post("/attach/{trigger_id}")
 async def attach_voice_number(
     trigger_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
     db: AsyncSession = Depends(get_session),
 ):
     """Set the Twilio number's VoiceUrl to point at this trigger's TwiML endpoint.
 
-    Called automatically when a phone trigger is created.
+    Called automatically when a phone trigger is created. Requires owner access.
     """
     trigger = await db.get(AgentTrigger, trigger_id)
     if not trigger:
-        from fastapi import HTTPException
         raise HTTPException(404, "Trigger not found")
+
+    agent = await db.get(Agent, trigger.agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    await assert_org_owner(db, current_user, agent.org_id)
 
     trigger_config: dict[str, Any] = trigger.config or {}
     connector_id = UUID(str(trigger_config["connector_id"]))
     number_sid = trigger_config.get("number_sid")
     if not number_sid:
-        from fastapi import HTTPException
         raise HTTPException(400, "number_sid not set in trigger config")
 
     creds = await _get_twilio_creds(db, connector_id)
@@ -516,7 +584,6 @@ async def attach_voice_number(
             data={"VoiceUrl": twiml_url, "VoiceMethod": "POST"},
         )
         if resp.status_code >= 300:
-            from fastapi import HTTPException
             raise HTTPException(502, f"Twilio returned {resp.status_code}: {resp.text[:200]}")
 
     return {"voice_url": twiml_url, "status": resp.json().get("status")}
@@ -525,13 +592,18 @@ async def attach_voice_number(
 @router.post("/detach/{trigger_id}")
 async def detach_voice_number(
     trigger_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
     db: AsyncSession = Depends(get_session),
 ):
-    """Clear the Twilio number's VoiceUrl when the trigger is deleted."""
+    """Clear the Twilio number's VoiceUrl when the trigger is deleted. Requires owner access."""
     trigger = await db.get(AgentTrigger, trigger_id)
     if not trigger:
-        from fastapi import HTTPException
         raise HTTPException(404, "Trigger not found")
+
+    agent = await db.get(Agent, trigger.agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    await assert_org_owner(db, current_user, agent.org_id)
 
     trigger_config: dict[str, Any] = trigger.config or {}
     connector_id = UUID(str(trigger_config["connector_id"]))

@@ -90,6 +90,9 @@ class User(SQLModel, table=True):
     name: str
     avatar_url: str | None = None
     is_staff: bool = Field(default=False)
+    # Incremented on logout so old tokens are immediately rejected.
+    # No Redis needed — one extra DB column is sufficient for our traffic.
+    token_version: int = Field(default=0, nullable=False)
     created_at: datetime = _ts()
     updated_at: datetime = _ts()
 

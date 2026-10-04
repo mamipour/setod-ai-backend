@@ -43,7 +43,7 @@ async def _assert_org_access(
     member = await db.exec(
         select(OrganizationMember).where(
             OrganizationMember.user_id == user.id,
-            OrganizationMember.org_id == org_id,
+            OrganizationMember.organization_id == org_id,
         )
     )
     if member.first() is None:
