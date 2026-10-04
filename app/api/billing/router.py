@@ -761,10 +761,16 @@ async def _add_addon_line_item(
             if va and va.stripe_price_id:
                 voice_prices.add(va.stripe_price_id)
 
+        # Only match items whose price ID is a known voice add-on price
+        all_voice_price_ids: set[str] = set()
+        for vc_code in ("voice_lite", "voice_standard"):
+            vc_addon = await db.get(Addon, vc_code)
+            if vc_addon and vc_addon.stripe_price_id:
+                all_voice_price_ids.add(vc_addon.stripe_price_id)
+
         for item in items:
-            if item.get("price", {}).get("id") in voice_prices or (
-                existing_addon and item.get("price", {}).get("id")
-            ):
+            item_price_id = item.get("price", {}).get("id")
+            if item_price_id and item_price_id in all_voice_price_ids:
                 voice_item_id = item["id"]
                 break
 
