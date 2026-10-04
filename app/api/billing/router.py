@@ -563,7 +563,6 @@ async def update_billing_settings(
 ):
     """Update auto-recharge settings."""
     from app.db.models import OrgBillingSettings
-    from datetime import UTC, datetime
 
     settings_row = await db.get(OrgBillingSettings, org_id)
     if not settings_row:
@@ -655,7 +654,6 @@ async def _do_auto_recharge(db, stripe_mod, org_id: UUID) -> bool:
             raise RuntimeError(f"PaymentIntent status={pi_dict.get('status')}")
 
     except Exception as exc:
-        from datetime import UTC, datetime
         log.error("auto-recharge failed for org %s: %s", org_id, exc)
         if settings_row:
             settings_row.auto_recharge_failed_at = datetime.now(UTC)
@@ -976,10 +974,10 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
         elif subscription_id:
             # Plan subscription — plan_code is in session metadata
             sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+            from datetime import timedelta as _billing_td
             now = datetime.now(UTC)
             period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            from datetime import timedelta as _td
-            period_end = (now.replace(day=1) + _td(days=32)).replace(day=1)
+            period_end = (now.replace(day=1) + _billing_td(days=32)).replace(day=1)
             if sub:
                 sub.stripe_customer_id = customer_id
                 sub.stripe_subscription_id = subscription_id
@@ -1078,7 +1076,6 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
         if meta.get("type") == "auto_recharge" and meta.get("org_id"):
             try:
                 from app.db.models import OrgBillingSettings
-                from datetime import UTC, datetime
                 bid = UUID(meta["org_id"])
                 settings_row = await db.get(OrgBillingSettings, bid)
                 if settings_row:
