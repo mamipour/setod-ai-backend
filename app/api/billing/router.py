@@ -67,6 +67,50 @@ async def _get_or_create_stripe_customer(db: AsyncSession, stripe_mod, org_id: U
 
 # ── Subscription item helpers ─────────────────────────────────────────────────
 
+def _resolve_addon_price_for_currency(stripe_mod, addon: "Addon", sub_currency: str) -> str:
+    """Return a Stripe price ID for this add-on in the subscription's currency.
+
+    If the subscription is in USD we return addon.stripe_price_id directly.
+    Otherwise we look for an existing active price on the same product in that
+    currency, or create one with the same nominal unit_amount (same number,
+    different currency — typical SaaS pricing parity approach).
+    """
+    if not sub_currency or sub_currency.lower() == "usd":
+        return addon.stripe_price_id
+
+    # Need a price in a non-USD currency
+    try:
+        base_price = stripe_mod.Price.retrieve(addon.stripe_price_id)
+        product_id = base_price.product
+        unit_amount = addon.price_usd_monthly  # same nominal amount in local currency
+
+        # Search for an existing matching price
+        prices = stripe_mod.Price.list(product=product_id, currency=sub_currency.lower(), active=True, limit=20)
+        for p in prices.data:
+            rec = p.recurring
+            if (
+                p.unit_amount == unit_amount
+                and rec is not None
+                and getattr(rec, "interval", None) == "month"
+                and getattr(rec, "usage_type", "licensed") == "licensed"
+            ):
+                return p.id
+
+        # Create a new price in the subscription's currency
+        new_price = stripe_mod.Price.create(
+            product=product_id,
+            currency=sub_currency.lower(),
+            unit_amount=unit_amount,
+            recurring={"interval": "month"},
+            nickname=f"{addon.code} Monthly ({sub_currency.upper()})",
+        )
+        log.info("Created %s price for addon %s in currency %s: %s", sub_currency, addon.code, sub_currency, new_price.id)
+        return new_price.id
+    except Exception:
+        log.exception("Could not resolve price in currency %s for addon %s, falling back to USD price", sub_currency, addon.code)
+        return addon.stripe_price_id
+
+
 async def _classify_items(db: AsyncSession, items: list[dict]) -> dict:
     """Classify Stripe subscription items by type.
 
@@ -895,7 +939,7 @@ async def addon_preview(
         action = "add"
 
     effective = "period_end" if action in ("remove", "swap_down") else "immediate"
-    renewal_price_cents = int(addon.price_usd_monthly * 100) if action not in ("remove",) else 0
+    renewal_price_cents = int(addon.price_usd_monthly) if action not in ("remove",) else 0  # price_usd_monthly is already in cents
 
     # Prorated charge for immediate actions
     amount_due_cents = 0
@@ -907,13 +951,16 @@ async def addon_preview(
             customer_id = await _get_or_create_stripe_customer(db, _stripe, org_id)
             _stripe_raw = _stripe.Subscription.retrieve(sub.stripe_subscription_id, expand=["items"])
             _stripe_sub = _stripe_raw._to_dict_recursive() if hasattr(_stripe_raw, "_to_dict_recursive") else dict(_stripe_raw)
+            sub_currency = _stripe_sub.get("currency", "usd")
             classified = await _classify_items(db, _stripe_sub.get("items", {}).get("data", []))
+            # Resolve price in the subscription's currency (handles CAD/non-USD subscriptions)
+            resolved_price_id = _resolve_addon_price_for_currency(_stripe, addon, sub_currency)
 
             preview_items = []
             if classified["voice_item"]:
-                preview_items.append({"id": classified["voice_item"]["id"], "price": addon.stripe_price_id})
+                preview_items.append({"id": classified["voice_item"]["id"], "price": resolved_price_id})
             else:
-                preview_items.append({"price": addon.stripe_price_id, "quantity": 1})
+                preview_items.append({"price": resolved_price_id, "quantity": 1})
                 # Add overage item if missing
                 if not classified["overage_item"] and addon.stripe_overage_price_id:
                     preview_items.append({"price": addon.stripe_overage_price_id, "quantity": 1})
@@ -940,7 +987,7 @@ async def addon_preview(
                 fraction = remaining_secs / period_secs if period_secs > 0 else 1.0
                 prorated_cents = int(renewal_price_cents * fraction)
                 if action == "swap_up" and current_voice and current_def:
-                    old_price_cents = int((current_def.price_usd_monthly or 0) * 100)
+                    old_price_cents = int(current_def.price_usd_monthly or 0)  # already in cents
                     prorated_cents = int((renewal_price_cents - old_price_cents) * fraction)
                 amount_due_cents = max(0, prorated_cents)
 
@@ -1062,8 +1109,12 @@ async def _add_addon_line_item(
     try:
         _stripe_raw = stripe_mod.Subscription.retrieve(sub.stripe_subscription_id, expand=["items"])
         stripe_sub = _stripe_raw._to_dict_recursive() if hasattr(_stripe_raw, "_to_dict_recursive") else dict(_stripe_raw)
+        sub_currency = stripe_sub.get("currency", "usd")
         items = stripe_sub.get("items", {}).get("data", [])
         classified = await _classify_items(db, items)
+
+        # Resolve a price in the subscription's currency (handles non-USD subscriptions)
+        resolved_price_id = _resolve_addon_price_for_currency(stripe_mod, addon, sub_currency)
 
         voice_item = classified["voice_item"]
         overage_item = classified["overage_item"]
@@ -1072,7 +1123,7 @@ async def _add_addon_line_item(
             # Swap to new voice price
             stripe_mod.SubscriptionItem.modify(
                 voice_item["id"],
-                price=price_id,
+                price=resolved_price_id,
                 proration_behavior="always_invoice",
             )
             log.info("voice add-on swapped to %s for org %s", addon_code, org_id)
@@ -1080,7 +1131,7 @@ async def _add_addon_line_item(
             # Add new voice item
             stripe_mod.SubscriptionItem.create(
                 subscription=sub.stripe_subscription_id,
-                price=price_id,
+                price=resolved_price_id,
                 quantity=1,
                 proration_behavior="always_invoice",
                 metadata={"addon_code": addon_code, "org_id": str(org_id)},
@@ -1090,9 +1141,43 @@ async def _add_addon_line_item(
         # Add metered overage item if absent
         if not overage_item and addon.stripe_overage_price_id:
             try:
+                # Metered price also needs to match the subscription currency
+                resolved_overage_price_id = addon.stripe_overage_price_id
+                if sub_currency.lower() != "usd":
+                    try:
+                        overage_base = stripe_mod.Price.retrieve(addon.stripe_overage_price_id)
+                        ov_product_id = overage_base.product
+                        ov_prices = stripe_mod.Price.list(product=ov_product_id, currency=sub_currency.lower(), active=True, limit=20)
+                        matched = None
+                        for p in ov_prices.data:
+                            rec = p.recurring
+                            if rec and getattr(rec, "usage_type", None) == "metered":
+                                matched = p.id
+                                break
+                        if matched:
+                            resolved_overage_price_id = matched
+                        else:
+                            # Create metered price in local currency
+                            from app.core.billing.usage import VOICE_OVERAGE_EVENT_NAME
+                            meter_obj = stripe_mod.Price.retrieve(addon.stripe_overage_price_id)
+                            meter_id = getattr(meter_obj.recurring, "meter", None) if meter_obj.recurring else None
+                            create_params = {
+                                "product": ov_product_id,
+                                "currency": sub_currency.lower(),
+                                "unit_amount": overage_base.unit_amount,
+                                "recurring": {"interval": "month", "usage_type": "metered"},
+                                "nickname": f"Voice Overage per minute ({sub_currency.upper()})",
+                            }
+                            if meter_id:
+                                create_params["recurring"]["meter"] = meter_id
+                            new_ov_price = stripe_mod.Price.create(**create_params)
+                            resolved_overage_price_id = new_ov_price.id
+                            log.info("Created %s metered overage price: %s", sub_currency, new_ov_price.id)
+                    except Exception:
+                        log.exception("Could not resolve overage price in currency %s, using USD fallback", sub_currency)
                 stripe_mod.SubscriptionItem.create(
                     subscription=sub.stripe_subscription_id,
-                    price=addon.stripe_overage_price_id,
+                    price=resolved_overage_price_id,
                     quantity=1,
                     proration_behavior="none",
                     metadata={"type": "voice_overage", "org_id": str(org_id)},
