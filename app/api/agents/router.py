@@ -779,7 +779,11 @@ async def publish_agent(
 ):
     agent = await _get_owner_only_agent(session, current_user, agent_id)
     if agent.model_connector_id is None:
-        raise HTTPException(status_code=422, detail="Choose an AI model before publishing")
+        # No BYOK connector is fine when the org can run on Setod-managed keys.
+        from app.core.billing.entitlements import resolve as _resolve_ent
+        ent = await _resolve_ent(session, agent.org_id)
+        if not ent.allows("managed_models"):
+            raise HTTPException(status_code=422, detail="Choose an AI model before publishing")
     if not agent.instructions.strip():
         raise HTTPException(status_code=422, detail="Add instructions before publishing")
 
@@ -2083,27 +2087,30 @@ async def explain_session(
         f"TRANSCRIPT:\n{transcript}\n\nSUMMARY:"
     )
 
-    # Use the agent's own model connector; fall back to first active OpenAI/Anthropic in the org.
-    from app.core.agents.base import _resolve_config, _build_client_for
-    config = _resolve_config(agent, use_published=False)
-    if not config.get("model_connector_id"):
-        # Find any active model connector in the org.
-        mc_result = await session.exec(
-            select(Connector).where(
-                Connector.org_id == agent.org_id,
-                Connector.type.in_([ConnectorType.openai, ConnectorType.anthropic]),
-                Connector.status == ConnectorStatus.active,
-            ).limit(1)
-        )
-        mc = mc_result.first()
-        if mc is None:
-            return ExplainOut(session_id=run.id, summary="No AI model connector available to generate a summary.")
-        config["model_connector_id"] = str(mc.id)
-        config["model"] = config.get("model") or ""
+    # Use the agent's own brain (BYOK connector or Setod-managed key).  If neither is
+    # available, borrow any active OpenAI/Anthropic connector in the org for the summary.
+    from app.core.agents.base import AgentRunError, _build_client_for, _resolve_config
+    from app.core.llm.client import user_message as _user_msg
 
+    config = _resolve_config(agent, use_published=False)
     try:
-        client = await _build_client_for(session, agent, config)
-        from app.core.llm.client import user_message as _user_msg
+        try:
+            client, *_ = await _build_client_for(session, agent, config)
+        except AgentRunError:
+            mc_result = await session.exec(
+                select(Connector).where(
+                    Connector.org_id == agent.org_id,
+                    Connector.type.in_([ConnectorType.openai, ConnectorType.anthropic]),
+                    Connector.status == ConnectorStatus.active,
+                ).limit(1)
+            )
+            mc = mc_result.first()
+            if mc is None:
+                return ExplainOut(session_id=run.id, summary="No AI model available to generate a summary.")
+            config["model_connector_id"] = str(mc.id)
+            config["model"] = ""
+            client, *_ = await _build_client_for(session, agent, config)
+
         response = await client.chat([_user_msg(prompt)], max_tokens=256)
         summary = response.content.strip()
     except Exception as exc:  # noqa: BLE001
