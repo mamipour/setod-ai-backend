@@ -13,12 +13,147 @@ from app.api.auth.dependencies import get_current_user, require_owner
 from app.config import settings
 from app.core.billing.entitlements import resolve as resolve_ent
 from app.core.billing.usage import get_org_usage, rollup_usage_periods
-from app.db.models import Addon, OrgAddon, OrgSubscription, Plan, StripeEvent, User
+from app.db.models import Addon, Agent, CreditGrant, OrgAddon, OrgBillingSettings, OrgSubscription, OrgTableRow, Organization, Plan, StripeEvent, User
 from app.db.session import get_session
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+
+
+async def _get_or_create_stripe_customer(db: AsyncSession, stripe_mod, org_id: UUID) -> str:
+    """Return the Stripe customer ID for an org, creating one if it doesn't exist.
+
+    stripe_customer_id is stored on Organization (canonical) and mirrored on
+    OrgSubscription for convenience.  This helper always reads from / writes to
+    Organization so that flushing the subscription row never orphans the customer.
+    """
+    from sqlmodel import select
+    org = await db.get(Organization, org_id)
+    if org and org.stripe_customer_id:
+        return org.stripe_customer_id
+
+    # Look up by email to avoid creating a second customer for the same address
+    from app.db.models import User as _User, OrganizationMember as _OM
+    owner_row = (await db.exec(
+        select(_User)
+        .join(_OM, _OM.user_id == _User.id)
+        .where(_OM.organization_id == org_id, _OM.role == "owner")
+        .limit(1)
+    )).first()
+    email = owner_row.email if owner_row else None
+
+    customers = stripe_mod.Customer.search(query=f'email:"{email}"', limit=5) if email else None
+    customer_id: str | None = None
+    if customers:
+        for c in customers.data:
+            cd = c._to_dict_recursive() if hasattr(c, "_to_dict_recursive") else dict(c)
+            if cd.get("email") == email:
+                customer_id = cd["id"]
+                break
+
+    if not customer_id:
+        cust = stripe_mod.Customer.create(email=email, metadata={"org_id": str(org_id)})
+        customer_id = cust.id
+        log.info("created Stripe customer %s for org %s", customer_id, org_id)
+
+    if org:
+        org.stripe_customer_id = customer_id
+        db.add(org)
+        await db.commit()
+
+    return customer_id
+
+
+# ── Catalog ───────────────────────────────────────────────────────────────────
+
+@router.get("/catalog")
+async def get_catalog(
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Public plan + add-on catalog. No auth required (used by plan page)."""
+    from sqlmodel import select
+    plans = (await db.exec(select(Plan).where(Plan.active == True).order_by(Plan.sort_order))).all()
+    addons = (await db.exec(select(Addon).where(Addon.active == True).order_by(Addon.sort_order))).all()
+    return {
+        "plans": [
+            {
+                "code": p.code,
+                "display_name": p.display_name,
+                "price_usd_monthly": p.price_usd_monthly,
+                "price_usd_annual": p.price_usd_annual,
+                "monthly_credit_cents": p.monthly_credit_cents,
+                "max_agents": (p.limits or {}).get("agents", 5),
+                "max_rows": (p.limits or {}).get("rows", 5000),
+                "features": p.features,
+                "limits": p.limits,
+                "sort_order": p.sort_order,
+            }
+            for p in plans
+        ],
+        "addons": [
+            {
+                "code": a.code,
+                "display_name": a.display_name,
+                "price_usd_monthly": a.price_usd_monthly,
+                "included_minutes": (a.included or {}).get("voice_minutes", 0),
+                # overage_price_per_unit in cents (29 cents = $0.29/min)
+                "overage_price_per_unit": int(((a.features or {}).get("overage_price_usd", 0.29)) * 100),
+                "features": a.features,
+                "sort_order": a.sort_order,
+            }
+            for a in addons
+        ],
+    }
+
+
+@router.get("/{org_id}/downgrade-impact")
+async def downgrade_impact(
+    org_id: UUID,
+    target_plan: str,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Return items that would exceed limits if the org downgrades to target_plan.
+
+    Response shape:
+      {
+        "agents": {"current": 12, "limit": 5, "over": 7},  # or null if OK
+        "rows":   {"current": 80000, "limit": 50000, "over": 30000},  # or null if OK
+      }
+    """
+    from sqlmodel import select, func
+    from app.db.models import Agent, OrgTableRow
+
+    plan = await db.get(Plan, target_plan)
+    if not plan:
+        raise HTTPException(404, f"Plan '{target_plan}' not found")
+
+    limits = plan.limits or {}
+    agent_limit = int(limits.get("agents", 5))
+    row_limit = int(limits.get("rows", 5000))
+
+    # Current counts
+    agent_count = (await db.exec(
+        select(func.count()).where(Agent.org_id == org_id, Agent.status != "deleted")
+    )).one()
+
+    row_count = (await db.exec(
+        select(func.count()).where(OrgTableRow.org_id == org_id, OrgTableRow.deleted_at.is_(None))
+    )).one()
+
+    return {
+        "agents": {
+            "current": int(agent_count),
+            "limit": agent_limit,
+            "over": max(0, int(agent_count) - agent_limit),
+        } if agent_limit != -1 and int(agent_count) > agent_limit else None,
+        "rows": {
+            "current": int(row_count),
+            "limit": row_limit,
+            "over": max(0, int(row_count) - row_limit),
+        } if row_limit != -1 and int(row_count) > row_limit else None,
+    }
 
 
 # ── Usage query ───────────────────────────────────────────────────────────────
@@ -79,12 +214,19 @@ async def get_plan(
         except Exception:
             log.exception("Failed to fetch pending downgrade plan")
 
+    # Credit balance
+    from app.core.billing.credits import balance as credit_balance
+    balance_cents = await credit_balance(db, org_id)
+    monthly_credit_cents = plan.monthly_credit_cents if plan else 0
+
     return {
         "plan_code": ent.plan_code,
         "plan_name": plan.display_name if plan else ent.plan_code,
         "features": ent.features,
         "limits": ent.limits,
         "included": ent.included,
+        "monthly_credit_cents": monthly_credit_cents,
+        "credit_balance_cents": balance_cents,
         "subscription": {
             "status": sub.status if sub else None,
             "stripe_customer_id": sub.stripe_customer_id if sub else None,
@@ -118,19 +260,18 @@ async def create_checkout(
     sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
 
     # If already subscribed, do an in-place subscription modification instead
-    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing"):
+    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing", "downgrade_scheduled"):
         return await _change_plan_inline(db, stripe, sub, plan, plan_code)
 
+    customer_id = await _get_or_create_stripe_customer(db, stripe, org_id)
     session_params: dict = {
         "mode": "subscription",
+        "customer": customer_id,
         "line_items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
         "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
         "metadata": {"org_id": str(org_id), "plan_code": plan_code},
     }
-    if sub and sub.stripe_customer_id:
-        session_params["customer"] = sub.stripe_customer_id
-
     checkout = stripe.checkout.Session.create(**session_params)
     return {"url": checkout.url}
 
@@ -162,19 +303,19 @@ async def change_plan(
 
     sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
 
-    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing"):
+    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing", "downgrade_scheduled"):
         return await _change_plan_inline(db, stripe, sub, plan, plan_code)
 
     # No existing sub — return a checkout URL
+    customer_id = await _get_or_create_stripe_customer(db, stripe, org_id)
     session_params: dict = {
         "mode": "subscription",
+        "customer": customer_id,
         "line_items": [{"price": plan.stripe_monthly_price_id, "quantity": 1}],
         "success_url": f"{settings.frontend_origin}/settings/plan?checkout=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?checkout=cancel",
         "metadata": {"org_id": str(org_id), "plan_code": plan_code},
     }
-    if sub and sub.stripe_customer_id:
-        session_params["customer"] = sub.stripe_customer_id
     checkout = stripe.checkout.Session.create(**session_params)
     return {"url": checkout.url}
 
@@ -329,6 +470,199 @@ async def reactivate(
     return {"status": "ok"}
 
 
+@router.post("/{org_id}/topup-checkout")
+async def create_topup_checkout(
+    org_id: UUID,
+    body: dict,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Start a Stripe Checkout session (mode=payment) for a prepaid credit top-up pack.
+
+    body: { "pack_id": "pack_1000" | "pack_2500" | "pack_5000" | "pack_10000" }
+
+    Top-up packs are one-time payments.  The webhook handler grants credits on
+    checkout.session.completed with billing_reason=payment (not subscription).
+    """
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Billing not configured")
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+
+    # Predefined top-up packs (amount_cents → display_label)
+    TOPUP_PACKS: dict[str, dict] = {
+        "pack_500":   {"cents": 500,   "price_usd": 500,   "label": "$5 — 500 credit cents"},
+        "pack_1000":  {"cents": 1000,  "price_usd": 1000,  "label": "$10 — 1,000 credit cents"},
+        "pack_2500":  {"cents": 2500,  "price_usd": 2500,  "label": "$25 — 2,500 credit cents"},
+        "pack_5000":  {"cents": 5000,  "price_usd": 5000,  "label": "$50 — 5,000 credit cents"},
+        "pack_10000": {"cents": 10000, "price_usd": 10000, "label": "$100 — 10,000 credit cents"},
+    }
+
+    pack_id = body.get("pack_id", "pack_2500")
+    pack = TOPUP_PACKS.get(pack_id)
+    if not pack:
+        raise HTTPException(400, f"Unknown pack '{pack_id}'. Valid: {list(TOPUP_PACKS)}")
+
+    customer_id = await _get_or_create_stripe_customer(db, stripe, org_id)
+    checkout = stripe.checkout.Session.create(
+        mode="payment",
+        customer=customer_id,
+        payment_intent_data={
+            "setup_future_usage": "off_session",  # save card for auto-recharge
+        },
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": pack["price_usd"],
+                "product_data": {"name": f"AI Credit Top-up — {pack['label']}"},
+            },
+            "quantity": 1,
+        }],
+        success_url=f"{settings.frontend_origin}/settings/plan?topup=success",
+        cancel_url=f"{settings.frontend_origin}/settings/plan?topup=cancel",
+        metadata={"org_id": str(org_id), "topup_cents": str(pack["cents"]), "pack_id": pack_id},
+    )
+    return {"url": checkout.url}
+
+
+@router.get("/{org_id}/billing-settings")
+async def get_billing_settings(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Return auto-recharge and notification settings for the org."""
+    from app.db.models import OrgBillingSettings
+    settings_row = await db.get(OrgBillingSettings, org_id)
+    if not settings_row:
+        return {
+            "auto_recharge_enabled": False,
+            "threshold_cents": 500,
+            "recharge_amount_cents": 2500,
+            "monthly_cap_cents": 20000,
+            "auto_recharged_this_month_cents": 0,
+            "auto_recharge_failed_at": None,
+        }
+    return {
+        "auto_recharge_enabled": settings_row.auto_recharge_enabled,
+        "threshold_cents": settings_row.threshold_cents,
+        "recharge_amount_cents": settings_row.recharge_amount_cents,
+        "monthly_cap_cents": settings_row.monthly_cap_cents,
+        "auto_recharged_this_month_cents": settings_row.auto_recharged_this_month_cents,
+        "auto_recharge_failed_at": settings_row.auto_recharge_failed_at,
+    }
+
+
+@router.patch("/{org_id}/billing-settings")
+async def update_billing_settings(
+    org_id: UUID,
+    body: dict,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Update auto-recharge settings."""
+    from app.db.models import OrgBillingSettings
+    from datetime import UTC, datetime
+
+    settings_row = await db.get(OrgBillingSettings, org_id)
+    if not settings_row:
+        settings_row = OrgBillingSettings(org_id=org_id)
+
+    if "auto_recharge_enabled" in body:
+        settings_row.auto_recharge_enabled = bool(body["auto_recharge_enabled"])
+    if "threshold_cents" in body:
+        settings_row.threshold_cents = max(100, int(body["threshold_cents"]))
+    if "recharge_amount_cents" in body:
+        settings_row.recharge_amount_cents = max(500, int(body["recharge_amount_cents"]))
+    if "monthly_cap_cents" in body:
+        settings_row.monthly_cap_cents = max(0, int(body["monthly_cap_cents"]))
+
+    settings_row.updated_at = datetime.now(UTC)
+    db.add(settings_row)
+    await db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/{org_id}/auto-recharge")
+async def trigger_auto_recharge(
+    org_id: UUID,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Manually trigger an auto-recharge attempt.  Useful for testing or after a card update."""
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Billing not configured")
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+    await _do_auto_recharge(db, stripe, org_id)
+    return {"status": "ok"}
+
+
+async def _do_auto_recharge(db, stripe_mod, org_id: UUID) -> bool:
+    """Attempt an off-session PaymentIntent charge for the auto-recharge amount.
+
+    Returns True if charge succeeded and credits were granted.
+    """
+    from app.db.models import OrgBillingSettings
+    from app.core.billing.credits import balance as _balance, grant_topup
+
+    settings_row = await db.get(OrgBillingSettings, org_id)
+    if not settings_row or not settings_row.auto_recharge_enabled:
+        return False
+
+    # Cap: don't exceed monthly_cap_cents
+    remaining_cap = settings_row.monthly_cap_cents - settings_row.auto_recharged_this_month_cents
+    if remaining_cap <= 0:
+        log.info("auto-recharge: org %s hit monthly cap of %d", org_id, settings_row.monthly_cap_cents)
+        return False
+
+    charge_cents = min(settings_row.recharge_amount_cents, remaining_cap)
+    org = await db.get(Organization, org_id)
+    customer_id = org.stripe_customer_id if org else None
+    if not customer_id:
+        log.warning("auto-recharge: no customer for org %s", org_id)
+        return False
+
+    # Find the customer's default payment method
+    try:
+        customer = stripe_mod.Customer.retrieve(customer_id)
+        cust_dict = customer._to_dict_recursive() if hasattr(customer, "_to_dict_recursive") else dict(customer)
+        pm_id = cust_dict.get("invoice_settings", {}).get("default_payment_method") or cust_dict.get("default_source")
+        if not pm_id:
+            log.warning("auto-recharge: no saved payment method for org %s", org_id)
+            return False
+
+        pi = stripe_mod.PaymentIntent.create(
+            amount=charge_cents,
+            currency="usd",
+            customer=customer_id,
+            payment_method=pm_id,
+            off_session=True,
+            confirm=True,
+            metadata={"org_id": str(org_id), "type": "auto_recharge", "credits_cents": charge_cents},
+        )
+        pi_dict = pi._to_dict_recursive() if hasattr(pi, "_to_dict_recursive") else dict(pi)
+        if pi_dict.get("status") == "succeeded":
+            await grant_topup(db, org_id, charge_cents, stripe_ref=pi_dict["id"], source="auto_recharge")
+            settings_row.auto_recharged_this_month_cents = (settings_row.auto_recharged_this_month_cents or 0) + charge_cents
+            settings_row.auto_recharge_failed_at = None
+            db.add(settings_row)
+            await db.commit()
+            log.info("auto-recharge: granted %d cents to org %s via pi %s", charge_cents, org_id, pi_dict["id"])
+            return True
+        else:
+            raise RuntimeError(f"PaymentIntent status={pi_dict.get('status')}")
+
+    except Exception as exc:
+        from datetime import UTC, datetime
+        log.error("auto-recharge failed for org %s: %s", org_id, exc)
+        if settings_row:
+            settings_row.auto_recharge_failed_at = datetime.now(UTC)
+            db.add(settings_row)
+            await db.commit()
+        return False
+
+
 @router.post("/{org_id}/addon-checkout")
 async def create_addon_checkout(
     org_id: UUID,
@@ -336,7 +670,12 @@ async def create_addon_checkout(
     current_user: Annotated[User, Depends(require_owner)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ):
-    """Start a Stripe Checkout session for a voice add-on (voice_lite or voice_standard)."""
+    """Add a voice add-on as a line item on the existing plan subscription.
+
+    If the org already has an active subscription, the add-on price is added as a new
+    subscription item (inline modification — no Checkout redirect needed).
+    If there is no subscription yet, falls back to a Checkout session.
+    """
     if not settings.stripe_secret_key:
         raise HTTPException(503, "Billing not configured")
     import stripe
@@ -348,23 +687,154 @@ async def create_addon_checkout(
         raise HTTPException(400, "addon_code required")
 
     addon = await db.get(Addon, addon_code)
-    if not addon or not addon.stripe_price_id:
-        raise HTTPException(400, f"Add-on '{addon_code}' has no Stripe price configured")
+    if not addon or not addon.price_usd_monthly:
+        raise HTTPException(400, f"Add-on '{addon_code}' has no price configured")
+
+    # Prefer the USD price ID; fall back to legacy stripe_price_id
+    price_id = addon.stripe_price_id
+    if not price_id:
+        raise HTTPException(400, f"Add-on '{addon_code}' has no Stripe price ID configured yet. Run stripe_sync_prices.py first.")
 
     sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
 
+    # If there's an existing active subscription, add as a line item inline
+    if sub and sub.stripe_subscription_id and sub.status in ("active", "trialing"):
+        return await _add_addon_line_item(db, stripe, sub, addon, addon_code, price_id, org_id)
+
+    # No subscription — fall back to Checkout (only the add-on, user must have plan first)
+    customer_id = await _get_or_create_stripe_customer(db, stripe, org_id)
     session_params: dict = {
         "mode": "subscription",
-        "line_items": [{"price": addon.stripe_price_id, "quantity": 1}],
+        "customer": customer_id,
+        "line_items": [{"price": price_id, "quantity": 1}],
         "success_url": f"{settings.frontend_origin}/settings/plan?addon=success",
         "cancel_url": f"{settings.frontend_origin}/settings/plan?addon=cancel",
         "metadata": {"org_id": str(org_id), "addon_code": addon_code},
     }
-    if sub and sub.stripe_customer_id:
-        session_params["customer"] = sub.stripe_customer_id
-
     checkout = stripe.checkout.Session.create(**session_params)
     return {"url": checkout.url}
+
+
+async def _add_addon_line_item(
+    db: AsyncSession,
+    stripe_mod,
+    sub: OrgSubscription,
+    addon,
+    addon_code: str,
+    price_id: str,
+    org_id: UUID,
+) -> dict:
+    """Add (or swap) a voice add-on as a subscription line item on the existing plan sub."""
+    from sqlmodel import select
+
+    # Check if this org already has a different voice add-on active
+    existing_addon = (await db.exec(
+        select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code != addon_code)
+        .where(OrgAddon.addon_code.in_(["voice_lite", "voice_standard"]))
+    )).first()
+
+    try:
+        stripe_sub = stripe_mod.Subscription.retrieve(sub.stripe_subscription_id, expand=["items"])
+        sub_dict = stripe_sub._to_dict_recursive() if hasattr(stripe_sub, "_to_dict_recursive") else dict(stripe_sub)
+
+        # Find existing voice item (if any)
+        items = sub_dict.get("items", {}).get("data", [])
+        voice_item_id: str | None = None
+        voice_prices = {a.stripe_price_id for a in (await db.exec(
+            select(OrgAddon).where(OrgAddon.org_id == org_id)
+        )).all() if a.addon_code in ("voice_lite", "voice_standard")}
+
+        for item in items:
+            if item.get("price", {}).get("id") in voice_prices or (
+                existing_addon and item.get("price", {}).get("id")
+            ):
+                voice_item_id = item["id"]
+                break
+
+        if voice_item_id:
+            # Swap: update the existing voice item to the new price
+            stripe_mod.SubscriptionItem.modify(voice_item_id, price=price_id)
+            log.info("voice add-on swapped to %s for org %s sub %s", addon_code, org_id, sub.stripe_subscription_id)
+        else:
+            # Add new line item
+            stripe_mod.SubscriptionItem.create(
+                subscription=sub.stripe_subscription_id,
+                price=price_id,
+                quantity=1,
+                metadata={"addon_code": addon_code, "org_id": str(org_id)},
+            )
+            log.info("voice add-on %s added to sub %s for org %s", addon_code, org_id, sub.stripe_subscription_id)
+
+    except Exception as exc:
+        log.error("failed to add voice add-on line item for org %s: %s", org_id, exc)
+        raise HTTPException(400, f"Stripe error: {exc}")
+
+    # Update local DB
+    existing_db_addon = (await db.exec(
+        select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon_code)
+    )).first()
+    if existing_db_addon:
+        existing_db_addon.status = "active"
+        existing_db_addon.stripe_subscription_id = sub.stripe_subscription_id
+        db.add(existing_db_addon)
+    else:
+        db.add(OrgAddon(
+            org_id=org_id,
+            addon_code=addon_code,
+            stripe_subscription_id=sub.stripe_subscription_id,
+            status="active",
+        ))
+    # Remove the swapped-out add-on if any
+    if existing_addon:
+        existing_addon.status = "cancelled"
+        db.add(existing_addon)
+
+    await db.commit()
+    return {"status": "ok", "addon_code": addon_code}
+
+
+@router.delete("/{org_id}/addon/{addon_code}")
+async def remove_addon(
+    org_id: UUID,
+    addon_code: str,
+    current_user: Annotated[User, Depends(require_owner)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+):
+    """Remove a voice add-on line item from the subscription."""
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Billing not configured")
+    import stripe
+    stripe.api_key = settings.stripe_secret_key
+    from sqlmodel import select
+
+    sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
+    if not sub or not sub.stripe_subscription_id:
+        raise HTTPException(400, "No active subscription")
+
+    addon = await db.get(Addon, addon_code)
+    if not addon or not addon.stripe_price_id:
+        raise HTTPException(404, "Add-on not found")
+
+    try:
+        stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id, expand=["items"])
+        sub_dict = stripe_sub._to_dict_recursive() if hasattr(stripe_sub, "_to_dict_recursive") else dict(stripe_sub)
+        items = sub_dict.get("items", {}).get("data", [])
+        item_id = next((it["id"] for it in items if it.get("price", {}).get("id") == addon.stripe_price_id), None)
+        if item_id:
+            stripe.SubscriptionItem.delete(item_id)
+    except Exception as exc:
+        log.error("failed to remove add-on %s for org %s: %s", addon_code, org_id, exc)
+        raise HTTPException(400, f"Stripe error: {exc}")
+
+    oa = (await db.exec(
+        select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon_code)
+    )).first()
+    if oa:
+        oa.status = "cancelled"
+        db.add(oa)
+        await db.commit()
+
+    return {"status": "ok"}
 
 
 @router.post("/{org_id}/portal")
@@ -378,16 +848,21 @@ async def create_portal(
     import stripe
     stripe.api_key = settings.stripe_secret_key
 
-    sub = (await db.exec(
-        __import__("sqlmodel", fromlist=["select"]).select(OrgSubscription)
-        .where(OrgSubscription.org_id == org_id)
-    )).first()
-    if not sub or not sub.stripe_customer_id:
+    org = await db.get(Organization, org_id)
+    customer_id = org.stripe_customer_id if org else None
+    if not customer_id:
+        # Fallback: check subscription row (legacy)
+        sub = (await db.exec(
+            __import__("sqlmodel", fromlist=["select"]).select(OrgSubscription)
+            .where(OrgSubscription.org_id == org_id)
+        )).first()
+        customer_id = sub.stripe_customer_id if sub else None
+    if not customer_id:
         raise HTTPException(400, "No active subscription — start with Checkout first")
 
     try:
         portal = stripe.billing_portal.Session.create(
-            customer=sub.stripe_customer_id,
+            customer=customer_id,
             return_url=f"{settings.frontend_origin}/settings/plan",
         )
     except stripe.error.InvalidRequestError as e:
@@ -453,14 +928,35 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
 
     if event_type == "checkout.session.completed":
         meta = data.get("metadata") or {}
-        org_id = UUID(meta["org_id"])
+        org_id_str = meta.get("org_id")
+        if not org_id_str:
+            return
+        org_id = UUID(org_id_str)
         customer_id = data.get("customer")
         subscription_id = data.get("subscription")
         addon_code = meta.get("addon_code")
         plan_code = meta.get("plan_code", "pro")
+        topup_cents = int(meta["topup_cents"]) if "topup_cents" in meta else None
+        mode = data.get("mode", "subscription")
+
+        # Always persist customer_id on the Organization (canonical)
+        if customer_id:
+            org = await db.get(Organization, org_id)
+            if org and not org.stripe_customer_id:
+                org.stripe_customer_id = customer_id
+                db.add(org)
+
+        # ── One-time payment top-up ──────────────────────────────────────────
+        if mode == "payment" and topup_cents:
+            payment_intent = data.get("payment_intent")
+            from app.core.billing.credits import grant_topup
+            await grant_topup(db, org_id, topup_cents, stripe_ref=payment_intent or data.get("id"), source="purchase")
+            await db.commit()
+            log.info("top-up: granted %d cents to org %s via session %s", topup_cents, org_id, data.get("id"))
+            return
 
         if addon_code and subscription_id:
-            # Voice add-on purchase
+            # Voice add-on purchase (legacy path; Phase 4 moves to line items)
             existing_addon = (await db.exec(
                 select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon_code)
             )).first()
@@ -475,14 +971,9 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
                     stripe_subscription_id=subscription_id,
                     status="active",
                 ))
-            # Store customer ID on the main subscription row
-            sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
-            if sub and not sub.stripe_customer_id:
-                sub.stripe_customer_id = customer_id
-                db.add(sub)
 
         elif subscription_id:
-            # Plan upgrade — no external Stripe call needed; plan_code is in session metadata
+            # Plan subscription — plan_code is in session metadata
             sub = (await db.exec(select(OrgSubscription).where(OrgSubscription.org_id == org_id))).first()
             now = datetime.now(UTC)
             period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -508,6 +999,13 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
                 ))
             log.info("org %s upgraded to plan=%s sub=%s", org_id, plan_code, subscription_id)
 
+            # Grant plan credit for the new period
+            if plan_code != "free":
+                plan_obj = await db.get(Plan, plan_code)
+                if plan_obj and plan_obj.monthly_credit_cents > 0:
+                    from app.core.billing.credits import grant_plan_credit
+                    await grant_plan_credit(db, org_id, plan_obj.monthly_credit_cents, period_end, stripe_ref=subscription_id)
+
     elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
         stripe_sub_id = data["id"]
         sub = (await db.exec(
@@ -517,6 +1015,16 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
             if event_type == "customer.subscription.deleted":
                 sub.status = "cancelled"
                 sub.plan_code = "free"
+                # Cancel all add-ons tied to this subscription
+                addon_rows = (await db.exec(
+                    select(OrgAddon).where(
+                        OrgAddon.org_id == sub.org_id,
+                        OrgAddon.stripe_subscription_id == stripe_sub_id,
+                    )
+                )).all()
+                for oa in addon_rows:
+                    oa.status = "cancelled"
+                    db.add(oa)
             else:
                 # Map Stripe status → our status
                 stripe_status = data.get("status", "active")
@@ -543,7 +1051,41 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
                 if resolved:
                     sub.plan_code = resolved
                     log.info("subscription.updated: sub=%s → plan=%s status=%s", stripe_sub_id, resolved, sub.status)
+
+                # Reconcile voice add-ons from line items
+                await _reconcile_addons_from_items(db, sub.org_id, stripe_sub_id, data)
             db.add(sub)
+
+    elif event_type == "invoice.paid":
+        # Grant monthly plan credit on renewal
+        stripe_sub_id = data.get("subscription")
+        period_end_ts = data.get("period_end") or data.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end")
+        if stripe_sub_id and period_end_ts:
+            sub = (await db.exec(
+                select(OrgSubscription).where(OrgSubscription.stripe_subscription_id == stripe_sub_id)
+            )).first()
+            if sub and sub.plan_code not in ("free",):
+                plan_obj = await db.get(Plan, sub.plan_code)
+                if plan_obj and plan_obj.monthly_credit_cents > 0:
+                    period_end = datetime.fromtimestamp(period_end_ts, tz=UTC)
+                    from app.core.billing.credits import grant_plan_credit
+                    await grant_plan_credit(db, sub.org_id, plan_obj.monthly_credit_cents, period_end, stripe_ref=data.get("id"))
+
+    elif event_type == "payment_intent.payment_failed":
+        # Handle auto-recharge failure — mark the org so UI can surface it
+        meta = data.get("metadata") or {}
+        if meta.get("type") == "auto_recharge" and meta.get("org_id"):
+            try:
+                from app.db.models import OrgBillingSettings
+                from datetime import UTC, datetime
+                bid = UUID(meta["org_id"])
+                settings_row = await db.get(OrgBillingSettings, bid)
+                if settings_row:
+                    settings_row.auto_recharge_failed_at = datetime.now(UTC)
+                    db.add(settings_row)
+                    await db.commit()
+            except Exception:
+                log.exception("failed to mark auto-recharge failure for org %s", meta.get("org_id"))
 
     elif event_type == "invoice.payment_failed":
         stripe_sub_id = data.get("subscription")
@@ -554,6 +1096,45 @@ async def _process_stripe_event(db: AsyncSession, event_type: str, data: dict) -
             if sub:
                 sub.status = "past_due"
                 db.add(sub)
+
+
+async def _reconcile_addons_from_items(db: AsyncSession, org_id: UUID, stripe_sub_id: str, sub_data: dict) -> None:
+    """Sync OrgAddon rows based on subscription line items.
+
+    For each voice add-on: if its price is in the subscription items → active,
+    otherwise → cancelled.  Handles both add and remove via Stripe portal or API.
+    """
+    from sqlmodel import select
+
+    items = sub_data.get("items", {}).get("data", [])
+    item_price_ids = {item.get("price", {}).get("id") for item in items if item.get("price", {}).get("id")}
+
+    addons = (await db.exec(select(Addon).where(Addon.active == True))).all()
+    for addon in addons:
+        if not addon.stripe_price_id:
+            continue
+        oa = (await db.exec(
+            select(OrgAddon).where(OrgAddon.org_id == org_id, OrgAddon.addon_code == addon.code)
+        )).first()
+
+        in_sub = addon.stripe_price_id in item_price_ids
+
+        if in_sub and oa is None:
+            # Add-on appeared in Stripe (e.g. added via portal)
+            db.add(OrgAddon(
+                org_id=org_id,
+                addon_code=addon.code,
+                stripe_subscription_id=stripe_sub_id,
+                status="active",
+            ))
+        elif in_sub and oa and oa.status != "active":
+            oa.status = "active"
+            oa.stripe_subscription_id = stripe_sub_id
+            db.add(oa)
+        elif not in_sub and oa and oa.stripe_subscription_id == stripe_sub_id and oa.status == "active":
+            # Add-on removed from subscription
+            oa.status = "cancelled"
+            db.add(oa)
 
 
 async def _plan_code_from_stripe_sub(db: AsyncSession, sub: dict) -> str | None:

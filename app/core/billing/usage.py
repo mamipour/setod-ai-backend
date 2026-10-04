@@ -95,10 +95,19 @@ async def record_llm_usage(
     billable: bool,
     managed: bool = False,          # True when Setod's platform key was used
 ) -> None:
-    """Record one LLM turn as a model_credits event."""
+    """Record one LLM turn as a model_credits event.
+
+    When managed=True, the cost is drawn from the org's prepaid credit ledger.
+    """
     price = await _get_price(db, provider, model_slug)
     cost = _compute_llm_cost(price, prompt_tokens, completion_tokens, billable, markup=managed)
     total_tokens = prompt_tokens + completion_tokens
+
+    # Draw from credit ledger for managed-model usage
+    if managed and cost > 0:
+        from app.core.billing.credits import draw as _draw
+        await _draw(db, org_id, cost)
+
     await record_event(
         db,
         org_id=org_id,

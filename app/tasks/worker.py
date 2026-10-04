@@ -47,6 +47,7 @@ MAX_CONCURRENT_RUNS = 4
 REAP_EVERY = timedelta(minutes=10)
 PRUNE_EVERY = timedelta(hours=24)
 ROLLUP_EVERY = timedelta(hours=1)
+CREDIT_NOTIFY_EVERY = timedelta(hours=1)
 # Slower tasks (schedules, files, approvals) run every 4th inbound tick (~20s).
 _SLOW_TASK_DIVISOR = 4
 
@@ -236,6 +237,110 @@ async def poll_once(limiter: asyncio.Semaphore, *, tick: int = 0) -> int:
     return len(bundles) + len(triggers) + len(files) + len(resumable)
 
 
+async def _check_credit_thresholds() -> None:
+    """Check all orgs with managed-model plans and log notifications if credit is low.
+
+    Tracks which orgs have been notified at 50%, 80%, or zero so we don't spam.
+    Runs hourly.
+    """
+    from sqlmodel import select
+    from app.db.models import OrgBillingSettings, OrgSubscription, Plan, User, OrganizationMember
+    from app.core.billing.credits import balance as _credit_balance
+
+    try:
+        async with AsyncSessionLocal() as db:
+            subs = (await db.exec(
+                select(OrgSubscription).where(OrgSubscription.status.in_(["active", "trialing", "past_due"]))
+            )).all()
+
+            for sub in subs:
+                plan = await db.get(Plan, sub.plan_code)
+                if not plan or plan.monthly_credit_cents == 0:
+                    continue
+
+                bal = await _credit_balance(db, sub.org_id)
+                total = plan.monthly_credit_cents
+                pct = (bal / total) if total > 0 else 1.0
+
+                settings_row = await db.get(OrgBillingSettings, sub.org_id)
+                now = datetime.now(UTC)
+
+                notify_type: str | None = None
+                if bal <= 0 and (not settings_row or not settings_row.notified_zero_at or
+                                  (now - settings_row.notified_zero_at).total_seconds() > 86400):
+                    notify_type = "zero"
+                elif pct <= 0.2 and (not settings_row or not settings_row.notified_low_at or
+                                      (now - settings_row.notified_low_at).total_seconds() > 21600):
+                    notify_type = "low"
+                elif pct <= 0.5 and (not settings_row or not settings_row.notified_50pct_at):
+                    notify_type = "50pct"
+                elif pct <= 0.8 and (not settings_row or not settings_row.notified_80pct_at):
+                    notify_type = "80pct"
+
+                if not notify_type:
+                    continue
+
+                owner_row = (await db.exec(
+                    select(User)
+                    .join(OrganizationMember, OrganizationMember.user_id == User.id)
+                    .where(OrganizationMember.organization_id == sub.org_id, OrganizationMember.role == "owner")
+                    .limit(1)
+                )).first()
+                if not owner_row:
+                    continue
+
+                log.info(
+                    "credit threshold %s for org %s (balance=%d/%d, owner=%s)",
+                    notify_type, sub.org_id, bal, total, owner_row.email,
+                )
+                # TODO: send actual email via email service
+
+                if not settings_row:
+                    settings_row = OrgBillingSettings(org_id=sub.org_id)
+                if notify_type == "zero":
+                    settings_row.notified_zero_at = now
+                elif notify_type == "low":
+                    settings_row.notified_low_at = now
+                elif notify_type == "50pct":
+                    settings_row.notified_50pct_at = now
+                elif notify_type == "80pct":
+                    settings_row.notified_80pct_at = now
+                settings_row.updated_at = now
+                db.add(settings_row)
+
+            await db.commit()
+    except Exception:
+        log.exception("credit threshold check failed")
+
+
+async def _reset_monthly_auto_recharge_caps() -> None:
+    """Reset auto_recharged_this_month_cents and notification flags at the start of each month."""
+    from sqlmodel import select
+    from app.db.models import OrgBillingSettings
+
+    now = datetime.now(UTC)
+    if now.day != 1:
+        return
+
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.exec(
+                select(OrgBillingSettings).where(OrgBillingSettings.auto_recharged_this_month_cents > 0)
+            )).all()
+            for row in rows:
+                row.auto_recharged_this_month_cents = 0
+                row.notified_50pct_at = None
+                row.notified_80pct_at = None
+                row.notified_low_at = None
+                row.notified_zero_at = None
+                db.add(row)
+            if rows:
+                await db.commit()
+                log.info("reset monthly auto-recharge caps for %d orgs", len(rows))
+    except Exception:
+        log.exception("monthly cap reset failed")
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -253,6 +358,7 @@ async def main() -> None:
     next_reap = datetime.now(UTC)
     next_prune = datetime.now(UTC)
     next_rollup = datetime.now(UTC)
+    next_credit_notify = datetime.now(UTC)
     tick = 0
     log.info("scheduler started — polling every %ds (slow tasks every %ds)",
              POLL_SECONDS, POLL_SECONDS * _SLOW_TASK_DIVISOR)
@@ -279,6 +385,11 @@ async def main() -> None:
                     except Exception:
                         log.exception("usage rollup failed")
                     next_rollup = datetime.now(UTC) + ROLLUP_EVERY
+
+                if datetime.now(UTC) >= next_credit_notify:
+                    await _check_credit_thresholds()
+                    await _reset_monthly_auto_recharge_caps()
+                    next_credit_notify = datetime.now(UTC) + CREDIT_NOTIFY_EVERY
 
                 if datetime.now(UTC) >= next_prune:
                     try:

@@ -108,8 +108,9 @@ _FREE_PLAN = Plan(
     code="free",
     display_name="Free",
     features={"managed_models": False, "voice": False},
-    limits={"agents": 2, "members": 2, "rows": 5000, "model_credits": 0},
-    included={"model_credits": 0},
+    limits={"agents": 5, "rows": 5000},
+    included={},
+    monthly_credit_cents=0,
 )
 
 
@@ -121,8 +122,17 @@ async def resolve(db: AsyncSession, org_id: UUID) -> Entitlements:
         select(OrgSubscription).where(OrgSubscription.org_id == org_id)
     )).first()
 
-    if sub and sub.status != "cancelled":
-        plan = await db.get(Plan, sub.plan_code) or _FREE_PLAN
+    # Grace period: past_due orgs keep their plan for up to 3 days
+    GRACE_DAYS = 3
+    if sub and sub.status not in ("cancelled",):
+        if sub.status == "past_due" and sub.current_period_end:
+            grace_cutoff = sub.current_period_end + __import__("datetime").timedelta(days=GRACE_DAYS)
+            if datetime.now(UTC) > grace_cutoff:
+                plan = _FREE_PLAN
+            else:
+                plan = await db.get(Plan, sub.plan_code) or _FREE_PLAN
+        else:
+            plan = await db.get(Plan, sub.plan_code) or _FREE_PLAN
     else:
         plan = _FREE_PLAN
 

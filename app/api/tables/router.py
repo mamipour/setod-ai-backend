@@ -459,6 +459,28 @@ async def create_row(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> RowOut:
     await _assert_member(db, current_user, org_id)
+
+    # Enforce row limit for the org's plan
+    try:
+        from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError, _to_http as _ent_to_http
+        from app.db.models import OrgTableRow as _OrgTableRow
+        from sqlmodel import select as _ssel, func as _sfunc
+        _ent = await _resolve_ent(db, org_id)
+        _row_limit = _ent.limit("rows")
+        if _row_limit != -1:
+            _row_count = (await db.exec(
+                _ssel(_sfunc.count()).where(
+                    _OrgTableRow.org_id == org_id,
+                    _OrgTableRow.deleted_at.is_(None),
+                )
+            )).one()
+            _ent.require_limit("rows", int(_row_count))
+    except EntitlementError as e:
+        from app.core.billing.entitlements import _to_http as _ent_to_http
+        raise _ent_to_http(e)
+    except Exception:
+        pass  # Don't block row creation on entitlement lookup failures
+
     try:
         row = await svc.create_row(
             db, org_id, table_id, body.data,
@@ -649,6 +671,30 @@ async def import_commit(
         parsed_rows = parse_rows(raw, filename=file.filename or "", columns=tbl.columns)
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
+
+    # Enforce row limit: check how many rows we'll add
+    try:
+        from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError, _to_http as _ent_to_http
+        from app.db.models import OrgTableRow as _OrgTableRow
+        from sqlmodel import select as _ssel, func as _sfunc
+        _ent = await _resolve_ent(db, org_id)
+        _row_limit = _ent.limit("rows")
+        if _row_limit != -1:
+            _existing = (await db.exec(
+                _ssel(_sfunc.count()).where(
+                    _OrgTableRow.org_id == org_id,
+                    _OrgTableRow.deleted_at.is_(None),
+                )
+            )).one()
+            if int(_existing) + len(parsed_rows) > _row_limit:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"This import would exceed your plan's row limit of {_row_limit:,}. Upgrade to add more rows.",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     created = 0
     conflicts = 0

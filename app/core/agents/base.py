@@ -1078,6 +1078,14 @@ async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, An
         from app.core.billing.entitlements import resolve as _resolve_ent, EntitlementError
         ent = await _resolve_ent(db, agent.org_id)
         if ent.allows("managed_models"):
+            # Check credit balance — allow small overdraft ($1) for in-flight requests
+            from app.core.billing.credits import balance as _credit_balance, OVERDRAFT_TOLERANCE_CENTS
+            bal = await _credit_balance(db, agent.org_id)
+            if bal <= -OVERDRAFT_TOLERANCE_CENTS:
+                raise AgentRunError(
+                    "Your managed-model credit balance is exhausted. "
+                    "Please top up your credits to continue using platform AI models."
+                )
             # Determine provider from model name
             model = config.get("model", "")
             if model.startswith("claude") and _cfg.platform_anthropic_api_key:

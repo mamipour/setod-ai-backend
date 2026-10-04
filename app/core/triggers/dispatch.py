@@ -152,15 +152,37 @@ async def run_trigger(
         log.info("trigger %s skipped — agent %s is already running", trigger_id, agent.id)
         return None
 
-    return await run_agent(
-        db,
-        agent,
-        trigger_type=trigger.type,
-        user_input=user_input,
-        dry_run=False,
-        use_published=True,
-        conversation_id=conversation_id,
-    )
+    try:
+        return await run_agent(
+            db,
+            agent,
+            trigger_type=trigger.type,
+            user_input=user_input,
+            dry_run=False,
+            use_published=True,
+            conversation_id=conversation_id,
+        )
+    except Exception as exc:
+        from app.core.agents.base import AgentRunError
+        if isinstance(exc, AgentRunError) and "credit" in str(exc).lower():
+            log.warning(
+                "trigger %s: agent %s unavailable (credit exhausted): %s",
+                trigger_id, agent.id, exc,
+            )
+            # Send an informational reply so the user knows the agent is unavailable
+            if conversation_id is not None:
+                try:
+                    from app.core.conversations import record_outbound
+                    await record_outbound(
+                        db,
+                        conversation_id=conversation_id,
+                        content="I'm temporarily unavailable due to insufficient AI credits. Please try again later or contact support.",
+                        agent_id=agent.id,
+                    )
+                except Exception:
+                    log.debug("could not send unavailable reply", exc_info=True)
+            return None
+        raise
 
 
 async def fire_channel_triggers(

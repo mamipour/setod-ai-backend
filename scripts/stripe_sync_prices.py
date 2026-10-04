@@ -1,0 +1,189 @@
+"""Idempotent script: create USD Stripe prices for all plans and add-ons, archive old CAD
+prices, and write the new price IDs back to the DB.
+
+Usage:
+    cd platform
+    python scripts/stripe_sync_prices.py
+
+Requires STRIPE_SECRET_KEY and DATABASE_URL in environment (or .env).
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import stripe
+from dotenv import load_dotenv
+
+load_dotenv()
+
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+
+import asyncio
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+from app.db.models import Plan, Addon
+
+# ── Product definitions ────────────────────────────────────────────────────────
+
+PLAN_PRODUCTS = [
+    {
+        "code": "pro",
+        "name": "Setod Pro",
+        "price_usd_cents": 4900,
+        "nickname": "Pro Monthly",
+    },
+    {
+        "code": "business",
+        "name": "Setod Business",
+        "price_usd_cents": 14900,
+        "nickname": "Business Monthly",
+    },
+]
+
+ADDON_PRODUCTS = [
+    {
+        "code": "voice_lite",
+        "name": "Setod Voice Lite",
+        "price_usd_cents": 14900,
+        "nickname": "Voice Lite Monthly",
+    },
+    {
+        "code": "voice_standard",
+        "name": "Setod Voice Standard",
+        "price_usd_cents": 29900,
+        "nickname": "Voice Standard Monthly",
+    },
+]
+
+# Metered USD overage price for voice minutes (per minute, over included quota)
+VOICE_OVERAGE_PER_MINUTE_CENTS = 29  # $0.29/min
+
+
+def _find_or_create_product(name: str) -> str:
+    """Return an existing product ID by exact name or create one."""
+    products = stripe.Product.search(query=f'name:"{name}"', limit=5)
+    for p in products.data:
+        if p.name == name and p.active:
+            return p.id
+    prod = stripe.Product.create(name=name)
+    print(f"  Created product: {prod.id} — {name}")
+    return prod.id
+
+
+def _find_existing_usd_price(product_id: str, amount: int, interval: str = "month") -> str | None:
+    """Return an existing active USD recurring price for this product/amount, or None."""
+    prices = stripe.Price.list(product=product_id, currency="usd", active=True, limit=20)
+    for p in prices.data:
+        rec = p.get("recurring") or {}
+        if (
+            p.unit_amount == amount
+            and rec.get("interval") == interval
+            and rec.get("usage_type") == "licensed"
+        ):
+            return p.id
+    return None
+
+
+def _archive_non_usd_prices(product_id: str) -> None:
+    """Archive any CAD prices on a product."""
+    prices = stripe.Price.list(product=product_id, active=True, limit=50)
+    for p in prices.data:
+        if p.currency != "usd":
+            stripe.Price.modify(p.id, active=False)
+            print(f"  Archived CAD price: {p.id}")
+
+
+def _ensure_recurring_price(product_id: str, amount_cents: int, nickname: str) -> str:
+    existing = _find_existing_usd_price(product_id, amount_cents)
+    if existing:
+        print(f"  Reusing USD price: {existing} ({nickname})")
+        return existing
+    price = stripe.Price.create(
+        product=product_id,
+        currency="usd",
+        unit_amount=amount_cents,
+        recurring={"interval": "month"},
+        nickname=nickname,
+    )
+    print(f"  Created USD price: {price.id} ({nickname})")
+    return price.id
+
+
+def _ensure_metered_price(product_id: str, amount_cents: int, nickname: str) -> str:
+    """Find or create a USD per-unit metered price (for voice overage)."""
+    prices = stripe.Price.list(product=product_id, currency="usd", active=True, limit=20)
+    for p in prices.data:
+        rec = p.get("recurring") or {}
+        if (
+            p.unit_amount == amount_cents
+            and rec.get("usage_type") == "metered"
+        ):
+            print(f"  Reusing metered price: {p.id} ({nickname})")
+            return p.id
+    price = stripe.Price.create(
+        product=product_id,
+        currency="usd",
+        unit_amount=amount_cents,
+        recurring={"interval": "month", "usage_type": "metered", "aggregate_usage": "sum"},
+        nickname=nickname,
+    )
+    print(f"  Created metered price: {price.id} ({nickname})")
+    return price.id
+
+
+async def main() -> None:
+    async with AsyncSessionLocal() as db:
+        # ── Plan prices ──────────────────────────────────────────────────────
+        for spec in PLAN_PRODUCTS:
+            print(f"\n[{spec['code']}]")
+            prod_id = _find_or_create_product(spec["name"])
+            _archive_non_usd_prices(prod_id)
+            price_id = _ensure_recurring_price(prod_id, spec["price_usd_cents"], spec["nickname"])
+
+            plan = await db.get(Plan, spec["code"])
+            if plan:
+                plan.stripe_monthly_price_id = price_id
+                db.add(plan)
+                print(f"  DB updated: plans.{spec['code']}.stripe_monthly_price_id = {price_id}")
+
+        # ── Add-on prices ────────────────────────────────────────────────────
+        voice_overage_product_id = _find_or_create_product("Setod Voice Overage")
+
+        for spec in ADDON_PRODUCTS:
+            print(f"\n[{spec['code']}]")
+            prod_id = _find_or_create_product(spec["name"])
+            _archive_non_usd_prices(prod_id)
+            price_id = _ensure_recurring_price(prod_id, spec["price_usd_cents"], spec["nickname"])
+            overage_price_id = _ensure_metered_price(
+                voice_overage_product_id,
+                VOICE_OVERAGE_PER_MINUTE_CENTS,
+                "Voice Overage per minute",
+            )
+
+            addon = await db.get(Addon, spec["code"])
+            if addon:
+                addon.stripe_price_id = price_id
+                addon.stripe_overage_price_id = overage_price_id
+                db.add(addon)
+                print(f"  DB updated: addons.{spec['code']}.stripe_price_id = {price_id}")
+                print(f"  DB updated: addons.{spec['code']}.stripe_overage_price_id = {overage_price_id}")
+
+        await db.commit()
+        print("\nDone. All USD prices synced.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

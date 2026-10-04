@@ -111,6 +111,8 @@ class Organization(SQLModel, table=True):
     #   {"telegram_connector_id": "<uuid>" | null}
     # Email always falls back to the owner's login email via Resend.
     notify_settings: str | None = Field(default=None)
+    # Stripe customer ID — stored here so it survives subscription row deletions.
+    stripe_customer_id: str | None = Field(default=None, index=True)
     # Data retention policy. None = keep forever.
     # Sessions older than this many days are pruned by the nightly worker.
     data_retention_days: int | None = Field(default=None)
@@ -1229,13 +1231,16 @@ class Plan(SQLModel, table=True):
 
     code: str = Field(primary_key=True)  # 'free' | 'pro' | 'business'
     display_name: str
-    price_cad_monthly: int = Field(default=0)   # cents
-    price_cad_annual: int = Field(default=0)    # cents/year
-    # Feature flags included: e.g. {"managed_models": true, "voice": false}
+    price_usd_monthly: int = Field(default=0)   # USD cents
+    price_usd_annual: int = Field(default=0)    # USD cents/year
+    # Monthly managed-model credit included in the plan, in USD cents.
+    # 0 for Free (no managed models), 2500 for Pro ($25), 12000 for Business ($120).
+    monthly_credit_cents: int = Field(default=0)
+    # Feature flags: e.g. {"managed_models": true, "voice": false}
     features: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
-    # Soft limits: {"agents": 2, "members": 2, "rows": 5000, "model_credits": 0}
+    # Soft limits: {"agents": 5, "rows": 5000}  — no "members" limit
     limits: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
-    # Included meter quantities per billing period: {"model_credits": 2000, "voice_minutes": 0}
+    # Included meter quantities per billing period (legacy voice_minutes; model_credits now via credit_grants)
     included: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
     stripe_monthly_price_id: str | None = Field(default=None)
     stripe_annual_price_id: str | None = Field(default=None)
@@ -1251,13 +1256,16 @@ class Addon(SQLModel, table=True):
 
     code: str = Field(primary_key=True)  # 'voice_lite' | 'voice_standard' | 'rows_100k'
     display_name: str
-    price_cad_monthly: int = Field(default=0)   # cents
+    price_usd_monthly: int = Field(default=0)   # USD cents
+    sort_order: int = Field(default=0)
     # Feature flags enabled by this add-on
     features: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
     # Meter allocations: {"voice_minutes": 400}
     included: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="'{}'"))
-    meter: str | None = Field(default=None)  # 'voice_minutes' | 'model_credits' | None
+    meter: str | None = Field(default=None)  # 'voice_minutes' | None
     stripe_price_id: str | None = Field(default=None)
+    # USD metered overage price (e.g. per voice_minute beyond included)
+    stripe_overage_price_id: str | None = Field(default=None)
     active: bool = Field(default=True)
     created_at: datetime = _ts()
 
@@ -1394,3 +1402,52 @@ class StripeEvent(SQLModel, table=True):
 
     event_id: str = Field(primary_key=True)   # evt_… from Stripe
     processed_at: datetime = _ts()
+
+
+class CreditGrant(SQLModel, table=True):
+    """Prepaid managed-model credit balance for an org.
+
+    Sources:
+      'plan'         — monthly grant from invoice.paid; expires at period_end.
+      'purchase'     — top-up pack bought via Checkout; expires in 12 months.
+      'auto_recharge'— off-session PaymentIntent recharge; expires in 12 months.
+      'promo'        — manual staff grant; custom expiry.
+
+    Draw order: oldest-expiring first; plan grants before purchased grants
+    (see credits.py draw()).  remaining_cents decrements as runs consume credit;
+    exhausted grants are kept for audit (remaining_cents == 0, not deleted).
+    """
+
+    __tablename__ = "credit_grants"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    amount_cents: int                          # original grant amount, never mutated
+    remaining_cents: int                       # decremented by draw()
+    source: str = Field(default="plan")        # 'plan' | 'purchase' | 'auto_recharge' | 'promo'
+    stripe_ref: str | None = Field(default=None)  # invoice_id, pi_id, or checkout session_id
+    granted_at: datetime = _ts()
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True))
+    created_at: datetime = _ts()
+
+
+class OrgBillingSettings(SQLModel, table=True):
+    """Per-org billing preferences and auto-recharge state."""
+
+    __tablename__ = "org_billing_settings"
+
+    org_id: UUID = Field(primary_key=True, foreign_key="organizations.id")
+    # Auto-recharge: when balance drops below threshold_cents, charge amount_cents.
+    auto_recharge_enabled: bool = Field(default=False)
+    threshold_cents: int = Field(default=500)   # $5.00
+    recharge_amount_cents: int = Field(default=2500)  # $25.00
+    monthly_cap_cents: int = Field(default=20000)     # $200.00 safety ceiling per month
+    # Running counter reset each calendar month (reset in worker).
+    auto_recharged_this_month_cents: int = Field(default=0)
+    # De-dup timestamps for notification emails.
+    notified_50pct_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    notified_80pct_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    notified_low_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    notified_zero_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    auto_recharge_failed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    updated_at: datetime = _ts()
