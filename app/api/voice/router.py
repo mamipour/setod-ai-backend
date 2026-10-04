@@ -97,7 +97,7 @@ def _twiml_busy() -> str:
     )
 
 
-def _twiml_connect(trigger_id: UUID, voice: str = "UgBBYS2sOqTuMpoF3BR0", language: str = "en-US") -> str:
+def _twiml_connect(trigger_id: UUID, voice: str = "UgBBYS2sOqTuMpoF3BR0") -> str:
     wss_url = f"{cfg.api_public_origin.replace('https://', 'wss://').replace('http://', 'ws://')}/voice/ws/{trigger_id}"
     # Ensure HTTPS/WSS
     if cfg.api_public_origin.startswith("https://"):
@@ -105,6 +105,9 @@ def _twiml_connect(trigger_id: UUID, voice: str = "UgBBYS2sOqTuMpoF3BR0", langua
     else:
         wss_url = f"wss://api.setod.com/voice/ws/{trigger_id}"
 
+    # language="multi" enables Deepgram's automatic language detection per utterance.
+    # The detected language code is forwarded in every "prompt" frame as msg["lang"],
+    # which we pass to the LLM so it can reply in the caller's language.
     # No welcomeGreeting — the LLM generates the opening line after the setup handshake.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -113,7 +116,7 @@ def _twiml_connect(trigger_id: UUID, voice: str = "UgBBYS2sOqTuMpoF3BR0", langua
         transcriptionProvider="Deepgram" speechModel="flux" eotThreshold="0.8"
         ttsProvider="ElevenLabs" voice="{voice}"
         interruptible="any" ignoreBackchannel="true"
-        language="{language}" />
+        language="multi" />
   </Connect>
 </Response>"""
 
@@ -169,11 +172,10 @@ async def voice_twiml(
             return Response(content=_twiml_busy(), media_type="application/xml")
 
         voice = trigger_config.get("voice", "UgBBYS2sOqTuMpoF3BR0")
-        language = trigger_config.get("language", "en-US")
 
     log.info("voice twiml: trigger=%s from=%s call=%s", trigger_id, form.get("From"), form.get("CallSid"))
     return Response(
-        content=_twiml_connect(trigger_id, voice, language),
+        content=_twiml_connect(trigger_id, voice),
         media_type="application/xml",
     )
 
@@ -306,7 +308,9 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                         "You are on a phone call. Keep every reply to 1-2 short spoken sentences. "
                         "Do not use markdown, bullet points, or any formatting. "
                         "Read numbers and codes digit by digit with pauses. "
-                        "If you need to do something that requires approval, say 'I'll have the team follow up on that.'"
+                        "If you need to do something that requires approval, say 'I'll have the team follow up on that.' "
+                        "IMPORTANT: always reply in the same language the caller is speaking. "
+                        "If they switch languages mid-call, switch with them immediately."
                     ))
 
                     # LLM-generated opening greeting — stream it immediately so the caller
@@ -348,7 +352,8 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                 if not voice_text or session is None:
                     continue
 
-                log.info("voice ws: prompt callSid=%s text=%r", call_sid, voice_text[:80])
+                detected_lang = msg.get("lang", "")
+                log.info("voice ws: prompt callSid=%s lang=%s text=%r", call_sid, detected_lang, voice_text[:80])
 
                 # Cancel any in-progress generation
                 if current_task and not current_task.done():
@@ -359,7 +364,12 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                         pass
                 cancel = asyncio.Event()
 
-                messages.append(user_message(voice_text))
+                # Prepend a language hint so the LLM mirrors the caller's detected language.
+                # This is a system message so it doesn't pollute the visible conversation history.
+                turn_messages = list(messages)
+                if detected_lang:
+                    turn_messages.append(system_message(f"[Caller is speaking {detected_lang} — reply in {detected_lang}]"))
+                turn_messages.append(user_message(voice_text))
 
                 async with AsyncSessionLocal() as db:
                     agent_obj = await db.get(Agent, trigger.agent_id)
@@ -369,7 +379,7 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
                     result = await stream_turn(
                         db,
                         agent_obj,
-                        messages=messages,
+                        messages=turn_messages,
                         tools=tools,
                         session=sess_obj,
                         on_token=send_token,
@@ -406,6 +416,8 @@ async def voice_ws(trigger_id: UUID, ws: WebSocket):
 
                 await send_last()
                 if result.content:
+                    # Store clean user + assistant messages in history (no lang hint noise)
+                    messages.append(user_message(voice_text))
                     messages.append(assistant_message(result.content, []))
 
             elif msg_type == "interrupt":
