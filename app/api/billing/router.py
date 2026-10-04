@@ -769,15 +769,20 @@ async def _add_addon_line_item(
                 break
 
         if voice_item_id:
-            # Swap: update the existing voice item to the new price
-            stripe_mod.SubscriptionItem.modify(voice_item_id, price=price_id)
+            # Swap: update the existing voice item to the new price, charge proration now
+            stripe_mod.SubscriptionItem.modify(
+                voice_item_id,
+                price=price_id,
+                proration_behavior="always_invoice",
+            )
             log.info("voice add-on swapped to %s for org %s sub %s", addon_code, org_id, sub.stripe_subscription_id)
         else:
-            # Add new line item
+            # Add new line item and immediately invoice the prorated amount
             stripe_mod.SubscriptionItem.create(
                 subscription=sub.stripe_subscription_id,
                 price=price_id,
                 quantity=1,
+                proration_behavior="always_invoice",
                 metadata={"addon_code": addon_code, "org_id": str(org_id)},
             )
             log.info("voice add-on %s added to sub %s for org %s", addon_code, org_id, sub.stripe_subscription_id)
@@ -838,7 +843,8 @@ async def remove_addon(
         items = sub_dict.get("items", {}).get("data", [])
         item_id = next((it["id"] for it in items if it.get("price", {}).get("id") == addon.stripe_price_id), None)
         if item_id:
-            stripe.SubscriptionItem.delete(item_id)
+            # proration_behavior=always_invoice credits the unused days back to the customer immediately
+            stripe.SubscriptionItem.delete(item_id, proration_behavior="always_invoice")
     except Exception as exc:
         log.error("failed to remove add-on %s for org %s: %s", addon_code, org_id, exc)
         raise HTTPException(400, f"Stripe error: {exc}")
