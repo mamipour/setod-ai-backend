@@ -1086,7 +1086,7 @@ async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, An
                     "Your managed-model credit balance is exhausted. "
                     "Please top up your credits to continue using platform AI models."
                 )
-            from app.core.billing.usage import cheapest_priced_model, has_price
+            from app.core.billing.usage import default_managed_model, has_price
 
             # Determine provider from model name
             model = config.get("model", "")
@@ -1100,10 +1100,10 @@ async def _build_client_for(db: AsyncSession, agent: Agent, config: dict[str, An
                 raise AgentRunError("This agent has no AI model selected.")
 
             # Managed usage is billed from the price table, so an unpriced model would be
-            # free.  "Default" resolves to the cheapest priced model; an explicit model
+            # free.  An empty model resolves to the recommended priced model; an explicit model
             # must be priced.
             if not model:
-                model = await cheapest_priced_model(db, provider)
+                model = await default_managed_model(db, provider)
                 if not model:
                     raise AgentRunError(
                         f"No managed {provider} models are priced yet. Add a model price or connect your own key."

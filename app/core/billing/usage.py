@@ -47,11 +47,18 @@ async def has_price(db: AsyncSession, provider: str, model_slug: str) -> bool:
     return await _get_price(db, provider, model_slug) is not None
 
 
-async def cheapest_priced_model(db: AsyncSession, provider: str) -> str | None:
-    """Slug of the lowest-input-cost active model for a provider, or None if none priced.
+async def default_managed_model(db: AsyncSession, provider: str) -> str | None:
+    """Default slug for managed runs on a provider, or None if nothing is priced.
 
-    Used as the managed-key default so an agent left on "Default" never runs unpriced.
+    Prefers the recommended model (``DEFAULT_MODELS``) when it has an active price row;
+    otherwise falls back to the cheapest priced model so a managed run is never unpriced.
     """
+    from app.core.llm.client import DEFAULT_MODELS
+
+    preferred = DEFAULT_MODELS.get(provider)
+    if preferred and await _get_price(db, provider, preferred) is not None:
+        return preferred
+
     rows = await db.exec(
         select(ModelPrice.model_slug)
         .where(ModelPrice.provider == provider, ModelPrice.active == True)  # noqa: E712
