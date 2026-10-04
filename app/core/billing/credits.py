@@ -205,7 +205,7 @@ async def _run_auto_recharge(org_id: UUID) -> None:
             return
         import stripe
         stripe.api_key = _cfg.stripe_secret_key
-        from app.db.base import AsyncSessionLocal
+        from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as db:
             from app.api.billing.router import _do_auto_recharge
             await _do_auto_recharge(db, stripe, org_id)
