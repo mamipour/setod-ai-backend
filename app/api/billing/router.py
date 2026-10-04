@@ -1119,14 +1119,27 @@ async def _add_addon_line_item(
         voice_item = classified["voice_item"]
         overage_item = classified["overage_item"]
 
+        # _classify_items matches only stored USD price IDs; if this subscription
+        # uses a non-USD price we may have missed the existing voice item.
+        # Re-scan raw items for the resolved (currency-matched) price ID.
+        if not voice_item:
+            for raw_item in items:
+                if raw_item.get("price", {}).get("id") == resolved_price_id:
+                    voice_item = raw_item
+                    break
+
         if voice_item:
-            # Swap to new voice price
-            stripe_mod.SubscriptionItem.modify(
-                voice_item["id"],
-                price=resolved_price_id,
-                proration_behavior="always_invoice",
-            )
-            log.info("voice add-on swapped to %s for org %s", addon_code, org_id)
+            if voice_item.get("price", {}).get("id") == resolved_price_id:
+                # Already on this exact price — just ensure snapshot/OrgAddon are updated below
+                log.info("voice add-on already on price %s for org %s (idempotent)", resolved_price_id, org_id)
+            else:
+                # Different price → swap
+                stripe_mod.SubscriptionItem.modify(
+                    voice_item["id"],
+                    price=resolved_price_id,
+                    proration_behavior="always_invoice",
+                )
+                log.info("voice add-on swapped to %s for org %s", addon_code, org_id)
         else:
             # Add new voice item
             stripe_mod.SubscriptionItem.create(
@@ -1175,14 +1188,22 @@ async def _add_addon_line_item(
                             log.info("Created %s metered overage price: %s", sub_currency, new_ov_price.id)
                     except Exception:
                         log.exception("Could not resolve overage price in currency %s, using USD fallback", sub_currency)
-                stripe_mod.SubscriptionItem.create(
-                    subscription=sub.stripe_subscription_id,
-                    price=resolved_overage_price_id,
-                    quantity=1,
-                    proration_behavior="none",
-                    metadata={"type": "voice_overage", "org_id": str(org_id)},
+                # Idempotent: check raw items for this resolved overage price too
+                already_has_overage = any(
+                    raw.get("price", {}).get("id") == resolved_overage_price_id
+                    for raw in items
                 )
-                log.info("voice overage item added for org %s", org_id)
+                if not already_has_overage:
+                    stripe_mod.SubscriptionItem.create(
+                        subscription=sub.stripe_subscription_id,
+                        price=resolved_overage_price_id,
+                        quantity=1,
+                        proration_behavior="none",
+                        metadata={"type": "voice_overage", "org_id": str(org_id)},
+                    )
+                    log.info("voice overage item added for org %s", org_id)
+                else:
+                    log.info("voice overage item already present for org %s (idempotent)", org_id)
             except Exception:
                 log.exception("failed to add voice overage item for org %s", org_id)
 
