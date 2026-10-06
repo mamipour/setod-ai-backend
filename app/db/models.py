@@ -1608,7 +1608,8 @@ class ApiToken(SQLModel, table=True):
     name: str = Field(max_length=80)
     token_hash: str = Field(unique=True, index=True, max_length=64)
     token_prefix: str = Field(max_length=8)
-    scope: ApiTokenScope = Field(default=ApiTokenScope.read)
+    # Plain text, matching the migration. A Postgres enum named apitokenscope was never created.
+    scope: ApiTokenScope = Field(default=ApiTokenScope.read, sa_column=Column(String(8), nullable=False, server_default="read"))
     token_version_at_creation: int = Field(default=0)
     expires_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     last_used_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
