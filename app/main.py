@@ -23,6 +23,7 @@ from app.api.hooks.router import router as hooks_router
 from app.api.workspace.router import router as workspace_router
 from app.api.billing.router import router as billing_router
 from app.api.voice.router import router as voice_router
+from app.api.code_skills.router import router as code_skills_router
 from app.config import settings
 import app.db.models  # noqa: F401 — registers all SQLModel tables
 from app.db.session import check_db
@@ -81,6 +82,22 @@ def _validate_production_config() -> None:
     if not settings.google_client_id or not settings.google_client_secret:
         errors.append("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set")
 
+    if settings.code_skills_enabled:
+        missing = [
+            name for name, value in (
+                ("AWS_ACCESS_KEY_ID", settings.aws_access_key_id),
+                ("AWS_SECRET_ACCESS_KEY", settings.aws_secret_access_key),
+                ("AWS_USERCODE_DEPLOYER_ROLE_ARN", settings.aws_usercode_deployer_role_arn),
+                ("AWS_USERCODE_EXEC_ROLE_ARN", settings.aws_usercode_exec_role_arn),
+                ("AWS_USERCODE_EXTERNAL_ID", settings.aws_usercode_external_id),
+                ("AWS_USERCODE_SUBNET_IDS", settings.aws_usercode_subnet_ids),
+                ("AWS_USERCODE_SECURITY_GROUP_ID", settings.aws_usercode_security_group_id),
+            )
+            if not value
+        ]
+        if missing:
+            errors.append("CODE_SKILLS_ENABLED is true but missing " + ", ".join(missing))
+
     if errors:
         joined = "; ".join(errors)
         raise RuntimeError(
@@ -92,6 +109,8 @@ def _validate_production_config() -> None:
 async def lifespan(app: FastAPI):
     _validate_production_config()
     await check_db()
+    from app.core.code_skills.service import sweep_interrupted_deploys
+    await sweep_interrupted_deploys()
     yield
 
 
@@ -153,6 +172,7 @@ app.include_router(approvals_router)
 app.include_router(conversations_router)
 app.include_router(notes_router)
 app.include_router(skills_router)
+app.include_router(code_skills_router)
 app.include_router(tables_router)
 app.include_router(webhooks_router)
 app.include_router(hooks_router)

@@ -62,6 +62,9 @@ sqladmin[full]
 # ── Billing / Stripe ──────────────────────────────────────────────────────────
 stripe
 
+# ── Code skills (user Python on Lambda; see CODE_SKILLS.md) ───────────────────
+boto3
+
 # ── Dev & testing ─────────────────────────────────────────────────────────────
 pytest
 pytest-asyncio

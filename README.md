@@ -111,6 +111,12 @@ app/
 alembic/          migrations
 ```
 
+## Code skills (AWS)
+
+User-written Python skills run as one Lambda each in a separate AWS account (`ca-central-1`), invoked only through `sts:AssumeRole`. There is no public function URL. Network is off unless the skill opts in. The setup (account, no-egress VPC, `SetodUserCodeExec`, `SetodUserCodeDeployer`, and the platform IAM user) is documented in `CODE_SKILLS.md` in the project notes.
+
+Leave `CODE_SKILLS_ENABLED=false` until these are set: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_USERCODE_DEPLOYER_ROLE_ARN`, `AWS_USERCODE_EXEC_ROLE_ARN`, `AWS_USERCODE_EXTERNAL_ID`, `AWS_USERCODE_SUBNET_IDS`, `AWS_USERCODE_SECURITY_GROUP_ID`, and `AWS_REGION=ca-central-1`. In production the process refuses to start if the flag is on and any of those are empty.
+
 ## License
 
 [MIT](LICENSE)

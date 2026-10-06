@@ -80,6 +80,18 @@ class Settings(BaseSettings):
     atlassian_mcp_client_id: str = ""
     atlassian_mcp_client_secret: str = ""
 
+    # Code skills: user Python deployed as one Lambda per skill in the usercode account.
+    # See CODE_SKILLS.md. Stay false until that account's env vars are set.
+    code_skills_enabled: bool = False
+    aws_region: str = "ca-central-1"
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_usercode_deployer_role_arn: str = ""
+    aws_usercode_exec_role_arn: str = ""
+    aws_usercode_external_id: str = ""
+    aws_usercode_subnet_ids: str = ""
+    aws_usercode_security_group_id: str = ""
+
     # Browser origins allowed to call this API. Comma-separated so it can be set per
     # environment; blank falls back to the development defaults below.
     cors_origins: str = ""

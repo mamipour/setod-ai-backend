@@ -37,6 +37,14 @@ from app.db.session import AsyncSessionLocal, engine
 
 log = logging.getLogger("worker")
 
+
+def _next_code_reconcile(now: datetime) -> datetime:
+    """Next 04:00 UTC, when orphan Lambda functions are deleted."""
+    target = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return target
+
 # Inbound events are polled frequently so the 10s debounce window resolves quickly.
 POLL_SECONDS = 5
 # Ceiling on how many due triggers one poll takes on. Keeps a backlog from turning into a
@@ -361,6 +369,7 @@ async def main() -> None:
     next_rollup = datetime.now(UTC)
     next_credit_notify = datetime.now(UTC)
     next_voice_overage_push = datetime.now(UTC)
+    next_code_reconcile = _next_code_reconcile(datetime.now(UTC))
     tick = 0
     log.info("scheduler started — polling every %ds (slow tasks every %ds)",
              POLL_SECONDS, POLL_SECONDS * _SLOW_TASK_DIVISOR)
@@ -393,6 +402,17 @@ async def main() -> None:
                     except Exception:
                         log.exception("voice overage push failed")
                     next_voice_overage_push = datetime.now(UTC) + VOICE_OVERAGE_PUSH_EVERY
+
+                if datetime.now(UTC) >= next_code_reconcile:
+                    try:
+                        from app.core.code_skills.reconcile import reconcile_orphans
+                        async with AsyncSessionLocal() as db:
+                            removed = await reconcile_orphans(db)
+                        if removed:
+                            log.info("code skills: deleted %d orphan function(s)", len(removed))
+                    except Exception:
+                        log.exception("code skill reconcile failed")
+                    next_code_reconcile = _next_code_reconcile(datetime.now(UTC))
 
                 if datetime.now(UTC) >= next_credit_notify:
                     await _check_credit_thresholds()

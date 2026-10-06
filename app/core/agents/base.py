@@ -221,6 +221,11 @@ async def run_agent(
         # Key-value memory: exact state between runs. Gated by a setting, on by default.
         if settings.get("kv_memory", True):
             tools = tools + await kv.build_tools(db, agent, session.id)
+        from app.core.code_skills import tools as code_skill_tools
+        _code_tools, _code_approval = await code_skill_tools.build_tools(db, agent, session.id)
+        if _code_tools:
+            tools = tools + _code_tools
+            approval_required |= _code_approval
         # Only offered when there are open resolvable tasks in scope.
         notes_tool = await notes.build_tool(db, agent.org_id, agent.id)
         if notes_tool is not None:
@@ -793,6 +798,8 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
         return f"Send SMS to {a.get('to', '?')}: {str(a.get('body', ''))[:100]}"
     if name in ("archive_email",):
         return f"Archive email {a.get('message_id', '?')}"
+    if name.startswith("code_"):
+        return f"Run custom code skill '{name[5:]}'"
     return f"Call {name}({', '.join(f'{k}={str(v)[:40]}' for k, v in list(a.items())[:3])})"
 
 
@@ -909,6 +916,11 @@ async def resume_agent(db: AsyncSession, session_id: UUID) -> AgentSession:
         tools = tools + [data_tool]
     if settings.get("kv_memory", True):
         tools = tools + await kv.build_tools(db, agent, session.id)
+    from app.core.code_skills import tools as code_skill_tools
+    _code_tools, _code_approval = await code_skill_tools.build_tools(db, agent, session.id)
+    if _code_tools:
+        tools = tools + _code_tools
+        approval_required |= _code_approval
     notes_tool = await notes.build_tool(db, agent.org_id, agent.id)
     if notes_tool is not None:
         tools = tools + [notes_tool]

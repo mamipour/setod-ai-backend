@@ -5,7 +5,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Column, DateTime, ForeignKey, Index, LargeBinary, UniqueConstraint, text
+from sqlalchemy import Column, DateTime, ForeignKey, Index, LargeBinary, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Field, SQLModel
@@ -1021,6 +1021,124 @@ class AgentSkillLink(SQLModel, table=True):
         )
     )
     attached_at: datetime = _ts()
+
+
+class CodeSkillDeployStatus(str, Enum):
+    draft = "draft"
+    deploying = "deploying"
+    ready = "ready"
+    failed = "failed"
+
+
+class CodeSkill(SQLModel, table=True):
+    """A user-authored Python function deployed as an AWS Lambda and exposed to agents as a tool.
+
+    Distinct from ``Skill``, which is a prompt fragment. See CODE_SKILLS.md.
+    """
+
+    __tablename__ = "code_skills"
+    __table_args__ = (UniqueConstraint("org_id", "tool_name", name="uq_code_skills_org_tool_name"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("organizations.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
+    created_by_id: UUID = Field(foreign_key="users.id")
+
+    name: str
+    tagline: str = Field(default="")
+    tool_name: str
+    tool_description: str
+    input_schema: dict[str, Any] = Field(sa_column=Column(JSONB, nullable=False))
+
+    source: str
+    source_sha256: str
+    timeout_seconds: int = Field(default=10)
+    network_access: bool = Field(default=False)
+    read_only: bool = Field(default=False)
+    secrets_enc: str | None = Field(default=None)
+
+    deploy_status: str = Field(
+        default=CodeSkillDeployStatus.draft.value,
+        sa_column=Column(String(16), nullable=False, server_default="draft"),
+    )
+    deployed_sha256: str | None = Field(default=None)
+    deployed_network_access: bool | None = Field(default=None)
+    deployed_timeout_seconds: int | None = Field(default=None)
+    lambda_function_name: str | None = Field(default=None)
+    lambda_arn: str | None = Field(default=None)
+    last_deploy_error: str | None = Field(default=None)
+    last_deployed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+
+    invocation_count: int = Field(default=0)
+    last_invoked_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    last_error: str | None = Field(default=None)
+
+    created_at: datetime = _ts()
+    updated_at: datetime = _ts()
+
+    @property
+    def dirty(self) -> bool:
+        """True when the live function differs from the saved row."""
+        return (
+            self.deployed_sha256 != self.source_sha256
+            or self.deployed_network_access != self.network_access
+            or self.deployed_timeout_seconds != self.timeout_seconds
+        )
+
+
+class AgentCodeSkillLink(SQLModel, table=True):
+    """Which code skills an agent may call, and whether each call needs approval."""
+
+    __tablename__ = "agent_code_skill_links"
+
+    agent_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("agents.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    code_skill_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("code_skills.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    requires_approval: bool = Field(default=False)
+    attached_at: datetime = _ts()
+
+
+class CodeSkillDeploy(SQLModel, table=True):
+    """Audit log: one row per deploy attempt."""
+
+    __tablename__ = "code_skill_deploys"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    code_skill_id: UUID = Field(
+        sa_column=Column(
+            PGUUID(as_uuid=True),
+            ForeignKey("code_skills.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    requested_by_id: UUID = Field(foreign_key="users.id")
+    source_sha256: str
+    network_access: bool
+    outcome: str = Field(default="pending")
+    error: str | None = Field(default=None)
+    started_at: datetime = _ts()
+    finished_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
 
 
 # ── Owner Notes ────────────────────────────────────────────────────────────────

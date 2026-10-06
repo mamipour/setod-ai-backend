@@ -112,9 +112,9 @@ class Entitlements:
 _FREE_PLAN = Plan(
     code="free",
     display_name="Free",
-    features={"managed_models": False, "voice": False},
-    limits={"agents": 5, "rows": 5000},
-    included={},
+    features={"managed_models": False, "voice": False, "code_skills": False},
+    limits={"agents": 5, "rows": 5000, "code_skills": 0},
+    included={"code_invocations": 0},
     monthly_credit_cents=0,
 )
 
