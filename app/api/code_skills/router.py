@@ -270,6 +270,8 @@ async def attach_code_skill(
     else:
         link.requires_approval = body.requires_approval
     session.add(link)
+    agent.updated_at = datetime.now(UTC)
+    session.add(agent)
     await session.commit()
 
 
@@ -289,6 +291,8 @@ async def detach_code_skill(
     )).first()
     if link is not None:
         await session.delete(link)
+        agent.updated_at = datetime.now(UTC)
+        session.add(agent)
         await session.commit()
 
 
@@ -342,14 +346,10 @@ async def delete_code_skill(
     await service.delete_skill(session, skill, backend)
 
 
-@router.post("/{skill_id}/deploy", status_code=202)
-@limiter.limit("10/minute")
-async def deploy_code_skill(
-    request: Request,
-    skill_id: UUID,
-    current_user: Annotated[User, Depends(get_current_user)],
-    session: Annotated[AsyncSession, Depends(get_session)],
+async def start_code_skill_deploy(
+    session: AsyncSession, current_user: User, skill_id: UUID,
 ) -> dict:
+    """Deploy body, shared by the HTTP route and the MCP tool. The route adds the limiter."""
     skill = await _skill(session, current_user, skill_id, owner=True)
     if skill.deploy_status == CodeSkillDeployStatus.deploying.value:
         raise HTTPException(status_code=409, detail="This code skill is already deploying")
@@ -369,14 +369,19 @@ async def deploy_code_skill(
     return {"deploy_id": str(deploy.id)}
 
 
-@router.post("/{skill_id}/test")
-@limiter.limit("30/minute")
-async def test_code_skill(
+@router.post("/{skill_id}/deploy", status_code=202)
+@limiter.limit("10/minute")
+async def deploy_code_skill(
     request: Request,
     skill_id: UUID,
-    body: TestIn,
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict:
+    return await start_code_skill_deploy(session, current_user, skill_id)
+
+
+async def run_code_skill_test(
+    session: AsyncSession, current_user: User, skill_id: UUID, body: TestIn,
 ) -> dict:
     skill = await _skill(session, current_user, skill_id, owner=True)
     if skill.deploy_status != CodeSkillDeployStatus.ready.value:
@@ -412,6 +417,18 @@ async def test_code_skill(
         "duration_ms": res["duration_ms"] if res else 0,
         "log_tail": res["log_tail"] if res else None,
     }
+
+
+@router.post("/{skill_id}/test")
+@limiter.limit("30/minute")
+async def test_code_skill(
+    request: Request,
+    skill_id: UUID,
+    body: TestIn,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict:
+    return await run_code_skill_test(session, current_user, skill_id, body)
 
 
 @router.get("/{skill_id}/secrets")

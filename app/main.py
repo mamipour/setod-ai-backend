@@ -24,6 +24,7 @@ from app.api.workspace.router import router as workspace_router
 from app.api.billing.router import router as billing_router
 from app.api.voice.router import router as voice_router
 from app.api.code_skills.router import router as code_skills_router
+from app.api.mcp.router import router as mcp_router
 from app.config import settings
 import app.db.models  # noqa: F401 — registers all SQLModel tables
 from app.db.session import check_db
@@ -98,6 +99,9 @@ def _validate_production_config() -> None:
         if missing:
             errors.append("CODE_SKILLS_ENABLED is true but missing " + ", ".join(missing))
 
+    if settings.mcp_server_enabled and not settings.mcp_public_url:
+        errors.append("MCP_SERVER_ENABLED is true but MCP_PUBLIC_URL is empty")
+
     if errors:
         joined = "; ".join(errors)
         raise RuntimeError(
@@ -123,7 +127,19 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    # The JSON-RPC endpoint has to answer with a JSON-RPC error. Cookie routes keep slowapi's 429.
+    if request.url.path == "/mcp":
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32029, "message": "Rate limited"}},
+            status_code=200,
+            headers={"MCP-Protocol-Version": "2025-03-26"},
+        )
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 
@@ -179,6 +195,7 @@ app.include_router(hooks_router)
 app.include_router(workspace_router)
 app.include_router(billing_router)
 app.include_router(voice_router)
+app.include_router(mcp_router)
 
 
 # ── Admin panel ───────────────────────────────────────────────────────────────

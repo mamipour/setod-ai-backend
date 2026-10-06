@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     aws_usercode_subnet_ids: str = ""
     aws_usercode_security_group_id: str = ""
 
+    # Remote MCP server so Claude Code / Cursor can build agents. See MCP_SERVER.md.
+    mcp_server_enabled: bool = False
+    mcp_public_url: str = ""
+
     # Browser origins allowed to call this API. Comma-separated so it can be set per
     # environment; blank falls back to the development defaults below.
     cors_origins: str = ""

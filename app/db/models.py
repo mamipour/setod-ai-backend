@@ -1588,3 +1588,46 @@ class OrgBillingSettings(SQLModel, table=True):
     auto_recharge_failed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     allow_voice_overage: bool = Field(default=True)
     updated_at: datetime = _ts()
+
+
+# ── MCP personal access tokens ────────────────────────────────────────────────
+
+class ApiTokenScope(str, Enum):
+    read = "read"
+    write = "write"
+
+
+class ApiToken(SQLModel, table=True):
+    """Personal access token for the MCP server. One token = one user + one workspace."""
+
+    __tablename__ = "api_tokens"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    name: str = Field(max_length=80)
+    token_hash: str = Field(unique=True, index=True, max_length=64)
+    token_prefix: str = Field(max_length=8)
+    scope: ApiTokenScope = Field(default=ApiTokenScope.read)
+    token_version_at_creation: int = Field(default=0)
+    expires_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    last_used_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    revoked_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    created_at: datetime = _ts()
+
+
+class McpAuditEvent(SQLModel, table=True):
+    """One row per MCP write (and per setod_run_agent). Arguments are capped at insert time."""
+
+    __tablename__ = "mcp_audit_events"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    token_id: UUID = Field(foreign_key="api_tokens.id", index=True)
+    user_id: UUID = Field(foreign_key="users.id")
+    org_id: UUID = Field(foreign_key="organizations.id", index=True)
+    tool: str = Field(max_length=64)
+    arguments: dict[str, Any] = Field(default_factory=dict, sa_type=JSONB)
+    ok: bool = Field(default=True)
+    error: str | None = Field(default=None)
+    duration_ms: int = Field(default=0)
+    created_at: datetime = _ts()

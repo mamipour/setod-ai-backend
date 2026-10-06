@@ -185,6 +185,8 @@ async def attach_skill(
     if existing.first():
         return  # idempotent
     session.add(AgentSkillLink(agent_id=agent.id, skill_id=skill.id))
+    agent.updated_at = datetime.now(UTC)
+    session.add(agent)
     await session.commit()
 
 
@@ -205,4 +207,6 @@ async def detach_skill(
     link = row.first()
     if link:
         await session.delete(link)
+        agent.updated_at = datetime.now(UTC)
+        session.add(agent)
         await session.commit()
