@@ -4,7 +4,7 @@
 
 <h1 align="center">Setod — API</h1>
 
-Backend for [Setod](https://setod.com): an AI agent platform for small-business back-office work. You write instructions in plain English, attach the accounts the agent may use, and put it on a schedule. When it wakes up, a model you already pay for (OpenAI or Anthropic) reads the instructions, looks at those accounts, and acts.
+Backend for [Setod](https://setod.com): an AI agent platform for small and medium size business back-office work. You write instructions in plain English, attach the accounts the agent may use, and put it on a schedule. When it wakes up, a model you already pay for (OpenAI or Anthropic) reads the instructions, looks at those accounts, and acts.
 
 This repo is the FastAPI API, Postgres schema, and the scheduler worker. The dashboard lives in [`setod-ai-frontend`](https://github.com/mamipour/setod-ai-frontend).
 
@@ -12,7 +12,7 @@ This repo is the FastAPI API, Postgres schema, and the scheduler worker. The das
 
 An agent is three things: **instructions**, **connectors**, and a **trigger**. Everything else exists to make those safe to run unattended.
 
-- **Connectors** — workspace-scoped accounts, credentials encrypted at rest. Google (Gmail + Calendar via App Password), Telegram bot, Telegram account (MTProto), Twilio SMS, OpenAI, Anthropic, and MCP servers (GitHub, Linear, Notion, Slack, Atlassian, Zapier, or a custom HTTPS URL).
+- **Connectors** — workspace-scoped accounts, credentials encrypted at rest. Gmail and Google Calendar (via App Password), Telegram bot, Telegram account (MTProto), Twilio SMS, WhatsApp Business, Instagram, Slack, HubSpot, Pipedrive, Airtable, Shopify, Calendly, inbound webhooks, OpenAI, Anthropic, and MCP servers (GitHub, Linear, Notion, Slack, Atlassian, Zapier, or a custom HTTPS URL).
 - **Tools** — come from the connector you attach. Reading tools skip items the agent already handled; irreversible writes (reply, archive, send) are recorded the moment they happen.
 - **Schedules** — cron in the owner's timezone, stored in Postgres. Missed slots are dropped, not replayed. A run still in flight blocks the next one.
 - **Draft / publish** — editing never changes what is live until you publish. Each publish is snapshotted so you can roll back.
