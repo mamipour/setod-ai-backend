@@ -2,42 +2,42 @@
   <img src="https://raw.githubusercontent.com/mamipour/setod-ai-frontend/main/public/logo.svg" alt="Setod" width="56" />
 </p>
 
-<h1 align="center">Setod — API</h1>
+# Setod — API
 
-Backend for [Setod](https://setod.com): an AI agent platform for small and medium size business back-office work. You write instructions in plain English, attach the accounts the agent may use, and put it on a schedule. When it wakes up, a model you already pay for (OpenAI or Anthropic) reads the instructions, looks at those accounts, and acts.
+Backend for [Setod](https://setod.com): an AI agent platform for small and medium size business back-office work. You write instructions in plain English, attach the accounts the agent may use, and put it on a schedule. When it wakes up, a model reads the instructions, looks at those accounts, and acts.
 
-This repo is the FastAPI API, Postgres schema, and the scheduler worker. The dashboard lives in [`setod-ai-frontend`](https://github.com/mamipour/setod-ai-frontend).
+Actively maintained. The service people use is [setod.com](https://setod.com). This repository is the MIT source for the API, the Postgres schema, and the scheduler. The dashboard is [`setod-ai-frontend`](https://github.com/mamipour/setod-ai-frontend).
 
-## What it does
+A star helps other people find the repo.
 
-An agent is three things: **instructions**, **connectors**, and a **trigger**. Everything else exists to make those safe to run unattended.
+## What this is
 
-- **Connectors** — workspace-scoped accounts, credentials encrypted at rest. Gmail and Google Calendar (via App Password), Telegram bot, Telegram account (MTProto), Twilio SMS, WhatsApp Business, Instagram, Slack, HubSpot, Pipedrive, Airtable, Shopify, Calendly, inbound webhooks, OpenAI, Anthropic, and MCP servers (GitHub, Linear, Notion, Slack, Atlassian, Zapier, or a custom HTTPS URL).
-- **Tools** — come from the connector you attach. Reading tools skip items the agent already handled; irreversible writes (reply, archive, send) are recorded the moment they happen.
-- **Schedules** — cron in the owner's timezone, stored in Postgres. Missed slots are dropped, not replayed. A run still in flight blocks the next one.
-- **Draft / publish** — editing never changes what is live until you publish. Each publish is snapshotted so you can roll back.
-- **Copilot** — a read-only prompt engineer that can search the web, fetch pages, and read past run traces, then suggest instructions you copy in yourself.
-- **Skills, notes, knowledge, approvals, agent-to-agent calls** — reusable behaviour rules, owner facts/tasks, document RAG (pgvector), gated write tools, and calling another published agent as a tool.
+An agent is three things: instructions, connectors, and a trigger. You bring your own OpenAI or Anthropic key. This API does not resell those tokens.
 
-You bring your own model keys. Setod does not resell tokens.
+## Why this, and not a workflow graph
 
-## Stack
+A tool like n8n asks you to draw every step. Setod asks for the instruction, the accounts, and when to run. The model decides the steps on that run.
 
-| Piece | Choice |
-|---|---|
-| API | FastAPI + Uvicorn |
-| DB | PostgreSQL 16+ with `pgvector` |
-| Scheduler | A polling worker (`app.tasks.worker`). Claims due rows with `FOR UPDATE SKIP LOCKED`. |
-| LLM | OpenAI and Anthropic, through one client |
-| Auth | Google OAuth for sign-in (not for Gmail) |
+Publish saves the instructions and the model settings. Connected accounts stay editable after publish, and each publish is snapshotted so you can roll back. A send, reply, or other irreversible tool can wait for approval. Every run keeps a transcript.
 
-Schedules live in Postgres, not Redis. Agent runs are long and infrequent; losing a cron job on a Redis restart is worse than extra queue throughput.
+Gmail and Google Calendar connect with a Google App Password. Sign-in is a separate Google OAuth client, used only to log in.
+
+## What it does not do
+
+- It does not give you a canvas of steps.
+- It does not drive a browser on a desktop.
+- Google Sheets is not a connector here.
+- It is not a control plane for a bank or another regulated institution.
+
+## Try it
+
+Use the hosted app at [setod.com](https://setod.com), or run this API yourself with the steps below. Without the worker, scheduled agents sit in the database and never fire.
 
 ## Requirements
 
-- Python 3.12+
-- PostgreSQL 16+ with the `pgvector` extension
-- A Google OAuth client used **only for sign-in** (Gmail/Calendar use a Google App Password)
+- Python 3.12 (the version this repo is deployed with; user-written code skills run on the Lambda runtime `python3.12`)
+- PostgreSQL 16 or newer, with the `pgvector` extension
+- A Google OAuth client used only for sign-in
 
 ## Setup
 
@@ -56,8 +56,8 @@ Minimum `.env`:
 | `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:5432/dbname` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Sign-in only |
 | `ENCRYPTION_KEY` | Fernet key for connector credentials |
-| `CORS_ORIGINS` | Browser origins. Blank uses `localhost:3000` and `127.0.0.1:3000` in development. Must be set in production. |
-| `PUBLIC_BASE_URL` | API origin for OAuth callbacks. Blank → `http://localhost:8000`. Production: no trailing slash. |
+| `CORS_ORIGINS` | Browser origins. Blank allows `localhost:3000` and `127.0.0.1:3000` in development, and must be set in production. |
+| `PUBLIC_BASE_URL` | API origin for OAuth callbacks. Blank uses `http://localhost:8000` (or `APP_PORT`). No trailing slash. |
 
 Generate the encryption key:
 
@@ -73,7 +73,7 @@ CREATE DATABASE setod;
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-Apply migrations and start the API plus worker:
+Apply migrations and start the API plus the worker:
 
 ```bash
 ./run.sh
@@ -81,15 +81,32 @@ Apply migrations and start the API plus worker:
 
 The API listens on `http://localhost:8000`. OpenAPI is at `/docs` outside production.
 
-`./run.sh` starts both processes. Without the worker, agents sit ready in the database and never fire.
+Optional env, only if you use those features:
 
-Optional env (only if you use those features):
+- `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — Telegram account connector
+- `SLACK_MCP_CLIENT_ID` / `SLACK_MCP_CLIENT_SECRET`, and the Notion, Linear, and Atlassian pairs — so each user does not have to paste an MCP OAuth app
+- `CODE_SKILLS_ENABLED` and the `AWS_USERCODE_*` variables — see below
 
-- `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — Telegram account (user) connector
-- `SLACK_MCP_CLIENT_ID` / `…_SECRET` (and the Notion / Linear / Atlassian pairs) — skip asking each user to paste an MCP OAuth app
-- `TWILIO_*` — unused for per-workspace Twilio connectors; those credentials live on the connector
+Workspace owners add their own model keys in the dashboard. Those keys are not required in this `.env`.
 
-Workspace owners add their own OpenAI/Anthropic keys and an optional Tavily key for web search in the dashboard. They are not server env vars.
+## What the API runs
+
+- **Connectors** — workspace accounts, credentials encrypted at rest. Gmail and Google Calendar (App Password), Telegram bot, Telegram account (MTProto), Twilio SMS, WhatsApp Business, Instagram, Slack, HubSpot, Pipedrive, Airtable, Shopify, Calendly, inbound webhooks, OpenAI, Anthropic, and MCP servers (GitHub, Linear, Notion, Slack, Atlassian, Zapier, or a custom HTTPS URL).
+- **Schedules** — cron in the owner's timezone, stored in Postgres. Missed slots are dropped, not replayed. A run still in flight blocks the next one.
+- **Copilot** — reads pages and past run traces, then suggests instructions you copy in yourself. It cannot publish.
+- **Skills, notes, knowledge, approvals, agent-to-agent calls** — reusable rules, owner facts, document search (pgvector), gated writes, and calling another published agent as a tool.
+
+## Stack
+
+| Piece | Choice |
+|---|---|
+| API | FastAPI + Uvicorn |
+| DB | PostgreSQL 16+ with `pgvector` |
+| Scheduler | `app.tasks.worker`, claiming due rows with `FOR UPDATE SKIP LOCKED` |
+| LLM | OpenAI and Anthropic, through one client |
+| Auth | Google OAuth for sign-in, not for Gmail |
+
+Schedules live in Postgres. A Redis restart would drop a cron job, and these runs are long and infrequent.
 
 ## Tests
 
@@ -97,25 +114,25 @@ Workspace owners add their own OpenAI/Anthropic keys and an optional Tavily key 
 PYTHONPATH=. python tests/e2e_slice5.py
 ```
 
-`e2e_slice5.py` covers owner notes and agent-to-agent calls against a live database and makes no LLM calls. Earlier slices drive a real model and spend tokens.
+`tests/e2e_slice5.py` covers owner notes and agent-to-agent calls against a live database. It makes no LLM calls. Earlier slices call a real model and spend tokens.
 
 ## Layout
 
 ```
 app/
-  api/            HTTP routes (agents, auth, connectors, approvals, skills, notes, webhooks)
-  core/           ReAct loop, LLM client, schedules, knowledge, notes
+  api/            HTTP routes
+  core/           agent loop, model client, schedules, knowledge, notes
   integrations/   Gmail, Calendar, Telegram, Twilio, web search, MCP
   tasks/worker.py scheduler process
   db/             SQLModel models
 alembic/          migrations
 ```
 
-## Code skills (AWS)
+## Code skills
 
-User-written Python skills run as one Lambda each in a separate AWS account (`ca-central-1`), invoked only through `sts:AssumeRole`. There is no public function URL. Network is off unless the skill opts in. The setup (account, no-egress VPC, `SetodUserCodeExec`, `SetodUserCodeDeployer`, and the platform IAM user) is documented in `CODE_SKILLS.md` in the project notes.
+User-written Python can run as one Lambda per skill, invoked through `sts:AssumeRole`, with no public function URL. Network is off unless the skill opts in.
 
-Leave `CODE_SKILLS_ENABLED=false` until these are set: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_USERCODE_DEPLOYER_ROLE_ARN`, `AWS_USERCODE_EXEC_ROLE_ARN`, `AWS_USERCODE_EXTERNAL_ID`, `AWS_USERCODE_SUBNET_IDS`, `AWS_USERCODE_SECURITY_GROUP_ID`, and `AWS_REGION=ca-central-1`. In production the process refuses to start if the flag is on and any of those are empty.
+Leave `CODE_SKILLS_ENABLED=false` until these are set: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_USERCODE_DEPLOYER_ROLE_ARN`, `AWS_USERCODE_EXEC_ROLE_ARN`, `AWS_USERCODE_EXTERNAL_ID`, `AWS_USERCODE_SUBNET_IDS`, `AWS_USERCODE_SECURITY_GROUP_ID`, and `AWS_REGION=ca-central-1`. If the flag is on in production and any of those are empty, the process refuses to start.
 
 ## License
 
