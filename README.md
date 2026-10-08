@@ -20,8 +20,6 @@ A tool like n8n asks you to draw every step. Setod asks for the instruction, the
 
 Publish saves the instructions and the model settings. Connected accounts stay editable after publish, and each publish is snapshotted so you can roll back. A send, reply, or other irreversible tool can wait for approval. Every run keeps a transcript.
 
-Gmail and Google Calendar connect with a Google App Password. Sign-in is a separate Google OAuth client, used only to log in.
-
 ## What it does not do
 
 - It does not give you a canvas of steps.
