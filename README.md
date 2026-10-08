@@ -26,8 +26,6 @@ Gmail and Google Calendar connect with a Google App Password. Sign-in is a separ
 
 - It does not give you a canvas of steps.
 - It does not drive a browser on a desktop.
-- Google Sheets is not a connector here.
-- It is not a control plane for a bank or another regulated institution.
 
 ## Try it
 
